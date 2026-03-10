@@ -78,7 +78,7 @@ while True:
             continue
         action, score = analyze_coin(price)
         action_text = {"BUY":"买入", "SELL":"卖出", "HOLD":"观望"}
-msg = f"{coin.upper()} 当前价格：${price:.2f} | 综合评分：{score} | 建议操作：{action_text.get(action, '观望')}"
+        msg = f"{coin.upper()} 当前价格：${price:.2f} | 综合评分：{score} | 建议操作：{action_text.get(action, '观望')}"
         print(msg)
         send_message(msg)
     print(f"下次检测在 {check_interval} 秒后\n")
