@@ -1,0 +1,10 @@
+{
+  "coins": ["bitcoin", "ethereum", "solana", "okb"],
+  "buy_threshold": 70,
+  "sell_threshold": 30,
+  "risk_check": true,
+  "check_interval": 300,
+  "notify_method": "telegram",
+  "telegram_bot_token": "YOUR_BOT_TOKEN_HERE",
+  "telegram_chat_id": "YOUR_CHAT_ID_HERE"
+}
