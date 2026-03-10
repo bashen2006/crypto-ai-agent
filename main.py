@@ -47,7 +47,6 @@ def analyze_coin(price):
     - 市场情绪：模拟情绪指数
     - 链上巨鲸监控：随机生成
     """
-    # 模拟因子评分 0-100
     import random
     score = random.randint(0, 100)
     action = "HOLD"
@@ -58,7 +57,7 @@ def analyze_coin(price):
     return action, score
 
 # ==============================
-# 通知函数
+# 中文通知函数
 # ==============================
 def send_message(msg):
     if notify_method == "telegram" and bot:
@@ -74,10 +73,12 @@ while True:
     for coin in coins:
         price = get_price(coin)
         if price is None:
-            print(f"{coin}: 获取价格失败")
+            print(f"{coin}：获取价格失败")
             continue
         action, score = analyze_coin(price)
-        msg = f"{coin.upper()} | Price: ${price:.2f} | Score: {score} | Action: {action}"
+        # 中文化显示
+        action_text = {"BUY":"买入", "SELL":"卖出", "HOLD":"观望"}
+        msg = f"{coin.upper()} 当前价格：${price:.2f} | 综合评分：{score} | 建议操作：{action_text.get(action, '观望')}"
         print(msg)
         send_message(msg)
     print(f"下次检测在 {check_interval} 秒后\n")
