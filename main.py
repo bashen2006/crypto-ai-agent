@@ -4,7 +4,10 @@ import json
 import statistics
 from datetime import datetime
 
+# =========================
 # 读取配置
+# =========================
+
 with open("config.json") as f:
     config = json.load(f)
 
@@ -17,8 +20,10 @@ telegram_chat_id = config["telegram_chat_id"]
 whale_trade_usdt = config["whale_trade_usdt"]
 volume_spike = config["volume_spike"]
 
+# =========================
+# Telegram
+# =========================
 
-# Telegram发送
 def send_message(msg):
 
     url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
@@ -34,7 +39,10 @@ def send_message(msg):
         print("Telegram发送失败")
 
 
-# 获取K线
+# =========================
+# OKX K线
+# =========================
+
 def get_candles(symbol):
 
     url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=5m&limit=100"
@@ -47,6 +55,7 @@ def get_candles(symbol):
     volumes = []
 
     for c in data:
+
         closes.append(float(c[4]))
         volumes.append(float(c[5]))
 
@@ -56,7 +65,10 @@ def get_candles(symbol):
     return closes, volumes
 
 
-# MA计算
+# =========================
+# MA
+# =========================
+
 def MA(data, period):
 
     if len(data) < period:
@@ -65,11 +77,11 @@ def MA(data, period):
     return sum(data[-period:]) / period
 
 
-# RSI计算
-def RSI(data, period=14):
+# =========================
+# RSI
+# =========================
 
-    if len(data) < period + 1:
-        return 50
+def RSI(data, period=14):
 
     gains = []
     losses = []
@@ -88,28 +100,30 @@ def RSI(data, period=14):
 
     rs = avg_gain / avg_loss
 
-    rsi = 100 - (100 / (1 + rs))
-
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 
+# =========================
 # MACD
+# =========================
+
 def MACD(data):
 
     ema12 = statistics.mean(data[-12:])
     ema26 = statistics.mean(data[-26:])
 
-    macd = ema12 - ema26
-
-    return macd
+    return ema12 - ema26
 
 
+# =========================
 # 巨鲸监控
+# =========================
+
 def check_whale(symbol):
 
     url = f"https://www.okx.com/api/v5/market/trades?instId={symbol}&limit=50"
 
-    r = requests.get(url, timeout=10)
+    r = requests.get(url)
 
     trades = r.json()["data"]
 
@@ -131,50 +145,121 @@ def check_whale(symbol):
     return whales
 
 
+# =========================
 # AI评分
+# =========================
+
 def calculate_score(ma7, ma30, rsi, macd, volume, avg_volume, whales):
 
     score = 50
 
-    signals = []
-
     if ma7 > ma30:
         score += 15
-        signals.append("MA多头趋势")
 
     else:
         score -= 10
-        signals.append("MA空头趋势")
 
     if rsi < 30:
         score += 10
-        signals.append("RSI超卖")
 
     if rsi > 70:
         score -= 10
-        signals.append("RSI超买")
 
     if macd > 0:
         score += 10
-        signals.append("MACD多头")
 
     if volume > avg_volume * volume_spike:
         score += 10
-        signals.append("成交量异常放大")
 
     if whales:
+        score += 5
 
-        score += 5 * len(whales)
-
-        signals.append("发现巨鲸交易")
-
-    return score, signals
+    return score
 
 
+# =========================
+# 记录交易信号
+# =========================
+
+def log_signal(coin, price, score, signal):
+
+    try:
+
+        with open("trade_log.json") as f:
+            log = json.load(f)
+
+    except:
+        log = []
+
+    log.append({
+
+        "coin": coin,
+        "time": str(datetime.now()),
+        "price": price,
+        "score": score,
+        "signal": signal
+
+    })
+
+    with open("trade_log.json", "w") as f:
+        json.dump(log, f, indent=2)
+
+
+# =========================
+# 自动复盘
+# =========================
+
+def review_signals():
+
+    try:
+
+        with open("trade_log.json") as f:
+            log = json.load(f)
+
+    except:
+        return
+
+    if len(log) < 5:
+        return
+
+    success = 0
+
+    for item in log[-10:]:
+
+        coin = item["coin"]
+
+        price_old = item["price"]
+
+        closes,_ = get_candles(coin)
+
+        price_now = closes[-1]
+
+        if item["signal"] == "buy":
+
+            if price_now > price_old:
+                success += 1
+
+        if item["signal"] == "sell":
+
+            if price_now < price_old:
+                success += 1
+
+    winrate = success / 10
+
+    print("策略胜率:", winrate)
+
+    if winrate < 0.4:
+
+        send_message(f"⚠️AI策略近期胜率较低：{winrate}")
+
+
+# =========================
 # 主循环
+# =========================
+
 while True:
 
-    print("AI量化监控运行中...")
+    print("AI量化系统运行中...")
 
     for coin in coins:
 
@@ -197,46 +282,50 @@ while True:
 
             whales = check_whale(coin)
 
-            score, signals = calculate_score(
+            score = calculate_score(
                 ma7, ma30, rsi, macd, volume, avg_volume, whales
             )
 
             if score >= config["buy_threshold"]:
+
+                signal = "buy"
                 advice = "买入信号"
 
             elif score <= config["sell_threshold"]:
+
+                signal = "sell"
                 advice = "卖出信号"
 
             else:
-                advice = "观望"
 
-            msg = f"""
-{coin} 市场分析
+                signal = "hold"信号 ="持有"
+                advice = "观望"建议 ="观望"
 
-当前价格：{price}
+            msg = f"""消息 =f"""消息 =f"""消息 =f"""消息 =f"""
+{coin}{币种}币}{币种}
+
+价格：{price}
 
 MA7：{round(ma7,2)}
 MA30：{round(ma30,2)}
 
 RSI：{round(rsi,2)}
-MACD：{round(macd,4)}
+MACD：{round(macd,2)}
 
 AI评分：{score}
 
-信号：
-{",".join(signals)}
+建议：{advice}
 
-建议：
-{advice}
-
-时间：
-{datetime.now()}
+时间：{datetime.now()}
 """
 
             print(msg)
 
-            if score >= config["buy_threshold"] or score <= config["sell_threshold"]:
+            if signal != "hold":
+
                 send_message(msg)
+
+                log_signal(coin, price, score, signal)
 
             time.sleep(2)
 
@@ -244,6 +333,8 @@ AI评分：{score}
 
             print("错误:", e)
 
-    print("等待下一次检测...")
+    review_signals()
+
+    print("等待下一轮检测")
 
     time.sleep(check_interval)
