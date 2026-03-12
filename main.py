@@ -4,9 +4,9 @@ import json
 import statistics
 from datetime import datetime
 
-# =========================
+# ======================
 # 读取配置
-# =========================
+# ======================
 
 with open("config.json") as f:
     config = json.load(f)
@@ -20,9 +20,17 @@ telegram_chat_id = config["telegram_chat_id"]
 whale_trade_usdt = config["whale_trade_usdt"]
 volume_spike = config["volume_spike"]
 
-# =========================
+# ======================
+# 状态缓存
+# ======================
+
+last_signal_time = {}
+daily_signal_count = {}
+signal_buffer = {}
+
+# ======================
 # Telegram
-# =========================
+# ======================
 
 def send_message(msg):
 
@@ -39,22 +47,54 @@ def send_message(msg):
         print("Telegram发送失败")
 
 
-# =========================
-# OKX K线
-# =========================
+# ======================
+# OKX安全请求
+# ======================
+
+def safe_request(url):
+
+    for i in range(3):
+
+        try:
+
+            r = requests.get(url, timeout=10)
+
+            if r.status_code == 429:
+
+                print("OKX限速，等待10秒")
+
+                time.sleep(10)
+
+                continue
+
+            return r.json()
+
+        except:
+
+            time.sleep(5)
+
+    return None
+
+
+# ======================
+# 获取K线
+# ======================
 
 def get_candles(symbol):
 
     url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=5m&limit=100"
 
-    r = requests.get(url, timeout=10)
+    data = safe_request(url)
 
-    data = r.json()["data"]
+    if not data:
+        return None,None
+
+    candles = data["data"]
 
     closes = []
     volumes = []
 
-    for c in data:
+    for c in candles:
 
         closes.append(float(c[4]))
         volumes.append(float(c[5]))
@@ -62,14 +102,14 @@ def get_candles(symbol):
     closes.reverse()
     volumes.reverse()
 
-    return closes, volumes
+    return closes,volumes
 
 
-# =========================
+# ======================
 # MA
-# =========================
+# ======================
 
-def MA(data, period):
+def MA(data,period):
 
     if len(data) < period:
         return None
@@ -77,261 +117,327 @@ def MA(data, period):
     return sum(data[-period:]) / period
 
 
-# =========================
+# ======================
 # RSI
-# =========================
+# ======================
 
-def RSI(data, period=14):
+def RSI(data,period=14):
 
-    gains = []
-    losses = []
+    gains=[]
+    losses=[]
 
-    for i in range(-period, 0):
+    for i in range(-period,0):
 
-        change = data[i] - data[i - 1]
+        change=data[i]-data[i-1]
 
-        if change > 0:
+        if change>0:
             gains.append(change)
         else:
             losses.append(abs(change))
 
-    avg_gain = sum(gains) / period if gains else 0.0001
-    avg_loss = sum(losses) / period if losses else 0.0001
+    avg_gain=sum(gains)/period if gains else 0.0001
+    avg_loss=sum(losses)/period if losses else 0.0001
 
-    rs = avg_gain / avg_loss
+    rs=avg_gain/avg_loss
 
-    return 100 - (100 / (1 + rs))
+    return 100-(100/(1+rs))
 
 
-# =========================
+# ======================
 # MACD
-# =========================
+# ======================
 
 def MACD(data):
 
-    ema12 = statistics.mean(data[-12:])
-    ema26 = statistics.mean(data[-26:])
+    ema12=statistics.mean(data[-12:])
+    ema26=statistics.mean(data[-26:])
 
-    return ema12 - ema26
+    return ema12-ema26
 
 
-# =========================
-# 巨鲸监控
-# =========================
+# ======================
+# 巨鲸交易
+# ======================
 
 def check_whale(symbol):
 
-    url = f"https://www.okx.com/api/v5/market/trades?instId={symbol}&limit=50"
+    url=f"https://www.okx.com/api/v5/market/trades?instId={symbol}&limit=50"
 
-    r = requests.get(url)
+    data=safe_request(url)
 
-    trades = r.json()["data"]
+    if not data:
+        return []
 
-    whales = []
+    trades=data["data"]
+
+    whales=[]
 
     for t in trades:
 
-        size = float(t["sz"])
-        price = float(t["px"])
+        size=float(t["sz"])
+        price=float(t["px"])
 
-        usdt = size * price
+        usdt=size*price
 
-        if usdt > whale_trade_usdt:
+        if usdt>whale_trade_usdt:
 
-            side = "买入" if t["side"] == "buy" else "卖出"
+            side="买入" if t["side"]=="buy" else "卖出"
 
-            whales.append((side, int(usdt)))
+            whales.append((side,int(usdt)))
 
     return whales
 
 
-# =========================
+# ======================
 # AI评分
-# =========================
+# ======================
 
-def calculate_score(ma7, ma30, rsi, macd, volume, avg_volume, whales):
+def calculate_score(ma7,ma30,rsi,macd,volume,avg_volume,whales):
 
-    score = 50
+    score=50
 
-    if ma7 > ma30:
-        score += 15
-
+    if ma7>ma30:
+        score+=15
     else:
-        score -= 10
+        score-=10
 
-    if rsi < 30:
-        score += 10
+    if rsi<30:
+        score+=10
 
-    if rsi > 70:
-        score -= 10
+    if rsi>70:
+        score-=10
 
-    if macd > 0:
-        score += 10
+    if macd>0:
+        score+=10
 
-    if volume > avg_volume * volume_spike:
-        score += 10
+    if volume>avg_volume*volume_spike:
+        score+=10
 
     if whales:
-        score += 5
+        score+=5
 
     return score
 
 
-# =========================
-# 记录交易信号
-# =========================
+# ======================
+# 冷却检测
+# ======================
 
-def log_signal(coin, price, score, signal):
+def in_cooldown(coin):
+
+    if coin not in last_signal_time:
+        return False
+
+    hours=(time.time()-last_signal_time[coin])/3600
+
+    return hours<config["cooldown_hours"]
+
+
+# ======================
+# 每日信号限制
+# ======================
+
+def can_send_today(coin):
+
+    today=datetime.now().strftime("%Y-%m-%d")
+
+    key=coin+today
+
+    if key not in daily_signal_count:
+        daily_signal_count[key]=0
+
+    return daily_signal_count[key]<config["max_signals_per_day"]
+
+
+# ======================
+# 信号确认
+# ======================
+
+def confirm_signal(coin,signal):
+
+    if coin not in signal_buffer:
+        signal_buffer[coin]=[]
+
+    signal_buffer[coin].append(signal)
+
+    if len(signal_buffer[coin])>config["confirm_signals"]:
+        signal_buffer[coin].pop(0)
+
+    return signal_buffer[coin].count(signal)==config["confirm_signals"]
+
+
+# ======================
+# 交易记录
+# ======================
+
+def log_signal(coin,price,score,signal):
 
     try:
 
         with open("trade_log.json") as f:
-            log = json.load(f)
+            log=json.load(f)
 
     except:
-        log = []
+
+        log=[]
 
     log.append({
 
-        "coin": coin,
-        "time": str(datetime.now()),
-        "price": price,
-        "score": score,
-        "signal": signal
+        "coin":coin,
+        "time":str(datetime.now()),
+        "price":price,
+        "score":score,
+        "signal":signal
 
     })
 
-    with open("trade_log.json", "w") as f:
-        json.dump(log, f, indent=2)
+    with open("trade_log.json","w") as f:
+        json.dump(log,f,indent=2)
 
 
-# =========================
+# ======================
 # 自动复盘
-# =========================
+# ======================
 
 def review_signals():
 
     try:
 
         with open("trade_log.json") as f:
-            log = json.load(f)
+            log=json.load(f)
 
     except:
         return
 
-    if len(log) < 5:
+    if len(log)<5:
         return
 
-    success = 0
+    success=0
 
     for item in log[-10:]:
 
-        coin = item["coin"]
+        coin=item["coin"]
 
-        price_old = item["price"]
+        price_old=item["price"]
 
-        closes,_ = get_candles(coin)
+        closes,_=get_candles(coin)
 
-        price_now = closes[-1]
+        if not closes:
+            continue
 
-        if item["signal"] == "buy":
+        price_now=closes[-1]
 
-            if price_now > price_old:
-                success += 1
+        if item["signal"]=="buy" and price_now>price_old:
+            success+=1
 
-        if item["signal"] == "sell":
+        if item["signal"]=="sell" and price_now<price_old:
+            success+=1
 
-            if price_now < price_old:
-                success += 1
+    winrate=success/10
 
-    winrate = success / 10
+    print("策略胜率:",winrate)
 
-    print("策略胜率:", winrate)
+    if winrate<0.4:
 
-    if winrate < 0.4:
-
-        send_message(f"⚠️AI策略近期胜率较低：{winrate}")
+        send_message(f"⚠️AI策略近期胜率较低 {winrate}")
 
 
-# =========================
+# ======================
 # 主循环
-# =========================
+# ======================
 
 while True:
 
-    print("AI量化系统运行中...")
+    print("AI量化系统V8运行中")
 
     for coin in coins:
 
         try:
 
-            closes, volumes = get_candles(coin)
+            closes,volumes=get_candles(coin)
 
-            price = closes[-1]
+            if not closes:
+                continue
 
-            ma7 = MA(closes, 7)
-            ma30 = MA(closes, 30)
+            price=closes[-1]
 
-            rsi = RSI(closes)
+            ma7=MA(closes,7)
+            ma30=MA(closes,30)
 
-            macd = MACD(closes)
+            rsi=RSI(closes)
 
-            volume = volumes[-1]
+            macd=MACD(closes)
 
-            avg_volume = statistics.mean(volumes[-20:])
+            volume=volumes[-1]
+            avg_volume=statistics.mean(volumes[-20:])
 
-            whales = check_whale(coin)
+            whales=check_whale(coin)
 
-            score = calculate_score(
-                ma7, ma30, rsi, macd, volume, avg_volume, whales
+            score=calculate_score(
+                ma7,ma30,rsi,macd,volume,avg_volume,whales
             )
 
-            if score >= config["buy_threshold"]:
+            if score>=config["buy_threshold"] and ma7>ma30:
 
-                signal = "buy"
-                advice = "买入信号"
+                signal="buy"
+                advice="买入信号"
 
-            elif score <= config["sell_threshold"]:
+            elif score<=config["sell_threshold"]:
 
-                signal = "sell"
-                advice = "卖出信号"
+                signal="sell"
+                advice="卖出信号"
 
             else:
 
-                signal = "hold"
-                advice = "观望"
+                signal="hold"
+                advice="观望"
 
-            msg = f"""
+            msg=f"""
 {coin}
 
-价格：{price}
+价格 {price}
 
-MA7：{round(ma7,2)}
-MA30：{round(ma30,2)}
+MA7 {round(ma7,2)}
+MA30 {round(ma30,2)}
 
-RSI：{round(rsi,2)}
-MACD：{round(macd,2)}
+RSI {round(rsi,2)}
+MACD {round(macd,2)}
 
-AI评分：{score}
+AI评分 {score}
 
-建议：{advice}
+建议 {advice}
 
-时间：{datetime.now()}
+时间 {datetime.now()}
 """
 
             print(msg)
 
-            if signal != "hold":
+            if signal!="hold":
+
+                if in_cooldown(coin):
+                    continue
+
+                if not can_send_today(coin):
+                    continue
+
+                if not confirm_signal(coin,signal):
+                    continue
 
                 send_message(msg)
 
-                log_signal(coin, price, score, signal)
+                log_signal(coin,price,score,signal)
 
-            time.sleep(2)
+                last_signal_time[coin]=time.time()
+
+                today=datetime.now().strftime("%Y-%m-%d")
+                key=coin+today
+                daily_signal_count[key]+=1
+
+            time.sleep(1.2)
 
         except Exception as e:
 
-            print("错误:", e)
+            print("错误",e)
 
     review_signals()
 
