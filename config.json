@@ -16,7 +16,7 @@
 
  "notify_method": "telegram",
 
- "telegram_bot_token": "8546952065:AAFx7E4-wx4AeGWS5sQthgnFLhtUvExOkrQ"“8546952065:AAFx7E4-wx4AeGWS5sQthgnFLhtUvExOkrQ”,
+ "telegram_bot_token": "8546952065:AAFx7E4-wx4AeGWS5sQthgnFLhtUvExOkrQ",
 
  "telegram_chat_id": "1392813886"
 }
