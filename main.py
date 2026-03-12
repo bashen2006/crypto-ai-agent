@@ -298,11 +298,11 @@ while True:
 
             else:
 
-                signal = "hold"信号 ="持有"
-                advice = "观望"建议 ="观望"
+                signal = "hold"
+                advice = "观望"
 
-            msg = f"""消息 =f"""消息 =f"""消息 =f"""消息 =f"""
-{coin}{币种}币}{币种}
+            msg = f"""
+{coin}
 
 价格：{price}
 
