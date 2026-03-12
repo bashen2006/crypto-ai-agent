@@ -193,11 +193,11 @@ while True:
             msg=f"""
 {coin}
 
-价格: {round四舍五入四舍五入四舍五入(price,2)}价格,2)}
+价格: {round(price,2)}
 
-市场状态: {market}市场状态:{市场}市场状态:{市场}
+市场状态: {market}
 
-RSI: {round四舍五入(rsi,2)}RSI：相对强弱指数：{四舍五入(rsi,2)}
+RSI: {round(rsi,2)}
 
 AI评分: {ai}
 
@@ -211,22 +211,22 @@ AI建议:
 
         except Exception as e:
 
-            send(f"{coin} 数据异常")发送(f"{币}数据异常")发送(f"f”{coin}数据异常")发送(f"f”{币}数据异常")发送(f"f”{币}数据异常")发送(f"{币}数据异常")
+            send(f"{coin} 数据异常")
 
             print(e)
 
-        time.sleep(1)时间。睡眠(1)
+        time.sleep(1)
 
-    if time.time()-last_review>21600:如果时间.时间()-上次审核>21600:如果时间。时间()-上次审核>21600:如果时间。时间()-上次审核>21600:
+    if time.time()-last_review>21600:
 
-        send发送发送发送发送发送发送发送发送发送发送("AI策略6小时复盘：系统运行正常")发送(“AI策略6小时复盘：系统运行正常”)发送(“AI策略6小时复盘：系统运行正常”)发送(“AI策略6小时复盘：系统运行正常”)
+        send("AI策略6小时复盘：系统运行正常")
 
         last_review=time.time()
 
     if time.time()-last_day>86400:
 
-        send("🔥AI策略24小时报告🔥")发送(“AI策略24小时报告”)发送(“AI策略24小时报告”)发送(“AI策略24小时报告”)发送(“AI策略24小时报告”)发送(发送(“AI策略24小时报告”)发送(“AI策略24小时报告”)发送(“AI策略24小时报告”)发送(“AI策略24小时报告”)发送(“AI策略24小时报告”)发送(“AI策略24小时报告”)发送(“AI策略24小时报告”)发送(“AI策略24小时报告”)
+        send("🔥AI策略24小时报告🔥")
 
-        last_day=time.time()昨天的时间=时间。时间()昨天的时间=time.time()
+        last_day=time.time()
 
     time.sleep(config["check_interval"])
