@@ -1,20 +1,15 @@
 {
  "coins": [
- "BTC-USDT",
- "ETH-USDT",
- "SOL-USDT",
- "OKB-USDT"
+  "BTC-USDT",
+  "ETH-USDT",
+  "SOL-USDT",
+  "OKB-USDT"
  ],
 
- "buy_threshold": 60,
- "strong_buy": 75,
-
- "sell_threshold": 40,
- "strong_sell": 25,
+ "buy_threshold": 70,
+ "sell_threshold": 30,
 
  "check_interval": 300,
-
- "notify_method": "telegram",
 
  "telegram_bot_token": "8546952065:AAFx7E4-wx4AeGWS5sQthgnFLhtUvExOkrQ",
 
