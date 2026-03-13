@@ -63,42 +63,41 @@ def record_signal(coin, price, score, signal):
 def update_results(current_price):
 
     if not os.path.exists(LOG_FILE):
-
         return
 
-
     with open(LOG_FILE, "r") as f:
-
         data = json.load(f)
 
+    updated = False
 
     for entry in data:
 
-        if entry["result"] is None:
+        # 已经判断过的不再改变
+        if entry["result"] is not None:
+            continue
 
-            old_price = entry["price"]
+        old_price = entry["price"]
 
-            if entry["signal"] in ["强买入", "建议买入"]:
+        if entry["signal"] in ["强买入", "建议买入"]:
 
-                if current_price > old_price:
+            if current_price > old_price:
+                entry["result"] = "win"
+            else:
+                entry["result"] = "lose"
 
-                    entry["result"] = "win"
+            updated = True
 
-                else:
+        elif entry["signal"] in ["强卖出", "建议卖出"]:
 
-                    entry["result"] = "lose"
+            if current_price < old_price:
+                entry["result"] = "win"
+            else:
+                entry["result"] = "lose"
 
-            elif entry["signal"] in ["强卖出", "建议卖出"]:
+            updated = True
 
-                if current_price < old_price:
-
-                    entry["result"] = "win"
-
-                else:
-
-                    entry["result"] = "lose"
-
-
-    with open(LOG_FILE, "w") as f:
+    if updated:
+        with open(LOG_FILE, "w") as f:
+            json.dump(data, f, indent=2)
 
         json.dump(data, f, indent=2)
