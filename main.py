@@ -1,232 +1,200 @@
-import requests
-import pandas as pd
 import time
 import json
-from datetime import datetime
 
-print("AI量化系统 V10 启动")
-
-with open("config.json") as f:
-    config=json.load(f)
-
-coins=config["coins"]
-
-BOT=config["telegram_bot_token"]
-CHAT=config["telegram_chat_id"]
-
-def send(msg):
-
-    url=f"https://api.telegram.org/bot{BOT}/sendMessage"
-
-    try:
-        requests.post(url,data={"chat_id":CHAT,"text":msg})
-    except:
-        print("telegram error")
+from modules.data_source import get_price, get_kline
+from modules.indicators import MA, RSI, MACD, Bollinger
+from modules.derivatives import get_funding_rate, get_open_interest, get_long_short_ratio
+from modules.onchain import get_whale_transactions
+from modules.ai_engine import calculate_score, generate_signal
+from modules.strategy import record_signal, update_results
+from modules.learning import calculate_win_rate
+from modules.report import generate_trade_report, generate_review_report
+from modules.telegram_bot import send_trade_report, send_review_report
 
 
-def get_kline(symbol):
+# =========================
+# 读取配置
+# =========================
 
-    url=f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar=5m&limit=200"
+def load_config():
 
-    r=requests.get(url)
+    with open("config.json", "r") as f:
 
-    data=r.json()["data"]
-
-    df=pd.DataFrame(data)
-
-    df=df.iloc[::-1]
-
-    df=df.astype(float)
-
-    return df
+        return json.load(f)
 
 
-def MA(series,n):
+config = load_config()
 
-    return series.rolling(n).mean()
+coins = config["coins"]
 
+buy_threshold = config["buy_threshold"]
 
-def RSI(series,period=14):
+sell_threshold = config["sell_threshold"]
 
-    delta=series.diff()
-
-    gain=(delta.where(delta>0,0)).rolling(period).mean()
-
-    loss=(-delta.where(delta<0,0)).rolling(period).mean()
-
-    rs=gain/loss
-
-    rsi=100-(100/(1+rs))
-
-    return rsi
+interval = config["check_interval"]
 
 
-def MACD(series):
+print("A12 AI量化系统启动...")
 
-    exp1=series.ewm(span=12).mean()
-
-    exp2=series.ewm(span=26).mean()
-
-    macd=exp1-exp2
-
-    signal=macd.ewm(span=9).mean()
-
-    return macd,signal
-
-
-def bollinger(series):
-
-    ma=series.rolling(20).mean()
-
-    std=series.rolling(20).std()
-
-    upper=ma+2*std
-
-    lower=ma-2*std
-
-    return upper,lower
-
-
-def bull_bear(ma50,ma100,ma200):
-
-    if ma50>ma100 and ma100>ma200:
-
-        return "牛市中 🟢"
-
-    if ma50<ma100 and ma100<ma200:
-
-        return "熊市中 🔴"
-
-    return "牛熊转换中 🟡"
-
-
-def score(price,ma7,ma30,ma50,ma100,ma200,rsi,macd,signal,upper,lower):
-
-    s=50
-
-    if ma7>ma30:
-        s+=10
-
-    if ma50>ma100:
-        s+=10
-
-    if price>ma200:
-        s+=10
-
-    if rsi<35:
-        s+=10
-
-    if rsi>70:
-        s-=10
-
-    if macd>signal:
-        s+=10
-
-    if price<lower:
-        s+=10
-
-    if price>upper:
-        s-=10
-
-    return max(0,min(100,s))
-
-
-last_review=time.time()
-last_day=time.time()
+# =========================
+# 主循环
+# =========================
 
 while True:
 
-    print("开始新一轮检测")
+    try:
 
-    for coin in coins:
+        for coin in coins:
 
-        try:
+            print("监控币种:", coin)
 
-            df=get_kline(coin)
+            # 获取价格
+            price = get_price(coin)
 
-            close=df[4]
+            # 获取K线
+            df = get_kline(coin)
 
-            price=float(close.iloc[-1])
+            if df is None:
 
-            ma7=MA(close,7).iloc[-1]
-            ma30=MA(close,30).iloc[-1]
-            ma50=MA(close,50).iloc[-1]
-            ma100=MA(close,100).iloc[-1]
-            ma200=MA(close,200).iloc[-1]
+                continue
 
-            rsi=RSI(close).iloc[-1]
+            close = df["close"]
 
-            macd,signal=MACD(close)
 
-            macd=macd.iloc[-1]
-            signal=signal.iloc[-1]
+            # =========================
+            # 技术指标
+            # =========================
 
-            upper,lower=bollinger(close)
+            ma7 = MA(close, 7).iloc[-1]
 
-            upper=upper.iloc[-1]
-            lower=lower.iloc[-1]
+            ma30 = MA(close, 30).iloc[-1]
 
-            market=bull_bear(ma50,ma100,ma200)
+            rsi = RSI(close).iloc[-1]
 
-            ai=score(price,ma7,ma30,ma50,ma100,ma200,rsi,macd,signal,upper,lower)
+            macd, signal, hist = MACD(close)
 
-            if ai>=config["strong_buy"]:
+            macd_val = macd.iloc[-1]
 
-                action="强买入"
+            macd_signal = signal.iloc[-1]
 
-            elif ai>=config["buy_threshold"]:
+            upper, mid, lower = Bollinger(close)
 
-                action="建议买入"
+            boll_upper = upper.iloc[-1]
 
-            elif ai<=config["strong_sell"]:
+            boll_lower = lower.iloc[-1]
 
-                action="强卖出"
 
-            elif ai<=config["sell_threshold"]:
+            indicators = {
 
-                action="建议卖出"
+                "price": price,
 
-            else:
+                "ma7": ma7,
 
-                action="观望"
+                "ma30": ma30,
 
-            msg=f"""
-{coin}
+                "rsi": rsi,
 
-价格: {round(price,2)}
+                "macd": macd_val,
 
-市场状态: {market}
+                "macd_signal": macd_signal,
 
-RSI: {round(rsi,2)}
+                "boll_upper": boll_upper,
 
-AI评分: {ai}
+                "boll_lower": boll_lower
 
-AI建议:
-{action}
-"""
+            }
 
-            print(msg)
 
-            send(msg)
+            # =========================
+            # 衍生品数据
+            # =========================
 
-        except Exception as e:
+            funding_rate = get_funding_rate(coin)
 
-            send(f"{coin} 数据异常")
+            open_interest = get_open_interest(coin)
 
-            print(e)
+            long_short_ratio = get_long_short_ratio(coin)
 
-        time.sleep(1)
 
-    if time.time()-last_review>21600:
+            derivatives = {
 
-        send("AI策略6小时复盘：系统运行正常")
+                "funding_rate": funding_rate,
 
-        last_review=time.time()
+                "open_interest": open_interest,
 
-    if time.time()-last_day>86400:
+                "long_short_ratio": long_short_ratio
 
-        send("🔥AI策略24小时报告🔥")
+            }
 
-        last_day=time.time()
 
-    time.sleep(config["check_interval"])
+            # =========================
+            # 巨鲸监控
+            # =========================
+
+            whales = get_whale_transactions()
+
+
+            # =========================
+            # AI评分
+            # =========================
+
+            score = calculate_score(indicators, derivatives, whales)
+
+            signal_text = generate_signal(score)
+
+
+            print("AI评分:", score)
+
+            print("AI建议:", signal_text)
+
+
+            # =========================
+            # 记录信号
+            # =========================
+
+            record_signal(coin, price, score, signal_text)
+
+
+            # =========================
+            # 更新策略结果
+            # =========================
+
+            update_results(price)
+
+
+            # =========================
+            # 生成交易报告
+            # =========================
+
+            report = generate_trade_report(coin, price, score, signal_text)
+
+            print(report)
+
+
+            # =========================
+            # 发送Telegram
+            # =========================
+
+            send_trade_report(report)
+
+
+            # =========================
+            # 策略复盘
+            # =========================
+
+            win_rate, wins, loses = calculate_win_rate()
+
+            review = generate_review_report(win_rate, wins, loses)
+
+            send_review_report(review)
+
+
+        print("等待下一轮监控...")
+
+        time.sleep(interval)
+
+    except Exception as e:
+
+        print("系统错误:", e)
+
+        time.sleep(60)
