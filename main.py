@@ -17,12 +17,16 @@ STATUS_PUSH_INTERVAL=300
 DAILY_REPORT_INTERVAL=86400
 BACKTEST_INTERVAL=86400
 ADAPTIVE_OPTIMIZATION_INTERVAL=86400
+MARKET_CYCLE_INTERVAL=3600
 
 last_signal_time={}
 last_status_push=0
 last_daily_report=0
 last_backtest_time=0
 last_adaptive_time=0
+last_cycle_check=0
+
+current_market_cycle="未知"
 
 MAX_LOG_SIZE=2000
 MAX_DYNAMIC_COINS=3
@@ -34,26 +38,20 @@ def load_config():
 
 
 def load_memory():
-
     try:
         with open(MEMORY_FILE) as f:
             return json.load(f)
-
     except:
-
         memory={
             "trend_weight":0.3,
             "momentum_weight":0.25,
             "volume_weight":0.2
         }
-
         save_memory(memory)
-
         return memory
 
 
 def save_memory(memory):
-
     with open(MEMORY_FILE,"w") as f:
         json.dump(memory,f,indent=4)
 
@@ -65,17 +63,11 @@ def save_memory(memory):
 def safe_request(url):
 
     for i in range(3):
-
         try:
-
             r=requests.get(url,timeout=10)
-
             if r.status_code==200:
-
                 return r.json()
-
         except:
-
             time.sleep(2)
 
     return None
@@ -126,7 +118,6 @@ def detect_whale(inst):
             value=size*price
 
             if value>WHALE_THRESHOLD:
-
                 whale+=value
 
         return whale
@@ -135,6 +126,10 @@ def detect_whale(inst):
 
         return 0
 
+
+# =========================
+# AI评分
+# =========================
 
 def calculate_score(df,memory,whale):
 
@@ -180,7 +175,54 @@ def calculate_score(df,memory,whale):
 
 
 # =========================
-# 新增：AI策略自适应优化
+# 新增：市场周期识别
+# =========================
+
+def detect_market_cycle():
+
+    try:
+
+        df=get_kline("BTC-USDT")
+
+        df["ma200"]=df["close"].rolling(200).mean()
+
+        price=df["close"].iloc[-1]
+        ma200=df["ma200"].iloc[-1]
+
+        momentum=(df["close"].iloc[-1]-df["close"].iloc[-30])/df["close"].iloc[-30]
+
+        if price>ma200 and momentum>0.05:
+            return "牛市"
+
+        elif price<ma200:
+            return "熊市"
+
+        else:
+            return "震荡"
+
+    except:
+
+        return "未知"
+
+
+def apply_cycle_strategy_adjustment(memory,cycle):
+
+    memory=memory.copy()
+
+    if cycle=="牛市":
+        memory["trend_weight"]=min(memory["trend_weight"]+0.05,1)
+
+    elif cycle=="熊市":
+        memory["trend_weight"]=max(memory["trend_weight"]-0.05,0)
+
+    elif cycle=="震荡":
+        memory["volume_weight"]=min(memory["volume_weight"]+0.05,1)
+
+    return memory
+
+
+# =========================
+# AI策略自适应优化
 # =========================
 
 def adaptive_strategy_optimization():
@@ -212,100 +254,14 @@ def adaptive_strategy_optimization():
     memory=load_memory()
 
     if winrate>0.6:
-
         memory["trend_weight"]=min(memory["trend_weight"]+0.02,1)
-        memory["momentum_weight"]=min(memory["momentum_weight"]+0.02,1)
-        memory["volume_weight"]=min(memory["volume_weight"]+0.02,1)
 
     elif winrate<0.4:
-
         memory["trend_weight"]=max(memory["trend_weight"]-0.02,0)
-        memory["momentum_weight"]=max(memory["momentum_weight"]-0.02,0)
-        memory["volume_weight"]=max(memory["volume_weight"]-0.02,0)
 
     save_memory(memory)
 
-    print("AI策略自适应优化完成 当前权重:",memory)
-
-
-# =========================
-# AI自动回测
-# =========================
-
-def calculate_backtest_performance():
-
-    if not os.path.exists(LOG_FILE):
-        return 0,0
-
-    with open(LOG_FILE) as f:
-
-        logs=json.load(f)
-
-    profit=0
-    trades=0
-
-    for r in logs:
-
-        if r["result"]=="correct":
-            profit+=1
-
-        elif r["result"]=="wrong":
-            profit-=1
-
-        if r["result"]!=None:
-            trades+=1
-
-    return profit,trades
-
-
-def send_backtest_report(config):
-
-    profit,trades=calculate_backtest_performance()
-
-    msg=f"""
-AI策略自动回测报告
-
-历史交易次数: {trades}
-策略收益评分: {profit}
-
-时间: {time.strftime("%Y-%m-%d %H:%M:%S")}
-"""
-
-    send_telegram(msg,
-                  config["telegram_bot_token"],
-                  config["telegram_chat_id"])
-
-    send_email("AI策略回测报告",
-               msg,
-               config["email_user"],
-               config["email_pass"],
-               config["email_receiver"])
-
-
-def send_telegram(msg,token,chat):
-
-    url=f"https://api.telegram.org/bot{token}/sendMessage"
-
-    data={"chat_id":chat,"text":msg}
-
-    requests.post(url,data=data)
-
-
-def send_email(subject,content,user,password,receiver):
-
-    msg=MIMEText(content,"plain","utf-8")
-
-    msg["Subject"]=subject
-    msg["From"]=user
-    msg["To"]=receiver
-
-    server=smtplib.SMTP_SSL("smtp.139.com",465)
-
-    server.login(user,password)
-
-    server.sendmail(user,receiver,msg.as_string())
-
-    server.quit()
+    print("AI策略自适应优化完成",memory)
 
 
 # =========================
@@ -316,6 +272,8 @@ def main():
 
     global last_backtest_time
     global last_adaptive_time
+    global last_cycle_check
+    global current_market_cycle
 
     config=load_config()
 
@@ -325,8 +283,15 @@ def main():
 
         try:
 
-            risk=market_risk_index()
-            sentiment=market_sentiment()
+            now=time.time()
+
+            if now-last_cycle_check>MARKET_CYCLE_INTERVAL:
+
+                current_market_cycle=detect_market_cycle()
+
+                print("市场周期:",current_market_cycle)
+
+                last_cycle_check=now
 
             hot=scan_hot_coins()
 
@@ -340,6 +305,8 @@ def main():
                         coins.append(h)
 
             memory=load_memory()
+
+            memory=apply_cycle_strategy_adjustment(memory,current_market_cycle)
 
             for coin in coins:
 
@@ -356,9 +323,7 @@ def main():
                 else:
                     signal="中性"
 
-                print(coin,signal,score)
-
-            now=time.time()
+                print(coin,signal,score,current_market_cycle)
 
             if now-last_backtest_time>BACKTEST_INTERVAL:
 
@@ -380,5 +345,4 @@ def main():
 
 
 if __name__=="__main__":
-
     main()
