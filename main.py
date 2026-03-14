@@ -13,24 +13,19 @@ LOG_FILE="prediction_log.json"
 WHALE_THRESHOLD=20000
 SIGNAL_COOLDOWN=1800
 
+STATUS_PUSH_INTERVAL=300
+
 last_signal_time={}
+last_status_push=0
 
 MAX_LOG_SIZE=2000
 MAX_DYNAMIC_COINS=3
 
 
-# =========================
-# 配置加载
-# =========================
-
 def load_config():
     with open(CONFIG_FILE) as f:
         return json.load(f)
 
-
-# =========================
-# AI权重
-# =========================
 
 def load_memory():
 
@@ -58,7 +53,7 @@ def save_memory(memory):
 
 
 # =========================
-# 新增：安全请求模块
+# 新增：安全请求
 # =========================
 
 def safe_request(url):
@@ -79,10 +74,6 @@ def safe_request(url):
 
     return None
 
-
-# =========================
-# OKX行情
-# =========================
 
 def get_kline(inst):
 
@@ -105,10 +96,6 @@ def get_kline(inst):
 
     return df
 
-
-# =========================
-# 巨鲸监控
-# =========================
 
 def detect_whale(inst):
 
@@ -142,10 +129,6 @@ def detect_whale(inst):
 
         return 0
 
-
-# =========================
-# AI评分
-# =========================
 
 def calculate_score(df,memory,whale):
 
@@ -200,10 +183,6 @@ def calculate_score(df,memory,whale):
     return score,factors
 
 
-# =========================
-# 市场风险指数
-# =========================
-
 def market_risk_index():
 
     try:
@@ -227,10 +206,6 @@ def market_risk_index():
 
         return "未知"
 
-
-# =========================
-# 市场情绪指数
-# =========================
 
 def market_sentiment():
 
@@ -293,10 +268,6 @@ def market_sentiment():
         return "未知"
 
 
-# =========================
-# 强势币扫描
-# =========================
-
 def scan_hot_coins():
 
     coins=[]
@@ -342,10 +313,6 @@ def scan_hot_coins():
         return []
 
 
-# =========================
-# 强势币过滤
-# =========================
-
 def hot_coin_filter(coin):
 
     try:
@@ -367,193 +334,65 @@ def hot_coin_filter(coin):
         return False
 
 
-# =========================
-# 日志优化（新增）
-# =========================
+def send_telegram(msg,token,chat):
 
-def trim_logs():
+    url=f"https://api.telegram.org/bot{token}/sendMessage"
 
-    try:
+    data={"chat_id":chat,"text":msg}
 
-        if not os.path.exists(LOG_FILE):
-            return
+    requests.post(url,data=data)
 
-        with open(LOG_FILE) as f:
 
-            logs=json.load(f)
+def send_email(subject,content,user,password,receiver):
 
-        if len(logs)>MAX_LOG_SIZE:
+    msg=MIMEText(content,"plain","utf-8")
 
-            logs=logs[-MAX_LOG_SIZE:]
+    msg["Subject"]=subject
+    msg["From"]=user
+    msg["To"]=receiver
 
-            with open(LOG_FILE,"w") as f:
+    server=smtplib.SMTP_SSL("smtp.139.com",465)
 
-                json.dump(logs,f)
+    server.login(user,password)
 
-    except:
+    server.sendmail(user,receiver,msg.as_string())
 
-        pass
+    server.quit()
 
 
 # =========================
-# 记录预测
+# 新增：5分钟状态推送
 # =========================
 
-def log_prediction(coin,price,signal,factors):
+def send_status_report(config,risk,sentiment,coin_count):
 
-    try:
-        with open(LOG_FILE) as f:
-            logs=json.load(f)
-    except:
-        logs=[]
+    now_str=time.strftime("%Y-%m-%d %H:%M:%S")
 
-    logs.append({
+    msg=f"""
+AI系统状态报告
 
-        "coin":coin,
-        "time":time.time(),
-        "price":price,
-        "signal":signal,
-        "factors":factors,
-        "result":None
-    })
+监控币种数量: {coin_count}
+市场风险: {risk}
+市场情绪: {sentiment}
 
-    with open(LOG_FILE,"w") as f:
-        json.dump(logs,f)
+系统运行状态: 正常
+时间: {now_str}
+"""
 
-    trim_logs()
+    send_telegram(msg,
+                  config["telegram_bot_token"],
+                  config["telegram_chat_id"])
 
+    send_email("AI系统状态报告",
+               msg,
+               config["email_user"],
+               config["email_pass"],
+               config["email_receiver"])
 
-# =========================
-# 验证预测
-# =========================
-
-def evaluate_predictions():
-
-    try:
-
-        with open(LOG_FILE) as f:
-
-            logs=json.load(f)
-
-    except:
-
-        return
-
-    changed=False
-
-    for r in logs:
-
-        if r["result"]!=None:
-            continue
-
-        if time.time()-r["time"]<7200:
-            continue
-
-        df=get_kline(r["coin"])
-
-        price=df["close"].iloc[-1]
-
-        if price>r["price"]:
-            r["result"]="correct"
-        else:
-            r["result"]="wrong"
-
-        changed=True
-
-    if changed:
-
-        with open(LOG_FILE,"w") as f:
-            json.dump(logs,f)
-
-
-# =========================
-# AI权重优化
-# =========================
-
-def optimize_weights():
-
-    try:
-
-        with open(LOG_FILE) as f:
-            logs=json.load(f)
-
-    except:
-        return
-
-    memory=load_memory()
-
-    stats={"trend":[0,0],"momentum":[0,0],"volume":[0,0]}
-
-    for r in logs:
-
-        if r["result"]==None:
-            continue
-
-        for f in stats:
-
-            if f in r["factors"]:
-
-                stats[f][1]+=1
-
-                if r["result"]=="correct":
-
-                    stats[f][0]+=1
-
-    for f in stats:
-
-        if stats[f][1]>5:
-
-            rate=stats[f][0]/stats[f][1]
-
-            if rate>0.6:
-                memory[f+"_weight"]+=0.01
-            else:
-                memory[f+"_weight"]-=0.01
-
-    save_memory(memory)
-
-
-# =========================
-# 系统统计
-# =========================
-
-def system_stats():
-
-    try:
-
-        with open(LOG_FILE) as f:
-
-            logs=json.load(f)
-
-    except:
-
-        return
-
-    total=0
-    correct=0
-
-    for r in logs:
-
-        if r["result"]!=None:
-
-            total+=1
-
-            if r["result"]=="correct":
-
-                correct+=1
-
-    if total>0:
-
-        winrate=round(correct/total*100,2)
-
-        print(f"系统统计 | 总预测:{total} | 胜率:{winrate}%")
-
-
-# =========================
-# 主程序
-# =========================
 
 def main():
+
+    global last_status_push
 
     config=load_config()
 
@@ -562,10 +401,6 @@ def main():
     while True:
 
         try:
-
-            evaluate_predictions()
-            optimize_weights()
-            system_stats()
 
             risk=market_risk_index()
             sentiment=market_sentiment()
@@ -616,29 +451,14 @@ AI评分: {score}
 
                 print(msg)
 
-                now=time.time()
+            # 新增：5分钟状态推送
+            now=time.time()
 
-                if signal!="中性":
+            if now-last_status_push>STATUS_PUSH_INTERVAL:
 
-                    if coin in last_signal_time:
+                send_status_report(config,risk,sentiment,len(coins))
 
-                        if now-last_signal_time[coin]<SIGNAL_COOLDOWN:
-
-                            continue
-
-                    send_telegram(msg,
-                                  config["telegram_bot_token"],
-                                  config["telegram_chat_id"])
-
-                    send_email("AI交易信号",
-                               msg,
-                               config["email_user"],
-                               config["email_pass"],
-                               config["email_receiver"])
-
-                    log_prediction(coin,price,signal,factors)
-
-                    last_signal_time[coin]=now
+                last_status_push=now
 
         except Exception as e:
 
