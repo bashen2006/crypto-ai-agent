@@ -1,1 +1,40 @@
-[]
+[
+  {
+    "timestamp": 1700000000.123,
+    "coin": "BTC-USDT",
+    "signal": "买入",
+    "score": 78,
+    "price": 50000.0,
+    "whale": 250000,
+    "market_cycle": "牛市",
+    "rule_score": 72,
+    "ml_score": 81.5,
+    "ml_confidence": 0.85,
+    "features": {
+      "rsi": 65.3,
+      "momentum_20": 0.12,
+      "volume_ratio": 2.1
+    },
+    "verified": false,
+    "result": null
+  },
+  {
+    "timestamp": 1700000300.456,
+    "coin": "ETH-USDT",
+    "signal": "卖出",
+    "score": 32,
+    "price": 3000.0,
+    "whale": 0,
+    "market_cycle": "震荡",
+    "rule_score": 35,
+    "ml_score": 29.8,
+    "ml_confidence": 0.72,
+    "features": {
+      "rsi": 32.1,
+      "momentum_20": -0.08,
+      "volume_ratio": 0.6
+    },
+    "verified": false,
+    "result": null
+  }
+]
