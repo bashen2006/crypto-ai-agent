@@ -931,13 +931,13 @@ def main():
                 last_adaptive_time = now
 
             # 8. 状态推送
-                        # 8. 状态推送（超级信号版）
+                                             
             if now - last_status_push > STATUS_PUSH_INTERVAL:
                 # 计算运行时间
                 uptime_seconds = int(now - start_time)
                 hours = uptime_seconds // 3600
                 minutes = (uptime_seconds % 3600) // 60
-                
+
                 # 模型信息
                 if ai_model.is_trained:
                     model_acc = ai_model.training_history[-1]['accuracy']
@@ -945,12 +945,13 @@ def main():
                     model_info = f"✅ 已训练 (准确率: {model_acc:.2%}, 样本: {model_samples})"
                 else:
                     model_info = "❌ 未训练"
-                
-                # 当前监控币种评分/信号
+
+                # 当前监控币种评分/信号（含价格）
                 coin_lines = []
                 for coin in coins:
                     try:
                         df = get_kline(coin)
+                        price = df["close"].iloc[-1]
                         whale = detect_whale(coin)
                         score, factors, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
                         # 判断信号
@@ -960,29 +961,29 @@ def main():
                             signal_icon = "🔴 卖出"
                         else:
                             signal_icon = "⚪ 中性"
-                        coin_lines.append(f"{coin}: {score} {signal_icon}")
+                        coin_lines.append(f"{coin}: ${price:.4f} {score} {signal_icon}")
                     except Exception as e:
                         coin_lines.append(f"{coin}: 获取失败")
-                
+
                 # 最近买卖信号
                 recent_signals = get_recent_signals(3)
                 recent_str = "\n".join(recent_signals) if recent_signals else "暂无"
-                
+
                 # 市场热点币种（前3个，带涨幅）
                 hot_coins_with_change = scan_hot_coins()[:3]
                 hot_lines = [f"{coin}: {change:+.2f}%" for coin, change in hot_coins_with_change]
                 hot_str = "\n".join(hot_lines) if hot_lines else "暂无"
-                
+
                 # 今日信号统计
                 today_total, today_correct = get_signal_stats_since(24)
                 today_winrate = today_correct / today_total if today_total > 0 else 0
-                
+
                 # 6小时和24小时统计
                 sixh_total, sixh_correct = get_signal_stats_since(6)
                 sixh_winrate = sixh_correct / sixh_total if sixh_total > 0 else 0
                 twenty4h_total, twenty4h_correct = today_total, today_correct
                 twenty4h_winrate = today_winrate
-                
+
                 # 构建消息
                 status = f"🔥 AI超级信号\n\n"
                 status += "📈 当前监控币种:\n" + "\n".join(coin_lines) + "\n\n"
@@ -994,10 +995,9 @@ def main():
                 status += f"6小时: {sixh_total}次, 胜率 {sixh_winrate:.2%}\n"
                 status += f"24小时: {twenty4h_total}次, 胜率 {twenty4h_winrate:.2%}\n"
                 status += f"运行时间: {hours}小时{minutes}分钟 | 周期: {current_market_cycle}"
-                
+
                 send_telegram_message(status, config)
                 last_status_push = now
-
             # 9. 日报推送
             if now - last_daily_report > DAILY_REPORT_INTERVAL:
                 send_backtest_report(config)
