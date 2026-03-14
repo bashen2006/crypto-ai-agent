@@ -1,6 +1,6 @@
 {
- "active_strategy": ["trend","momentum"],
- "strategies": [
+ "active_strategy":["trend","momentum"],
+ "strategies":[
   ["trend","momentum"],
   ["trend","volume"],
   ["momentum","volume"],
