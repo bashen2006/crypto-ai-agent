@@ -173,15 +173,21 @@ def get_signal_strength(score):
 
     if score >= 75:
         return "强信号"
-
     elif score >= 60:
         return "中等信号"
-
     elif score >= 45:
         return "观察"
-
     else:
         return "弱信号"
+
+
+# 🔥超级信号判断
+def check_super_signal(score, cycle, whale_volume):
+
+    if score >= 75 and cycle == "主升浪" and whale_volume >= 50000:
+        return True
+
+    return False
 
 
 # Telegram
@@ -195,32 +201,6 @@ def send_telegram(message, token, chat_id):
     }
 
     requests.post(url, data=payload)
-
-
-# 扫描暴涨币
-def scan_hot_coins():
-
-    try:
-
-        url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
-
-        r = requests.get(url)
-
-        data = r.json()["data"]
-
-        coins = []
-
-        for coin in data:
-
-            change = float(coin["sodUtc8"])
-
-            if change > 0.05:
-                coins.append(coin["instId"])
-
-        return coins[:3]
-
-    except:
-        return []
 
 
 # 保存预测
@@ -246,55 +226,6 @@ def save_prediction(coin, signal, price, score, df):
         json.dump(logs, f, indent=4)
 
 
-# AI复盘
-def review_predictions():
-
-    try:
-        with open(LOG_FILE, "r") as f:
-            logs = json.load(f)
-    except:
-        return
-
-    if len(logs) == 0:
-        return
-
-    correct = 0
-    total = 0
-
-    for record in logs:
-
-        coin = record["coin"]
-        price_then = record["price"]
-        signal = record["signal"]
-
-        try:
-
-            df = get_okx_kline(coin)
-
-            price_now = df["close"].iloc[-1]
-
-            if signal == "买入" and price_now > price_then:
-                correct += 1
-
-            elif signal == "卖出" and price_now < price_then:
-                correct += 1
-
-            total += 1
-
-        except:
-            continue
-
-    if total == 0:
-        return
-
-    accuracy = correct / total
-
-    print("AI复盘完成")
-    print("预测次数:", total)
-    print("正确次数:", correct)
-    print("准确率:", accuracy)
-
-
 # 主程序
 def main():
 
@@ -302,24 +233,11 @@ def main():
 
     print("AI交易系统启动")
 
-    last_review = time.time()
-    last_scan = time.time()
-
     while True:
 
         memory = load_ai_memory()
 
         print("\n开始市场扫描:", datetime.now())
-
-        if time.time() - last_scan > 3600:
-
-            hot_coins = scan_hot_coins()
-
-            for c in hot_coins:
-                if c not in config["coins"]:
-                    config["coins"].append(c)
-
-            last_scan = time.time()
 
         for coin in config["coins"]:
 
@@ -339,6 +257,8 @@ def main():
 
                 strength = get_signal_strength(score)
 
+                super_signal = check_super_signal(score, cycle, whale_volume)
+
                 if score >= config["buy_threshold"]:
                     signal = "买入"
                 elif score <= config["sell_threshold"]:
@@ -346,13 +266,46 @@ def main():
                 else:
                     signal = "中性"
 
-                print(
-                    f"[{datetime.now()}] {coin} | 评分:{score} | 信号:{signal} | 强度:{strength} | 周期:{cycle} | 市场:{trend} | 巨鲸:{int(whale_volume)}"
-                )
+                if super_signal:
+
+                    print(
+                        f"[{datetime.now()}] 🔥超级信号 {coin} | 评分:{score} | 周期:{cycle} | 巨鲸:{int(whale_volume)}"
+                    )
+
+                else:
+
+                    print(
+                        f"[{datetime.now()}] {coin} | 评分:{score} | 信号:{signal} | 强度:{strength} | 周期:{cycle} | 市场:{trend} | 巨鲸:{int(whale_volume)}"
+                    )
 
                 save_prediction(coin, signal, price, score, df)
 
-                if signal != "中性":
+                if super_signal:
+
+                    msg = f"""
+🔥 AI超级信号
+
+币种：{coin}
+
+当前价格：{price}
+
+行情阶段：{cycle}
+行情评级：{trend}
+
+AI评分：{score}
+
+巨鲸资金：{int(whale_volume)} USDT
+
+建议：强买入
+"""
+
+                    send_telegram(
+                        msg,
+                        config["telegram_bot_token"],
+                        config["telegram_chat_id"]
+                    )
+
+                elif signal != "中性":
 
                     msg = f"""
 AI交易信号
@@ -381,14 +334,6 @@ AI评分：{score}
             except Exception as e:
 
                 print("错误:", e)
-
-        if time.time() - last_review > 21600:
-
-            print("开始AI复盘")
-
-            review_predictions()
-
-            last_review = time.time()
 
         time.sleep(config["check_interval"])
 
