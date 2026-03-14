@@ -198,7 +198,7 @@ def market_sentiment():
 
         url="https://www.okx.com/api/v5/market/tickers?instType=SPOT"
 
-        r=requests.get(url)
+        r=requests.get(url,timeout=10)
 
         data=r.json()["data"]
 
@@ -209,18 +209,37 @@ def market_sentiment():
 
             try:
 
-                change=float(c["chgUtc"])
+                # 原逻辑（完全保留）
+                if "chgUtc" in c:
+
+                    change=float(c["chgUtc"])
+
+                # 新增备用逻辑
+                else:
+
+                    last=float(c["last"])
+                    open24=float(c["open24h"])
+
+                    change=(last-open24)/open24
 
                 if change>0:
 
                     up+=1
                 else:
+
                     down+=1
 
             except:
+
                 pass
 
-        ratio=up/(up+down)
+        total=up+down
+
+        if total==0:
+
+            return "未知"
+
+        ratio=up/total
 
         if ratio>0.7:
             return "极度贪婪"
@@ -231,7 +250,9 @@ def market_sentiment():
         else:
             return "恐慌"
 
-    except:
+    except Exception as e:
+
+        print("情绪指数错误:",e)
 
         return "未知"
 
@@ -472,6 +493,25 @@ def system_stats():
         winrate=round(correct/total*100,2)
 
         print(f"系统统计 | 总预测:{total} | 胜率:{winrate}%")
+
+# =========================
+# 稳定性增强模块
+# =========================
+def safe_request(url):
+
+    for i in range(3):
+
+        try:
+
+            r=requests.get(url,timeout=10)
+
+            return r.json()
+
+        except:
+
+            time.sleep(2)
+
+    return None
 
 # =========================
 # 主程序
