@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import smtplib
 from email.mime.text import MIMEText
+import os
 
 CONFIG_FILE="config.json"
 MEMORY_FILE="ai_memory.json"
@@ -14,6 +15,10 @@ SIGNAL_COOLDOWN=1800
 
 last_signal_time={}
 
+MAX_LOG_SIZE=2000
+MAX_DYNAMIC_COINS=3
+
+
 # =========================
 # 配置加载
 # =========================
@@ -21,6 +26,7 @@ last_signal_time={}
 def load_config():
     with open(CONFIG_FILE) as f:
         return json.load(f)
+
 
 # =========================
 # AI权重
@@ -50,6 +56,30 @@ def save_memory(memory):
     with open(MEMORY_FILE,"w") as f:
         json.dump(memory,f,indent=4)
 
+
+# =========================
+# 新增：安全请求模块
+# =========================
+
+def safe_request(url):
+
+    for i in range(3):
+
+        try:
+
+            r=requests.get(url,timeout=10)
+
+            if r.status_code==200:
+
+                return r.json()
+
+        except:
+
+            time.sleep(2)
+
+    return None
+
+
 # =========================
 # OKX行情
 # =========================
@@ -58,9 +88,12 @@ def get_kline(inst):
 
     url=f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar=5m&limit=100"
 
-    r=requests.get(url)
+    data=safe_request(url)
 
-    data=r.json()["data"]
+    if not data:
+        raise Exception("行情请求失败")
+
+    data=data["data"]
 
     df=pd.DataFrame(data)
 
@@ -72,6 +105,7 @@ def get_kline(inst):
 
     return df
 
+
 # =========================
 # 巨鲸监控
 # =========================
@@ -82,9 +116,12 @@ def detect_whale(inst):
 
         url=f"https://www.okx.com/api/v5/market/trades?instId={inst}&limit=100"
 
-        r=requests.get(url)
+        data=safe_request(url)
 
-        data=r.json()["data"]
+        if not data:
+            return 0
+
+        data=data["data"]
 
         whale=0
 
@@ -104,6 +141,7 @@ def detect_whale(inst):
     except:
 
         return 0
+
 
 # =========================
 # AI评分
@@ -161,8 +199,9 @@ def calculate_score(df,memory,whale):
 
     return score,factors
 
+
 # =========================
-# 新增：市场风险指数
+# 市场风险指数
 # =========================
 
 def market_risk_index():
@@ -188,8 +227,9 @@ def market_risk_index():
 
         return "未知"
 
+
 # =========================
-# 新增：市场情绪指数
+# 市场情绪指数
 # =========================
 
 def market_sentiment():
@@ -198,9 +238,12 @@ def market_sentiment():
 
         url="https://www.okx.com/api/v5/market/tickers?instType=SPOT"
 
-        r=requests.get(url,timeout=10)
+        data=safe_request(url)
 
-        data=r.json()["data"]
+        if not data:
+            return "未知"
+
+        data=data["data"]
 
         up=0
         down=0
@@ -209,12 +252,10 @@ def market_sentiment():
 
             try:
 
-                # 原逻辑（完全保留）
                 if "chgUtc" in c:
 
                     change=float(c["chgUtc"])
 
-                # 新增备用逻辑
                 else:
 
                     last=float(c["last"])
@@ -226,17 +267,14 @@ def market_sentiment():
 
                     up+=1
                 else:
-
                     down+=1
 
             except:
-
                 pass
 
         total=up+down
 
         if total==0:
-
             return "未知"
 
         ratio=up/total
@@ -250,14 +288,13 @@ def market_sentiment():
         else:
             return "恐慌"
 
-    except Exception as e:
-
-        print("情绪指数错误:",e)
+    except:
 
         return "未知"
 
+
 # =========================
-# 新增：强势币扫描
+# 强势币扫描
 # =========================
 
 def scan_hot_coins():
@@ -268,15 +305,27 @@ def scan_hot_coins():
 
         url="https://www.okx.com/api/v5/market/tickers?instType=SPOT"
 
-        r=requests.get(url)
+        data=safe_request(url)
 
-        data=r.json()["data"]
+        if not data:
+            return []
+
+        data=data["data"]
 
         for c in data:
 
             try:
 
-                change=float(c["chgUtc"])
+                if "chgUtc" in c:
+
+                    change=float(c["chgUtc"])
+
+                else:
+
+                    last=float(c["last"])
+                    open24=float(c["open24h"])
+
+                    change=(last-open24)/open24
 
                 if change>0.05:
 
@@ -286,14 +335,15 @@ def scan_hot_coins():
 
                 pass
 
-        return coins[:3]
+        return coins[:MAX_DYNAMIC_COINS]
 
     except:
 
         return []
 
+
 # =========================
-# 新增：强势币回测过滤
+# 强势币过滤
 # =========================
 
 def hot_coin_filter(coin):
@@ -307,44 +357,43 @@ def hot_coin_filter(coin):
         if change>0:
 
             return True
+
         else:
+
             return False
 
     except:
 
         return False
 
-# =========================
-# Telegram
-# =========================
-
-def send_telegram(msg,token,chat):
-
-    url=f"https://api.telegram.org/bot{token}/sendMessage"
-
-    data={"chat_id":chat,"text":msg}
-
-    requests.post(url,data=data)
 
 # =========================
-# Email
+# 日志优化（新增）
 # =========================
 
-def send_email(subject,content,user,password,receiver):
+def trim_logs():
 
-    msg=MIMEText(content,"plain","utf-8")
+    try:
 
-    msg["Subject"]=subject
-    msg["From"]=user
-    msg["To"]=receiver
+        if not os.path.exists(LOG_FILE):
+            return
 
-    server=smtplib.SMTP_SSL("smtp.139.com",465)
+        with open(LOG_FILE) as f:
 
-    server.login(user,password)
+            logs=json.load(f)
 
-    server.sendmail(user,receiver,msg.as_string())
+        if len(logs)>MAX_LOG_SIZE:
 
-    server.quit()
+            logs=logs[-MAX_LOG_SIZE:]
+
+            with open(LOG_FILE,"w") as f:
+
+                json.dump(logs,f)
+
+    except:
+
+        pass
+
 
 # =========================
 # 记录预测
@@ -370,6 +419,9 @@ def log_prediction(coin,price,signal,factors):
 
     with open(LOG_FILE,"w") as f:
         json.dump(logs,f)
+
+    trim_logs()
+
 
 # =========================
 # 验证预测
@@ -412,6 +464,7 @@ def evaluate_predictions():
 
         with open(LOG_FILE,"w") as f:
             json.dump(logs,f)
+
 
 # =========================
 # AI权重优化
@@ -459,6 +512,7 @@ def optimize_weights():
 
     save_memory(memory)
 
+
 # =========================
 # 系统统计
 # =========================
@@ -494,24 +548,6 @@ def system_stats():
 
         print(f"系统统计 | 总预测:{total} | 胜率:{winrate}%")
 
-# =========================
-# 稳定性增强模块
-# =========================
-def safe_request(url):
-
-    for i in range(3):
-
-        try:
-
-            r=requests.get(url,timeout=10)
-
-            return r.json()
-
-        except:
-
-            time.sleep(2)
-
-    return None
 
 # =========================
 # 主程序
@@ -536,13 +572,15 @@ def main():
 
             hot=scan_hot_coins()
 
-            coins=config["coins"]
+            coins=config["coins"].copy()
 
             for h in hot:
 
                 if hot_coin_filter(h):
 
-                    coins.append(h)
+                    if h not in coins:
+
+                        coins.append(h)
 
             memory=load_memory()
 
@@ -607,6 +645,7 @@ AI评分: {score}
             print("系统异常，自动恢复:",e)
 
         time.sleep(config["check_interval"])
+
 
 if __name__=="__main__":
 
