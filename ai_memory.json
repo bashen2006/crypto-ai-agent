@@ -1,7 +1,14 @@
 {
-"trend_weight": 0.3,
-"volume_weight": 0.2,
-"momentum_weight": 0.2,
-"volatility_weight": 0.1,
-"sentiment_weight": 0.2
+  "trend_weight": 0.3,
+  "volume_weight": 0.2,
+  "momentum_weight": 0.2,
+  "volatility_weight": 0.1,
+  "sentiment_weight": 0.2,
+  "ml_weight": 0.7,
+  "last_training_time": 0,
+  "total_training_sessions": 0,
+  "best_accuracy": 0.0,
+  "feature_importance": {},
+  "model_version": "1.0.0",
+  "training_history": []
 }
