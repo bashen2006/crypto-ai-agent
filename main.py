@@ -187,6 +187,44 @@ def save_prediction(coin, signal, price, score, df):
     except:
         logs = []
 
+    df["ma7"] = df["close"].rolling(7).mean()
+    df["ma30"] = df["close"].rolling(30).mean()
+
+    trend = 1 if df["ma7"].iloc[-1] > df["ma30"].iloc[-1] else 0
+
+    volume = df["volume"].iloc[-1]
+    avg_volume = df["volume"].mean()
+    volume_factor = 1 if volume > avg_volume * 1.5 else 0
+
+    momentum = (df["close"].iloc[-1] - df["close"].iloc[-5]) / df["close"].iloc[-5]
+    momentum_factor = 1 if momentum > 0 else 0
+
+    volatility = (df["high"] - df["low"]).mean()
+    volatility_factor = 1 if volatility > df["close"].mean() * 0.01 else 0
+
+    record = {
+        "time": str(datetime.now()),
+        "coin": coin,
+        "signal": signal,
+        "price": price,
+        "score": score,
+        "trend": trend,
+        "volume": volume_factor,
+        "momentum": momentum_factor,
+        "volatility": volatility_factor
+    }
+
+    logs.append(record)
+
+    with open(LOG_FILE, "w") as f:
+        json.dump(logs, f, indent=4)
+
+    try:
+        with open(LOG_FILE, "r") as f:
+            logs = json.load(f)
+    except:
+        logs = []
+
     record = {
         "time": str(datetime.now()),
         "coin": coin,
@@ -200,7 +238,41 @@ def save_prediction(coin, signal, price, score, df):
     with open(LOG_FILE, "w") as f:
         json.dump(logs, f, indent=4)
 
+def analyze_factor_contribution(logs):
 
+    factors = ["trend", "volume", "momentum", "volatility"]
+
+    stats = {}
+
+    for f in factors:
+        stats[f] = {"correct": 0, "total": 0}
+
+    for record in logs:
+
+        if "correct" not in record:
+            continue
+
+        for f in factors:
+
+            if f in record:
+
+                stats[f]["total"] += 1
+
+                if record["correct"]:
+                    stats[f]["correct"] += 1
+
+    factor_accuracy = {}
+
+    for f in factors:
+
+        total = stats[f]["total"]
+
+        if total == 0:
+            factor_accuracy[f] = 0
+        else:
+            factor_accuracy[f] = stats[f]["correct"] / total
+
+    return factor_accuracy
 # AI复盘
 def review_predictions():
 
@@ -227,11 +299,16 @@ def review_predictions():
             df = get_okx_kline(coin)
             price_now = df["close"].iloc[-1]
 
-            if signal == "BUY" and price_now > price_then:
-                correct += 1
+           if signal == "BUY" and price_now > price_then:
+    correct += 1
+    record["correct"] = True
 
-            if signal == "SELL" and price_now < price_then:
-                correct += 1
+elif signal == "SELL" and price_now < price_then:
+    correct += 1
+    record["correct"] = True
+
+else:
+    record["correct"] = False
 
             total += 1
 
@@ -242,6 +319,37 @@ def review_predictions():
         return
 
     accuracy = correct / total
+factor_accuracy = analyze_factor_contribution(logs)
+
+print("因子贡献:")
+
+for f in factor_accuracy:
+    print(f"{f}:", round(factor_accuracy[f],3))
+
+
+memory = load_ai_memory()
+
+for factor in factor_accuracy:
+
+    weight_key = f"{factor}_weight"
+
+    if weight_key not in memory:
+        continue
+
+    acc = factor_accuracy[factor]
+
+    if acc > 0.6:
+        memory[weight_key] += 0.02
+
+    elif acc < 0.45:
+        memory[weight_key] -= 0.02
+
+    memory[weight_key] = max(0.05, min(0.5, memory[weight_key]))
+
+with open(AI_MEMORY_FILE, "w") as f:
+    json.dump(memory, f, indent=4)
+
+print("AI策略已更新:", memory)
 
     print("AI复盘完成")
     print("预测次数:", total)
