@@ -1,200 +1,122 @@
 import time
 import json
+import requests
+import pandas as pd
 
-from modules.data_source import get_price, get_kline
-from modules.indicators import MA, RSI, MACD, Bollinger
-from modules.derivatives import get_funding_rate, get_open_interest, get_long_short_ratio
-from modules.onchain import get_whale_transactions
-from modules.ai_engine import calculate_score, generate_signal
-from modules.strategy import record_signal, update_results
-from modules.learning import calculate_win_rate
-from modules.report import generate_trade_report, generate_review_report
-from modules.telegram_bot import send_trade_report, send_review_report
+CONFIG_FILE = "config.json"
 
-
-# =========================
-# 读取配置
-# =========================
 
 def load_config():
-
-    with open("config.json", "r") as f:
-
+    with open(CONFIG_FILE, "r") as f:
         return json.load(f)
 
 
-config = load_config()
+def get_okx_kline(inst):
+    url = f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar=5m&limit=50"
+    r = requests.get(url)
+    data = r.json()["data"]
+    df = pd.DataFrame(data)
+    df = df.iloc[:, :6]
+    df.columns = ["ts", "open", "high", "low", "close", "volume"]
+    df = df.astype(float)
+    return df
 
-coins = config["coins"]
 
-buy_threshold = config["buy_threshold"]
+def calculate_score(df):
+    df["ma7"] = df["close"].rolling(7).mean()
+    df["ma30"] = df["close"].rolling(30).mean()
 
-sell_threshold = config["sell_threshold"]
+    ma7 = df["ma7"].iloc[-1]
+    ma30 = df["ma30"].iloc[-1]
 
-interval = config["check_interval"]
+    score = 50
 
+    if ma7 > ma30:
+        score += 20
+    else:
+        score -= 20
 
-print("A12 AI量化系统启动...")
+    volume = df["volume"].iloc[-1]
+    avg_volume = df["volume"].mean()
 
-# =========================
-# 主循环
-# =========================
+    if volume > avg_volume * 1.5:
+        score += 10
 
-while True:
+    return score
 
-    try:
 
-        for coin in coins:
+def send_telegram(message, token, chat_id):
 
-            print("监控币种:", coin)
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-            # 获取价格
-            price = get_price(coin)
+    payload = {
+        "chat_id": chat_id,
+        "text": message
+    }
 
-            # 获取K线
-            df = get_kline(coin)
+    requests.post(url, data=payload)
 
-            if df is None:
 
-                continue
+def analyze_coin(inst, config):
 
-            close = df["close"]
+    df = get_okx_kline(inst)
 
+    score = calculate_score(df)
 
-            # =========================
-            # 技术指标
-            # =========================
+    price = df["close"].iloc[-1]
 
-            ma7 = MA(close, 7).iloc[-1]
+    if score >= config["buy_threshold"]:
+        signal = "BUY"
+    elif score <= config["sell_threshold"]:
+        signal = "SELL"
+    else:
+        signal = "NEUTRAL"
 
-            ma30 = MA(close, 30).iloc[-1]
+    return signal, score, price
 
-            rsi = RSI(close).iloc[-1]
 
-            macd, signal, hist = MACD(close)
+def main():
 
-            macd_val = macd.iloc[-1]
+    config = load_config()
 
-            macd_signal = signal.iloc[-1]
+    print("AI Agent Started")
 
-            upper, mid, lower = Bollinger(close)
+    while True:
 
-            boll_upper = upper.iloc[-1]
+        for coin in config["coins"]:
 
-            boll_lower = lower.iloc[-1]
+            try:
 
+                signal, score, price = analyze_coin(coin, config)
 
-            indicators = {
+                print(coin, signal, score)
 
-                "price": price,
+                if signal != "NEUTRAL":
 
-                "ma7": ma7,
+                    msg = f"""
+AI交易信号
 
-                "ma30": ma30,
+币种: {coin}
 
-                "rsi": rsi,
+评分: {score}
 
-                "macd": macd_val,
+价格: {price}
 
-                "macd_signal": macd_signal,
+信号: {signal}
+"""
 
-                "boll_upper": boll_upper,
+                    send_telegram(
+                        msg,
+                        config["telegram_bot_token"],
+                        config["telegram_chat_id"]
+                    )
 
-                "boll_lower": boll_lower
+            except Exception as e:
 
-            }
+                print("error:", e)
 
+        time.sleep(config["check_interval"])
 
-            # =========================
-            # 衍生品数据
-            # =========================
 
-            funding_rate = get_funding_rate(coin)
-
-            open_interest = get_open_interest(coin)
-
-            long_short_ratio = get_long_short_ratio(coin)
-
-
-            derivatives = {
-
-                "funding_rate": funding_rate,
-
-                "open_interest": open_interest,
-
-                "long_short_ratio": long_short_ratio
-
-            }
-
-
-            # =========================
-            # 巨鲸监控
-            # =========================
-
-            whales = get_whale_transactions()
-
-
-            # =========================
-            # AI评分
-            # =========================
-
-            score = calculate_score(indicators, derivatives, whales)
-
-            signal_text = generate_signal(score)
-
-
-            print("AI评分:", score)
-
-            print("AI建议:", signal_text)
-
-
-            # =========================
-            # 记录信号
-            # =========================
-
-            record_signal(coin, price, score, signal_text)
-
-
-            # =========================
-            # 更新策略结果
-            # =========================
-
-            update_results(price)
-
-
-            # =========================
-            # 生成交易报告
-            # =========================
-
-            report = generate_trade_report(coin, price, score, signal_text)
-
-            print(report)
-
-
-            # =========================
-            # 发送Telegram
-            # =========================
-
-            send_trade_report(report)
-
-
-            # =========================
-            # 策略复盘
-            # =========================
-
-            win_rate, wins, loses = calculate_win_rate()
-
-            review = generate_review_report(win_rate, wins, loses)
-
-            send_review_report(review)
-
-
-        print("等待下一轮监控...")
-
-        time.sleep(interval)
-
-    except Exception as e:
-
-        print("系统错误:", e)
-
-        time.sleep(60)
+if __name__ == "__main__":
+    main()
