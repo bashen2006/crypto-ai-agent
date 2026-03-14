@@ -702,7 +702,7 @@ def adaptive_strategy_optimization(config):
 # 热门币种扫描（保持不变）
 # =========================
 def scan_hot_coins(limit=20):
-    """从OKX获取涨幅榜，返回热门币种列表（排除稳定币）"""
+    """从OKX获取涨幅榜，返回热门币种列表（包含币名和24h涨幅）"""
     url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
     data = safe_request(url)
     if not data or "data" not in data:
@@ -719,12 +719,13 @@ def scan_hot_coins(limit=20):
         vol24h = float(t.get("vol24h", 0))
         if vol24h < 100000:
             continue
-        hot.append(inst)
+        change24h = float(t.get("change24h", 0))
+        hot.append((inst, change24h))  # 返回元组 (币种, 涨幅)
     return hot
 
-def hot_coin_filter(coin):
-    """判断热门币是否符合加入动态列表的条件"""
-    if coin in ["BTC-USDT", "ETH-USDT"]:
+def hot_coin_filter(coin_name):
+    """判断热门币是否符合加入动态列表的条件（coin_name是字符串）"""
+    if coin_name in ["BTC-USDT", "ETH-USDT"]:
         return False
     return True
 
@@ -793,6 +794,29 @@ def generate_backtest_report():
     
     return report
 
+def get_recent_signals(n=3):
+    """获取最近的n个非中性信号，返回格式化字符串列表"""
+    log = load_log()
+    signals = [e for e in log if e.get("signal") in ("买入", "卖出")]
+    signals.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+    recent = []
+    now = time.time()
+    for s in signals[:n]:
+        ts = s.get("timestamp", 0)
+        minutes_ago = int((now - ts) / 60) if ts else 0
+        time_str = f"{minutes_ago}分钟前" if minutes_ago < 60 else f"{minutes_ago//60}小时前"
+        recent.append(f"{time_str} {s['coin']} {s['signal']} ({s['score']})")
+    return recent
+
+def get_signal_stats_since(hours):
+    """统计最近 hours 小时内的信号总数和正确数"""
+    log = load_log()
+    cutoff = time.time() - hours * 3600
+    recent = [e for e in log if e.get("timestamp", 0) > cutoff and e.get("signal") in ("买入", "卖出")]
+    total = len(recent)
+    correct = sum(1 for e in recent if e.get("result") == "correct")
+    return total, correct
+
 def send_backtest_report(config):
     """生成并发送回测报告"""
     report = generate_backtest_report()
@@ -808,6 +832,7 @@ def main():
 
     config = load_config()
     print("=" * 50)
+    start_time = time.time()
     print("AI自主学习交易系统启动")
     print(f"模型状态: {'已训练' if ai_model.is_trained else '未训练'}")
     print(f"使用ML: {config.get('use_ml_model', True)}")
@@ -831,7 +856,8 @@ def main():
             verify_past_signals(config)
 
             # 3. 获取热门币种
-            hot_coins = scan_hot_coins()[:MAX_DYNAMIC_COINS]
+            hot_coins_with_change = scan_hot_coins()[:MAX_DYNAMIC_COINS]
+hot_coins = [coin for coin, _ in hot_coins_with_change]  # 只取币名用于监控
             coins = config["coins"].copy()
             for h in hot_coins:
                 if hot_coin_filter(h) and h not in coins:
@@ -905,13 +931,70 @@ def main():
                 last_adaptive_time = now
 
             # 8. 状态推送
+                        # 8. 状态推送（超级信号版）
             if now - last_status_push > STATUS_PUSH_INTERVAL:
-                model_status = "✅ ML已训练" if ai_model.is_trained else "❌ ML未训练"
-                status = (f"✅ 系统运行中\n"
-                         f"周期: {current_market_cycle}\n"
-                         f"{model_status}\n"
-                         f"监控币种: {len(coins)}\n"
-                         f"下次检查: {config['check_interval']}秒")
+                # 计算运行时间
+                uptime_seconds = int(now - start_time)
+                hours = uptime_seconds // 3600
+                minutes = (uptime_seconds % 3600) // 60
+                
+                # 模型信息
+                if ai_model.is_trained:
+                    model_acc = ai_model.training_history[-1]['accuracy']
+                    model_samples = ai_model.training_history[-1]['samples']
+                    model_info = f"✅ 已训练 (准确率: {model_acc:.2%}, 样本: {model_samples})"
+                else:
+                    model_info = "❌ 未训练"
+                
+                # 当前监控币种评分/信号
+                coin_lines = []
+                for coin in coins:
+                    try:
+                        df = get_kline(coin)
+                        whale = detect_whale(coin)
+                        score, factors, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
+                        # 判断信号
+                        if score >= config["buy_threshold"]:
+                            signal_icon = "🟢 买入"
+                        elif score <= config["sell_threshold"]:
+                            signal_icon = "🔴 卖出"
+                        else:
+                            signal_icon = "⚪ 中性"
+                        coin_lines.append(f"{coin}: {score} {signal_icon}")
+                    except Exception as e:
+                        coin_lines.append(f"{coin}: 获取失败")
+                
+                # 最近买卖信号
+                recent_signals = get_recent_signals(3)
+                recent_str = "\n".join(recent_signals) if recent_signals else "暂无"
+                
+                # 市场热点币种（前3个，带涨幅）
+                hot_coins_with_change = scan_hot_coins()[:3]
+                hot_lines = [f"{coin}: {change:+.2f}%" for coin, change in hot_coins_with_change]
+                hot_str = "\n".join(hot_lines) if hot_lines else "暂无"
+                
+                # 今日信号统计
+                today_total, today_correct = get_signal_stats_since(24)
+                today_winrate = today_correct / today_total if today_total > 0 else 0
+                
+                # 6小时和24小时统计
+                sixh_total, sixh_correct = get_signal_stats_since(6)
+                sixh_winrate = sixh_correct / sixh_total if sixh_total > 0 else 0
+                twenty4h_total, twenty4h_correct = today_total, today_correct
+                twenty4h_winrate = today_winrate
+                
+                # 构建消息
+                status = f"🔥 AI超级信号\n\n"
+                status += "📈 当前监控币种:\n" + "\n".join(coin_lines) + "\n\n"
+                status += f"⏱️ 最近信号:\n{recent_str}\n\n"
+                status += f"📊 市场热点:\n{hot_str}\n\n"
+                status += f"🤖 模型表现: {model_info}\n"
+                status += f"📆 今日信号: {today_total}次 (胜率: {today_winrate:.2%})\n\n"
+                status += f"📊 AI复盘报告:\n"
+                status += f"6小时: {sixh_total}次, 胜率 {sixh_winrate:.2%}\n"
+                status += f"24小时: {twenty4h_total}次, 胜率 {twenty4h_winrate:.2%}\n"
+                status += f"运行时间: {hours}小时{minutes}分钟 | 周期: {current_market_cycle}"
+                
                 send_telegram_message(status, config)
                 last_status_push = now
 
