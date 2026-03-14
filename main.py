@@ -33,6 +33,68 @@ def get_okx_kline(inst):
     return df
 
 
+def review_predictions():
+
+    try:
+        with open("prediction_log.json", "r") as f:
+            logs = json.load(f)
+    except:
+        return
+
+    if len(logs) == 0:
+        return
+
+    correct = 0
+    total = 0
+
+    for record in logs:
+
+        coin = record["coin"]
+        price_then = record["price"]
+        signal = record["signal"]
+
+        try:
+            df = get_okx_kline(coin)
+            price_now = df["close"].iloc[-1]
+
+            if signal == "BUY" and price_now > price_then:
+                correct += 1
+
+            if signal == "SELL" and price_now < price_then:
+                correct += 1
+
+            total += 1
+
+        except:
+            continue
+
+    if total == 0:
+        return
+
+    accuracy = correct / total
+
+    print("AI复盘完成")
+    print("预测次数:", total)
+    print("正确次数:", correct)
+    print("准确率:", accuracy)
+
+    record = {
+        "time": str(datetime.now()),
+        "accuracy": accuracy,
+        "checked_predictions": total
+    }
+
+    try:
+        with open("learning_log.json", "r") as f:
+            learning_logs = json.load(f)
+    except:
+        learning_logs = []
+
+    learning_logs.append(record)
+
+    with open("learning_log.json", "w") as f:
+        json.dump(learning_logs, f, indent=4)
+
 # 计算评分
 def calculate_score(df):
 
@@ -120,7 +182,7 @@ def analyze_coin(inst, config):
 def main():
 
     config = load_config()
-
+    last_review = time.time()
     print("===================================")
     print("AI交易系统已启动")
     print("开始监控OKX市场数据")
@@ -130,6 +192,14 @@ def main():
 
     while True:
 
+        if time.time() - last_review > 21600:
+
+             print("开始AI复盘...")
+
+             review_predictions()
+
+             last_review = time.time()
+        
         print("")
         print("开始新一轮市场扫描:", datetime.now())
 
