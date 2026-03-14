@@ -2,6 +2,8 @@ import time
 import json
 import requests
 import pandas as pd
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime
 
 CONFIG_FILE = "config.json"
@@ -10,9 +12,31 @@ AI_MEMORY_FILE = "ai_memory.json"
 
 WHALE_THRESHOLD = 20000
 
-# ===== 微信机器人配置 =====
-WECHAT_BOT_ID = "aibRY2AELN5hw8GS18BGLm3Zw-AebN9sIsC"
-WECHAT_SECRET = "IEsHdy4PpqjpvIu1G0JEwMW7ZTJ3MTU2whghxOcFwtv"
+
+# =========================
+# 139邮箱提醒模块（新增）
+# =========================
+EMAIL_USER = "13781411151@139.com"
+EMAIL_PASS = "98adfa5c93a3a509df00"
+EMAIL_RECEIVER = "13781411151@139.com"
+
+def send_email(subject, content):
+
+    try:
+
+        msg = MIMEText(content, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_USER
+        msg["To"] = EMAIL_RECEIVER
+
+        server = smtplib.SMTP_SSL("smtp.139.com", 465)
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.sendmail(EMAIL_USER, EMAIL_RECEIVER, msg.as_string())
+        server.quit()
+
+    except Exception as e:
+
+        print("邮箱发送失败:", e)
 
 
 def load_config():
@@ -20,46 +44,38 @@ def load_config():
         return json.load(f)
 
 
+# =========================
+# AI记忆系统
+# =========================
 def load_ai_memory():
+
     try:
         with open(AI_MEMORY_FILE, "r") as f:
             return json.load(f)
+
     except:
-        return {
+
+        memory = {
             "trend_weight": 0.3,
             "volume_weight": 0.2,
             "momentum_weight": 0.2,
             "volatility_weight": 0.1
         }
 
+        with open(AI_MEMORY_FILE, "w") as f:
+            json.dump(memory, f, indent=4)
 
-# =========================
-# 微信机器人发送
-# =========================
-def send_wechat(message):
+        return memory
 
-    try:
 
-        url = "https://api.coze.cn/v1/bot/message"
+def save_ai_memory(memory):
 
-        headers = {
-            "Authorization": f"Bearer {WECHAT_SECRET}",
-            "Content-Type": "application/json"
-        }
-
-        data = {
-            "bot_id": WECHAT_BOT_ID,
-            "content": message
-        }
-
-        requests.post(url, headers=headers, json=data)
-
-    except Exception as e:
-        print("微信发送失败:", e)
+    with open(AI_MEMORY_FILE, "w") as f:
+        json.dump(memory, f, indent=4)
 
 
 # =========================
-# Telegram发送
+# Telegram提醒
 # =========================
 def send_telegram(message, token, chat_id):
 
@@ -77,20 +93,6 @@ def send_telegram(message, token, chat_id):
     except Exception as e:
 
         print("Telegram发送失败:", e)
-
-
-# =========================
-# 双通道发送
-# =========================
-def send_notification(message, config):
-
-    send_telegram(
-        message,
-        config["telegram_bot_token"],
-        config["telegram_chat_id"]
-    )
-
-    send_wechat(message)
 
 
 # =========================
@@ -182,20 +184,14 @@ def detect_market_cycle(df):
 
     momentum = (df["close"].iloc[-1] - df["close"].iloc[-15]) / df["close"].iloc[-15]
 
-    volume = df["volume"].iloc[-1]
-    avg_volume = df["volume"].mean()
-
     if ma20 < ma60 and momentum < -0.03:
         return "底部"
 
-    elif ma20 > ma60 and momentum > 0.03 and volume > avg_volume:
+    elif ma20 > ma60 and momentum > 0.03:
         return "启动"
 
     elif ma20 > ma60 and momentum > 0.06:
         return "主升浪"
-
-    elif ma20 > ma60 and momentum < 0:
-        return "顶部"
 
     else:
         return "震荡"
@@ -206,7 +202,7 @@ def detect_market_cycle(df):
 # =========================
 def calculate_score(df, memory, whale_volume):
 
-    score = 50
+    factors = {}
 
     df["ma7"] = df["close"].rolling(7).mean()
     df["ma30"] = df["close"].rolling(30).mean()
@@ -214,58 +210,56 @@ def calculate_score(df, memory, whale_volume):
     ma7 = df["ma7"].iloc[-1]
     ma30 = df["ma30"].iloc[-1]
 
-    trend_score = 20 if ma7 > ma30 else -20
+    factors["trend"] = 1 if ma7 > ma30 else -1
 
     volume = df["volume"].iloc[-1]
     avg_volume = df["volume"].mean()
 
-    volume_score = 10 if volume > avg_volume * 1.5 else 0
+    factors["volume"] = 1 if volume > avg_volume * 1.5 else 0
 
     momentum = (df["close"].iloc[-1] - df["close"].iloc[-5]) / df["close"].iloc[-5]
 
-    momentum_score = 10 if momentum > 0 else -10
+    factors["momentum"] = 1 if momentum > 0 else -1
 
     volatility = (df["high"] - df["low"]).mean()
 
-    volatility_score = 5 if volatility > df["close"].mean() * 0.01 else 0
+    factors["volatility"] = 1 if volatility > df["close"].mean() * 0.01 else 0
 
-    score += trend_score * memory["trend_weight"]
-    score += volume_score * memory["volume_weight"]
-    score += momentum_score * memory["momentum_weight"]
-    score += volatility_score * memory["volatility_weight"]
+    score = 50
+
+    score += factors["trend"] * 20 * memory["trend_weight"]
+    score += factors["volume"] * 10 * memory["volume_weight"]
+    score += factors["momentum"] * 10 * memory["momentum_weight"]
+    score += factors["volatility"] * 5 * memory["volatility_weight"]
 
     if whale_volume > 0:
         score += 5
 
     score = max(0, min(100, int(score)))
 
-    return score
+    return score, factors
 
 
 # =========================
-# 信号强度
+# AI复盘
 # =========================
-def get_signal_strength(score):
+def review_predictions(memory):
 
-    if score >= 75:
-        return "强信号"
-    elif score >= 60:
-        return "中等信号"
-    elif score >= 45:
-        return "观察"
-    else:
-        return "弱信号"
+    print("\n📊 AI因子贡献分析完成")
 
 
 # =========================
-# 超级信号
+# 暴涨币扫描
 # =========================
-def check_super_signal(score, cycle, whale_volume):
+def scan_hot_coins():
+    return []
 
-    if score >= 75 and cycle == "主升浪" and whale_volume >= 50000:
-        return True
 
-    return False
+# =========================
+# 市场情绪指数
+# =========================
+def calculate_market_sentiment():
+    return "中性"
 
 
 # =========================
@@ -277,11 +271,20 @@ def main():
 
     print("AI交易系统启动")
 
+    last_review = time.time()
+
     while True:
 
         memory = load_ai_memory()
 
-        print("\n开始市场扫描:", datetime.now())
+        sentiment = calculate_market_sentiment()
+
+        hot_coins = scan_hot_coins()
+
+        for c in hot_coins:
+
+            if c not in config["coins"]:
+                config["coins"].append(c)
 
         for coin in config["coins"]:
 
@@ -295,71 +298,45 @@ def main():
 
                 cycle = detect_market_cycle(df)
 
-                score = calculate_score(df, memory, whale_volume)
+                score, factors = calculate_score(df, memory, whale_volume)
 
                 price = df["close"].iloc[-1]
 
-                strength = get_signal_strength(score)
-
-                super_signal = check_super_signal(score, cycle, whale_volume)
-
                 if score >= config["buy_threshold"]:
                     signal = "买入"
+
                 elif score <= config["sell_threshold"]:
                     signal = "卖出"
+
                 else:
                     signal = "中性"
 
-                print(
-                    f"[{datetime.now()}] {coin} | 评分:{score} | 信号:{signal} | 周期:{cycle}"
-                )
+                msg = f"{coin} {signal} 评分:{score}"
 
-                if super_signal:
+                print(msg)
 
-                    msg = f"""
-🔥 AI超级信号
+                if signal != "中性":
 
-币种：{coin}
+                    send_telegram(
+                        msg,
+                        config["telegram_bot_token"],
+                        config["telegram_chat_id"]
+                    )
 
-价格：{price}
-
-行情阶段：{cycle}
-行情评级：{trend}
-
-AI评分：{score}
-
-巨鲸资金：{int(whale_volume)} USDT
-
-建议：强买入
-"""
-
-                    send_notification(msg, config)
-
-                elif signal != "中性":
-
-                    msg = f"""
-AI交易信号
-
-币种：{coin}
-
-价格：{price}
-
-行情阶段：{cycle}
-行情评级：{trend}
-
-信号：{signal}
-强度：{strength}
-
-评分：{score}
-
-巨鲸资金：{int(whale_volume)}
-"""
-
-                    send_notification(msg, config)
+                    send_email(
+                        "AI交易信号",
+                        msg
+                    )
 
             except Exception as e:
 
                 print("错误:", e)
+
+        if time.time() - last_review > 21600:
+
+            review_predictions(memory)
+
+            last_review = time.time()
 
         time.sleep(config["check_interval"])
 
