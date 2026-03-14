@@ -6,7 +6,6 @@ from datetime import datetime
 
 CONFIG_FILE = "config.json"
 LOG_FILE = "prediction_log.json"
-LEARNING_FILE = "learning_log.json"
 AI_MEMORY_FILE = "ai_memory.json"
 
 WHALE_THRESHOLD = 20000
@@ -90,13 +89,11 @@ def get_market_state(df):
     ma90 = df["ma90"].iloc[-1]
 
     if ma30 > ma90:
-        trend = "牛市"
+        return "牛市"
     elif ma30 < ma90:
-        trend = "熊市"
+        return "熊市"
     else:
-        trend = "震荡"
-
-    return trend
+        return "震荡"
 
 
 # AI评分
@@ -130,7 +127,6 @@ def calculate_score(df, memory, whale_volume):
     score += momentum_score * memory["momentum_weight"]
     score += volatility_score * memory["volatility_weight"]
 
-    # 巨鲸加分
     if whale_volume > 0:
         score += 5
 
@@ -139,7 +135,7 @@ def calculate_score(df, memory, whale_volume):
     return score
 
 
-# 发送Telegram
+# Telegram
 def send_telegram(message, token, chat_id):
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -152,7 +148,7 @@ def send_telegram(message, token, chat_id):
     requests.post(url, data=payload)
 
 
-# 自动发现暴涨币
+# 扫描暴涨币
 def scan_hot_coins():
 
     try:
@@ -219,33 +215,13 @@ def save_prediction(coin, signal, price, score, df):
     with open(LOG_FILE, "w") as f:
         json.dump(logs, f, indent=4)
 
-    try:
-        with open(LOG_FILE, "r") as f:
-            logs = json.load(f)
-    except:
-        logs = []
 
-    record = {
-        "time": str(datetime.now()),
-        "coin": coin,
-        "signal": signal,
-        "price": price,
-        "score": score
-    }
-
-    logs.append(record)
-
-    with open(LOG_FILE, "w") as f:
-        json.dump(logs, f, indent=4)
-
+# 因子贡献分析
 def analyze_factor_contribution(logs):
 
     factors = ["trend", "volume", "momentum", "volatility"]
 
-    stats = {}
-
-    for f in factors:
-        stats[f] = {"correct": 0, "total": 0}
+    stats = {f: {"correct": 0, "total": 0} for f in factors}
 
     for record in logs:
 
@@ -255,24 +231,25 @@ def analyze_factor_contribution(logs):
         for f in factors:
 
             if f in record:
-
                 stats[f]["total"] += 1
 
                 if record["correct"]:
                     stats[f]["correct"] += 1
 
-    factor_accuracy = {}
+    result = {}
 
     for f in factors:
 
         total = stats[f]["total"]
 
         if total == 0:
-            factor_accuracy[f] = 0
+            result[f] = 0
         else:
-            factor_accuracy[f] = stats[f]["correct"] / total
+            result[f] = stats[f]["correct"] / total
 
-    return factor_accuracy
+    return result
+
+
 # AI复盘
 def review_predictions():
 
@@ -299,16 +276,16 @@ def review_predictions():
             df = get_okx_kline(coin)
             price_now = df["close"].iloc[-1]
 
-           if signal == "BUY" and price_now > price_then:
-    correct += 1
-    record["correct"] = True
+            if signal == "BUY" and price_now > price_then:
+                correct += 1
+                record["correct"] = True
 
-elif signal == "SELL" and price_now < price_then:
-    correct += 1
-    record["correct"] = True
+            elif signal == "SELL" and price_now < price_then:
+                correct += 1
+                record["correct"] = True
 
-else:
-    record["correct"] = False
+            else:
+                record["correct"] = False
 
             total += 1
 
@@ -319,42 +296,42 @@ else:
         return
 
     accuracy = correct / total
-factor_accuracy = analyze_factor_contribution(logs)
 
-print("因子贡献:")
-
-for f in factor_accuracy:
-    print(f"{f}:", round(factor_accuracy[f],3))
-
-
-memory = load_ai_memory()
-
-for factor in factor_accuracy:
-
-    weight_key = f"{factor}_weight"
-
-    if weight_key not in memory:
-        continue
-
-    acc = factor_accuracy[factor]
-
-    if acc > 0.6:
-        memory[weight_key] += 0.02
-
-    elif acc < 0.45:
-        memory[weight_key] -= 0.02
-
-    memory[weight_key] = max(0.05, min(0.5, memory[weight_key]))
-
-with open(AI_MEMORY_FILE, "w") as f:
-    json.dump(memory, f, indent=4)
-
-print("AI策略已更新:", memory)
+    factor_accuracy = analyze_factor_contribution(logs)
 
     print("AI复盘完成")
     print("预测次数:", total)
     print("正确次数:", correct)
     print("准确率:", accuracy)
+
+    print("因子贡献:")
+
+    for f in factor_accuracy:
+        print(f, round(factor_accuracy[f], 3))
+
+    memory = load_ai_memory()
+
+    for factor in factor_accuracy:
+
+        key = f"{factor}_weight"
+
+        if key not in memory:
+            continue
+
+        acc = factor_accuracy[factor]
+
+        if acc > 0.6:
+            memory[key] += 0.02
+
+        elif acc < 0.45:
+            memory[key] -= 0.02
+
+        memory[key] = max(0.05, min(0.5, memory[key]))
+
+    with open(AI_MEMORY_FILE, "w") as f:
+        json.dump(memory, f, indent=4)
+
+    print("AI策略已更新:", memory)
 
 
 # 主程序
@@ -371,18 +348,14 @@ def main():
 
         memory = load_ai_memory()
 
-        print("")
-        print("开始市场扫描:", datetime.now())
+        print("\n开始市场扫描:", datetime.now())
 
-        # 自动扫描暴涨币
         if time.time() - last_scan > 3600:
 
             hot_coins = scan_hot_coins()
 
             for c in hot_coins:
-
                 if c not in config["coins"]:
-
                     config["coins"].append(c)
 
             last_scan = time.time()
