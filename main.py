@@ -749,7 +749,7 @@ def adaptive_strategy_optimization(config):
 # 热门币种扫描
 # =========================
 def scan_hot_coins(limit=20):
-    """从OKX获取涨幅榜，返回热门币种列表（包含币名和24h涨幅）"""
+    """从OKX获取涨幅榜，返回热门币种列表（只包含以USDT计价的交易对）"""
     url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
     data = safe_request(url)
     if not data or "data" not in data:
@@ -757,23 +757,19 @@ def scan_hot_coins(limit=20):
     tickers = data["data"]
     tickers.sort(key=lambda x: float(x.get("change24h", 0)), reverse=True)
     hot = []
-    stable_coins = ["USDT", "USDC", "DAI", "BUSD", "TUSD", "USDJ", "PAX", "GUSD", "HUSD", "USDK", "EURS", "CEUR"]
     for t in tickers[:limit]:
         inst = t["instId"]
-        base, quote = inst.split("-") if "-" in inst else ("", "")
-        if quote in stable_coins:
+        if "-" not in inst:
+            continue
+        base, quote = inst.split("-")
+        if quote != "USDT":          # 只保留USDT交易对
             continue
         vol24h = float(t.get("vol24h", 0))
-        if vol24h < 100000:
+        if vol24h < 100000:          # 成交量过滤（可选）
             continue
         change24h = float(t.get("change24h", 0))
         hot.append((inst, change24h))
     return hot
-
-def hot_coin_filter(coin_name):
-    if coin_name in ["BTC-USDT", "ETH-USDT"]:
-        return False
-    return True
 
 # =========================
 # 回测报告
