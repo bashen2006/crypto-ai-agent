@@ -10,6 +10,9 @@ MEMORY_FILE="ai_memory.json"
 LOG_FILE="prediction_log.json"
 
 WHALE_THRESHOLD=20000
+SIGNAL_COOLDOWN=1800
+
+last_signal_time={}
 
 # =========================
 # 配置加载
@@ -103,7 +106,7 @@ def detect_whale(inst):
         return 0
 
 # =========================
-# AI评分（原功能）
+# AI评分
 # =========================
 
 def calculate_score(df,memory,whale):
@@ -117,7 +120,6 @@ def calculate_score(df,memory,whale):
     momentum=(df["close"].iloc[-1]-df["close"].iloc[-10])/df["close"].iloc[-10]
 
     score=50
-
     factors={}
 
     if ma20>ma60:
@@ -176,18 +178,65 @@ def market_risk_index():
 
         if price<ma200:
 
-            return "HIGH"
+            return "高风险"
 
         else:
 
-            return "NORMAL"
+            return "正常"
 
     except:
 
-        return "UNKNOWN"
+        return "未知"
 
 # =========================
-# 新增：扫描强势币
+# 新增：市场情绪指数
+# =========================
+
+def market_sentiment():
+
+    try:
+
+        url="https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+
+        r=requests.get(url)
+
+        data=r.json()["data"]
+
+        up=0
+        down=0
+
+        for c in data:
+
+            try:
+
+                change=float(c["chgUtc"])
+
+                if change>0:
+
+                    up+=1
+                else:
+                    down+=1
+
+            except:
+                pass
+
+        ratio=up/(up+down)
+
+        if ratio>0.7:
+            return "极度贪婪"
+        elif ratio>0.55:
+            return "贪婪"
+        elif ratio>0.45:
+            return "中性"
+        else:
+            return "恐慌"
+
+    except:
+
+        return "未知"
+
+# =========================
+# 新增：强势币扫描
 # =========================
 
 def scan_hot_coins():
@@ -221,6 +270,28 @@ def scan_hot_coins():
     except:
 
         return []
+
+# =========================
+# 新增：强势币回测过滤
+# =========================
+
+def hot_coin_filter(coin):
+
+    try:
+
+        df=get_kline(coin)
+
+        change=(df["close"].iloc[-1]-df["close"].iloc[-30])/df["close"].iloc[-30]
+
+        if change>0:
+
+            return True
+        else:
+            return False
+
+    except:
+
+        return False
 
 # =========================
 # Telegram
@@ -300,11 +371,9 @@ def evaluate_predictions():
     for r in logs:
 
         if r["result"]!=None:
-
             continue
 
         if time.time()-r["time"]<7200:
-
             continue
 
         df=get_kline(r["coin"])
@@ -312,11 +381,8 @@ def evaluate_predictions():
         price=df["close"].iloc[-1]
 
         if price>r["price"]:
-
             r["result"]="correct"
-
         else:
-
             r["result"]="wrong"
 
         changed=True
@@ -324,11 +390,10 @@ def evaluate_predictions():
     if changed:
 
         with open(LOG_FILE,"w") as f:
-
             json.dump(logs,f)
 
 # =========================
-# 新增：AI权重优化
+# AI权重优化
 # =========================
 
 def optimize_weights():
@@ -336,11 +401,9 @@ def optimize_weights():
     try:
 
         with open(LOG_FILE) as f:
-
             logs=json.load(f)
 
     except:
-
         return
 
     memory=load_memory()
@@ -350,7 +413,6 @@ def optimize_weights():
     for r in logs:
 
         if r["result"]==None:
-
             continue
 
         for f in stats:
@@ -370,17 +432,14 @@ def optimize_weights():
             rate=stats[f][0]/stats[f][1]
 
             if rate>0.6:
-
                 memory[f+"_weight"]+=0.01
-
             else:
-
                 memory[f+"_weight"]-=0.01
 
     save_memory(memory)
 
 # =========================
-# 新增：系统统计
+# 系统统计
 # =========================
 
 def system_stats():
@@ -412,7 +471,7 @@ def system_stats():
 
         winrate=round(correct/total*100,2)
 
-        print(f"AI统计 | 总预测:{total} 胜率:{winrate}%")
+        print(f"系统统计 | 总预测:{total} | 胜率:{winrate}%")
 
 # =========================
 # 主程序
@@ -422,27 +481,32 @@ def main():
 
     config=load_config()
 
-    print("AI Trading Bot Started")
+    print("AI交易系统启动")
 
     while True:
 
-        evaluate_predictions()
+        try:
 
-        optimize_weights()
+            evaluate_predictions()
+            optimize_weights()
+            system_stats()
 
-        system_stats()
+            risk=market_risk_index()
+            sentiment=market_sentiment()
 
-        risk=market_risk_index()
+            hot=scan_hot_coins()
 
-        hot=scan_hot_coins()
+            coins=config["coins"]
 
-        coins=config["coins"]+hot
+            for h in hot:
 
-        memory=load_memory()
+                if hot_coin_filter(h):
 
-        for coin in coins:
+                    coins.append(h)
 
-            try:
+            memory=load_memory()
+
+            for coin in coins:
 
                 df=get_kline(coin)
 
@@ -454,27 +518,41 @@ def main():
 
                 if score>=config["buy_threshold"]:
 
-                    signal="BUY"
+                    signal="买入"
 
                 elif score<=config["sell_threshold"]:
 
-                    signal="SELL"
+                    signal="卖出"
 
                 else:
 
-                    signal="NEUTRAL"
+                    signal="中性"
 
-                msg=f"{coin} | {signal} | score:{score} | risk:{risk}"
+                msg=f"""
+币种: {coin}
+信号: {signal}
+AI评分: {score}
+市场风险: {risk}
+市场情绪: {sentiment}
+"""
 
                 print(msg)
 
-                if signal!="NEUTRAL":
+                now=time.time()
+
+                if signal!="中性":
+
+                    if coin in last_signal_time:
+
+                        if now-last_signal_time[coin]<SIGNAL_COOLDOWN:
+
+                            continue
 
                     send_telegram(msg,
                                   config["telegram_bot_token"],
                                   config["telegram_chat_id"])
 
-                    send_email("AI Signal",
+                    send_email("AI交易信号",
                                msg,
                                config["email_user"],
                                config["email_pass"],
@@ -482,9 +560,11 @@ def main():
 
                     log_prediction(coin,price,signal,factors)
 
-            except Exception as e:
+                    last_signal_time[coin]=now
 
-                print("error:",e)
+        except Exception as e:
+
+            print("系统异常，自动恢复:",e)
 
         time.sleep(config["check_interval"])
 
