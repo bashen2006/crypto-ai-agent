@@ -256,11 +256,11 @@ def main():
                     f"[{datetime.now()}] 币种:{coin} | 评分:{score} | 信号:{signal} | 当前价:{price}"
                 )
 
-                if signal != "NEUTRAL":
+               save_prediction(coin, signal, price, score)
 
-                    save_prediction(coin, signal, price, score)
+if signal != "NEUTRAL":
 
-                    msg = f"""
+    msg = f"""
 【AI交易信号】
 
 币种：{coin}
