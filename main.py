@@ -165,9 +165,9 @@ class AITradingModel:
         
         return features
     
-    def prepare_training_data(self, logs, price_data_cache):
+    def prepare_training_data(self, logs):
         """
-        从历史日志准备训练数据
+        从历史日志准备训练数据（直接使用日志中保存的特征）
         """
         X_list = []
         y_list = []
@@ -175,24 +175,11 @@ class AITradingModel:
         for log in logs:
             if not log.get('verified') or log.get('result') not in ['correct', 'wrong']:
                 continue
-                
-            coin = log['coin']
-            timestamp = log['timestamp']
-            
-            # 获取当时的特征数据（这里简化，实际应该从历史数据中提取）
-            # 在实际应用中，您需要根据timestamp获取当时的市场数据
-            # 这里使用一个简化的方法
-            try:
-                # 假设我们可以获取当时的K线数据
-                df = get_kline(coin, limit=200)  # 获取最新数据作为替代
-                whale = log.get('whale', 0)
-                features = self.extract_features(df, whale, log.get('market_cycle', '未知'), coin)
-                
-                if features:
-                    X_list.append(features)
-                    y_list.append(1 if log['result'] == 'correct' else 0)
-            except:
-                continue
+            if 'features' not in log:
+                continue  # 跳过没有特征的旧日志
+            features = log['features']
+            X_list.append(features)
+            y_list.append(1 if log['result'] == 'correct' else 0)
                 
         if len(X_list) < MIN_TRAIN_SAMPLES:
             return None, None
@@ -367,6 +354,7 @@ def load_memory():
     try:
         with open(MEMORY_PATH) as f:
             memory = json.load(f)
+        # 补充缺失的键，保留多余键
         for key in default_memory:
             if key not in memory:
                 memory[key] = default_memory[key]
@@ -506,6 +494,7 @@ def apply_cycle_strategy_adjustment(memory, cycle):
 def calculate_score(df, memory, whale, market_cycle, coin, config):
     """
     增强版评分：结合传统规则和机器学习模型
+    返回: (综合评分, 因子信息字典, 特征字典)
     """
     # 1. 传统规则评分
     df = df.dropna().copy()
@@ -536,6 +525,7 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
     ml_score = 50
     ml_confidence = 0
     feature_importance = {}
+    features = None
     
     if config.get("use_ml_model", True) and ai_model.is_trained:
         try:
@@ -546,6 +536,9 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
                 feature_importance = ml_info.get('contribution', {})
         except Exception as e:
             print(f"ML预测失败: {e}")
+    else:
+        # 即使未训练，也提取特征以备记录
+        features = ai_model.extract_features(df, whale, market_cycle, coin)
     
     # 3. 综合评分
     ml_weight = config.get("ml_weight", 0.7) if ai_model.is_trained else 0
@@ -560,7 +553,7 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
         'feature_importance': feature_importance
     }
     
-    return int(combined_score), factors
+    return int(combined_score), factors, features
 
 # =========================
 # 日志管理：验证与记录（增强版，使用持久化路径）
@@ -605,8 +598,8 @@ def verify_past_signals(config):
     if updated:
         save_log(log)
 
-def log_signal(coin, signal, score, price, whale, market_cycle, factors):
-    """记录新信号到日志（增强版：保存更多上下文）"""
+def log_signal(coin, signal, score, price, whale, market_cycle, factors, features):
+    """记录新信号到日志（增强版：保存更多上下文，包括特征）"""
     log = load_log()
     entry = {
         "timestamp": time.time(),
@@ -619,6 +612,7 @@ def log_signal(coin, signal, score, price, whale, market_cycle, factors):
         "rule_score": factors.get('rule_score', 50),
         "ml_score": factors.get('ml_score', 50),
         "ml_confidence": factors.get('ml_confidence', 0),
+        "features": features,  # 保存特征字典
         "verified": False,
         "result": None
     }
@@ -638,10 +632,10 @@ def log_signal(coin, signal, score, price, whale, market_cycle, factors):
     save_log(log)
 
 # =========================
-# 自适应优化（增强版：基于机器学习，保持不变）
+# 自适应优化（增强版：基于机器学习，使用日志中的特征）
 # =========================
 def adaptive_strategy_optimization(config):
-    """增强版自适应优化：重新训练机器学习模型"""
+    """增强版自适应优化：重新训练机器学习模型（使用日志中保存的特征）"""
     global ai_model
     
     log = load_log()
@@ -651,38 +645,14 @@ def adaptive_strategy_optimization(config):
         print(f"自适应优化：已验证记录不足{MIN_TRAIN_SAMPLES}条（{len(verified)}），跳过")
         return
     
-    # 准备训练数据
-    # 注意：实际应用中需要从历史K线数据中提取特征
-    # 这里简化处理，使用当前数据作为替代
-    X_list = []
-    y_list = []
-    price_cache = {}
+    # 准备训练数据（直接从日志提取特征）
+    X_df, y = ai_model.prepare_training_data(verified)
     
-    for entry in verified[-500:]:  # 使用最近500条
-        coin = entry["coin"]
-        try:
-            # 获取当时的K线数据（这里简化，使用当前数据）
-            df = get_kline(coin, limit=200)
-            features = ai_model.extract_features(
-                df, 
-                entry.get('whale', 0), 
-                entry.get('market_cycle', '未知'),
-                coin
-            )
-            if features:
-                X_list.append(features)
-                y_list.append(1 if entry['result'] == 'correct' else 0)
-        except:
-            continue
-    
-    if len(X_list) < MIN_TRAIN_SAMPLES:
-        print(f"特征提取后样本不足: {len(X_list)}")
+    if X_df is None:
+        print("特征提取后样本不足")
         return
     
     # 训练模型
-    X_df = pd.DataFrame(X_list)
-    y = np.array(y_list)
-    
     success = ai_model.train(X_df, y)
     
     if success:
@@ -700,7 +670,7 @@ def adaptive_strategy_optimization(config):
         feature_msg = "\n".join([f"{f}: {v:.4f}" for f, v in top_features])
         
         msg = (f"🤖 AI模型已进化\n"
-               f"训练样本: {len(X_list)}\n"
+               f"训练样本: {len(X_df)}\n"
                f"准确率: {ai_model.training_history[-1]['accuracy']:.4f}\n"
                f"Top5特征:\n{feature_msg}")
         
@@ -807,7 +777,7 @@ def send_backtest_report(config):
     send_notification(report, config, "每日回测报告")
 
 # =========================
-# 主程序（增强版，保持不变）
+# 主程序（增强版，已适配特征记录）
 # =========================
 def main():
     global last_backtest_time, last_adaptive_time, last_cycle_check, current_market_cycle
@@ -854,8 +824,8 @@ def main():
                     df = get_kline(coin)
                     whale = detect_whale(coin)
                     
-                    # 使用增强版评分
-                    score, factors = calculate_score(df, memory, whale, current_market_cycle, coin, config)
+                    # 使用增强版评分，并获取特征字典
+                    score, factors, features = calculate_score(df, memory, whale, current_market_cycle, coin, config)
 
                     # 判断信号
                     if score >= config["buy_threshold"]:
@@ -873,10 +843,10 @@ def main():
                             continue
                         last_signal_time[coin] = now
 
-                    # 记录日志（增强版：保存更多信息）
+                    # 记录日志（增强版：保存更多信息，包括特征）
                     if signal in ("买入", "卖出"):
                         price = df["close"].iloc[-1]
-                        log_signal(coin, signal, score, price, whale, current_market_cycle, factors)
+                        log_signal(coin, signal, score, price, whale, current_market_cycle, factors, features)
 
                     # 发送通知（增强版：包含ML信息）
                     if signal in ("买入", "卖出"):
