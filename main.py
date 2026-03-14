@@ -15,10 +15,14 @@ SIGNAL_COOLDOWN=1800
 
 STATUS_PUSH_INTERVAL=300
 DAILY_REPORT_INTERVAL=86400
+BACKTEST_INTERVAL=86400
+ADAPTIVE_OPTIMIZATION_INTERVAL=86400
 
 last_signal_time={}
 last_status_push=0
 last_daily_report=0
+last_backtest_time=0
+last_adaptive_time=0
 
 MAX_LOG_SIZE=2000
 MAX_DYNAMIC_COINS=3
@@ -55,7 +59,7 @@ def save_memory(memory):
 
 
 # =========================
-# 新增：安全请求
+# 安全请求
 # =========================
 
 def safe_request(url):
@@ -175,186 +179,94 @@ def calculate_score(df,memory,whale):
     return score,factors
 
 
-def market_risk_index():
-
-    try:
-
-        df=get_kline("BTC-USDT")
-
-        df["ma200"]=df["close"].rolling(200).mean()
-
-        price=df["close"].iloc[-1]
-        ma200=df["ma200"].iloc[-1]
-
-        if price<ma200:
-            return "高风险"
-        else:
-            return "正常"
-
-    except:
-
-        return "未知"
-
-
-def market_sentiment():
-
-    try:
-
-        url="https://www.okx.com/api/v5/market/tickers?instType=SPOT"
-
-        data=safe_request(url)
-
-        if not data:
-            return "未知"
-
-        data=data["data"]
-
-        up=0
-        down=0
-
-        for c in data:
-
-            try:
-
-                if "chgUtc" in c:
-                    change=float(c["chgUtc"])
-                else:
-                    last=float(c["last"])
-                    open24=float(c["open24h"])
-                    change=(last-open24)/open24
-
-                if change>0:
-                    up+=1
-                else:
-                    down+=1
-
-            except:
-                pass
-
-        total=up+down
-
-        if total==0:
-            return "未知"
-
-        ratio=up/total
-
-        if ratio>0.7:
-            return "极度贪婪"
-        elif ratio>0.55:
-            return "贪婪"
-        elif ratio>0.45:
-            return "中性"
-        else:
-            return "恐慌"
-
-    except:
-        return "未知"
-
-
-def scan_hot_coins():
-
-    coins=[]
-
-    try:
-
-        url="https://www.okx.com/api/v5/market/tickers?instType=SPOT"
-
-        data=safe_request(url)
-
-        if not data:
-            return []
-
-        data=data["data"]
-
-        for c in data:
-
-            try:
-
-                if "chgUtc" in c:
-                    change=float(c["chgUtc"])
-                else:
-                    last=float(c["last"])
-                    open24=float(c["open24h"])
-                    change=(last-open24)/open24
-
-                if change>0.05:
-                    coins.append(c["instId"])
-
-            except:
-                pass
-
-        return coins[:MAX_DYNAMIC_COINS]
-
-    except:
-
-        return []
-
-
-def hot_coin_filter(coin):
-
-    try:
-
-        df=get_kline(coin)
-
-        change=(df["close"].iloc[-1]-df["close"].iloc[-30])/df["close"].iloc[-30]
-
-        return change>0
-
-    except:
-
-        return False
-
-
 # =========================
-# 新增：AI胜率统计
+# 新增：AI策略自适应优化
 # =========================
 
-def calculate_ai_winrate():
+def adaptive_strategy_optimization():
 
     if not os.path.exists(LOG_FILE):
-        return 0,0,0,0
+        return
 
     with open(LOG_FILE) as f:
-
         logs=json.load(f)
 
-    total=0
     correct=0
     wrong=0
 
     for r in logs:
 
-        if r["result"]=="correct":
+        if r.get("result")=="correct":
             correct+=1
-            total+=1
+
+        elif r.get("result")=="wrong":
+            wrong+=1
+
+    total=correct+wrong
+
+    if total<10:
+        return
+
+    winrate=correct/total
+
+    memory=load_memory()
+
+    if winrate>0.6:
+
+        memory["trend_weight"]=min(memory["trend_weight"]+0.02,1)
+        memory["momentum_weight"]=min(memory["momentum_weight"]+0.02,1)
+        memory["volume_weight"]=min(memory["volume_weight"]+0.02,1)
+
+    elif winrate<0.4:
+
+        memory["trend_weight"]=max(memory["trend_weight"]-0.02,0)
+        memory["momentum_weight"]=max(memory["momentum_weight"]-0.02,0)
+        memory["volume_weight"]=max(memory["volume_weight"]-0.02,0)
+
+    save_memory(memory)
+
+    print("AI策略自适应优化完成 当前权重:",memory)
+
+
+# =========================
+# AI自动回测
+# =========================
+
+def calculate_backtest_performance():
+
+    if not os.path.exists(LOG_FILE):
+        return 0,0
+
+    with open(LOG_FILE) as f:
+
+        logs=json.load(f)
+
+    profit=0
+    trades=0
+
+    for r in logs:
+
+        if r["result"]=="correct":
+            profit+=1
 
         elif r["result"]=="wrong":
-            wrong+=1
-            total+=1
+            profit-=1
 
-    if total==0:
-        return 0,0,0,0
+        if r["result"]!=None:
+            trades+=1
 
-    winrate=round(correct/total*100,2)
-
-    return total,correct,wrong,winrate
+    return profit,trades
 
 
-# =========================
-# 新增：AI日报
-# =========================
+def send_backtest_report(config):
 
-def send_daily_report(config):
-
-    total,correct,wrong,winrate=calculate_ai_winrate()
+    profit,trades=calculate_backtest_performance()
 
     msg=f"""
-AI交易系统日报
+AI策略自动回测报告
 
-总信号: {total}
-正确: {correct}
-错误: {wrong}
-胜率: {winrate}%
+历史交易次数: {trades}
+策略收益评分: {profit}
 
 时间: {time.strftime("%Y-%m-%d %H:%M:%S")}
 """
@@ -363,7 +275,7 @@ AI交易系统日报
                   config["telegram_bot_token"],
                   config["telegram_chat_id"])
 
-    send_email("AI交易系统日报",
+    send_email("AI策略回测报告",
                msg,
                config["email_user"],
                config["email_pass"],
@@ -402,8 +314,8 @@ def send_email(subject,content,user,password,receiver):
 
 def main():
 
-    global last_status_push
-    global last_daily_report
+    global last_backtest_time
+    global last_adaptive_time
 
     config=load_config()
 
@@ -448,11 +360,17 @@ def main():
 
             now=time.time()
 
-            if now-last_daily_report>DAILY_REPORT_INTERVAL:
+            if now-last_backtest_time>BACKTEST_INTERVAL:
 
-                send_daily_report(config)
+                send_backtest_report(config)
 
-                last_daily_report=now
+                last_backtest_time=now
+
+            if now-last_adaptive_time>ADAPTIVE_OPTIMIZATION_INTERVAL:
+
+                adaptive_strategy_optimization()
+
+                last_adaptive_time=now
 
         except Exception as e:
 
