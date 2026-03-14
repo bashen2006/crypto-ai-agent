@@ -9,6 +9,8 @@ LOG_FILE = "prediction_log.json"
 LEARNING_FILE = "learning_log.json"
 AI_MEMORY_FILE = "ai_memory.json"
 
+WHALE_THRESHOLD = 20000
+
 
 def load_config():
     with open(CONFIG_FILE, "r") as f:
@@ -29,7 +31,7 @@ def load_ai_memory():
         }
 
 
-# 获取OKX K线
+# 获取K线
 def get_okx_kline(inst):
 
     url = f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar=5m&limit=50"
@@ -49,8 +51,56 @@ def get_okx_kline(inst):
     return df
 
 
+# 巨鲸检测
+def detect_whale(inst):
+
+    try:
+
+        url = f"https://www.okx.com/api/v5/market/trades?instId={inst}&limit=100"
+
+        r = requests.get(url)
+
+        data = r.json()["data"]
+
+        whale_volume = 0
+
+        for trade in data:
+
+            size = float(trade["sz"])
+            price = float(trade["px"])
+
+            usdt_value = size * price
+
+            if usdt_value >= WHALE_THRESHOLD:
+                whale_volume += usdt_value
+
+        return whale_volume
+
+    except:
+        return 0
+
+
+# 市场状态
+def get_market_state(df):
+
+    df["ma30"] = df["close"].rolling(30).mean()
+    df["ma90"] = df["close"].rolling(90).mean()
+
+    ma30 = df["ma30"].iloc[-1]
+    ma90 = df["ma90"].iloc[-1]
+
+    if ma30 > ma90:
+        trend = "牛市"
+    elif ma30 < ma90:
+        trend = "熊市"
+    else:
+        trend = "震荡"
+
+    return trend
+
+
 # AI评分
-def calculate_score(df, memory):
+def calculate_score(df, memory, whale_volume):
 
     score = 50
 
@@ -80,6 +130,10 @@ def calculate_score(df, memory):
     score += momentum_score * memory["momentum_weight"]
     score += volatility_score * memory["volatility_weight"]
 
+    # 巨鲸加分
+    if whale_volume > 0:
+        score += 5
+
     score = max(0, min(100, int(score)))
 
     return score
@@ -98,7 +152,33 @@ def send_telegram(message, token, chat_id):
     requests.post(url, data=payload)
 
 
-# 保存预测（包含因子）
+# 自动发现暴涨币
+def scan_hot_coins():
+
+    try:
+
+        url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+
+        r = requests.get(url)
+
+        data = r.json()["data"]
+
+        coins = []
+
+        for coin in data:
+
+            change = float(coin["sodUtc8"])
+
+            if change > 0.05:
+                coins.append(coin["instId"])
+
+        return coins[:3]
+
+    except:
+        return []
+
+
+# 保存预测
 def save_prediction(coin, signal, price, score, df):
 
     try:
@@ -107,56 +187,18 @@ def save_prediction(coin, signal, price, score, df):
     except:
         logs = []
 
-    df["ma7"] = df["close"].rolling(7).mean()
-    df["ma30"] = df["close"].rolling(30).mean()
-
-    trend = 1 if df["ma7"].iloc[-1] > df["ma30"].iloc[-1] else 0
-
-    volume = df["volume"].iloc[-1]
-    avg_volume = df["volume"].mean()
-    volume_factor = 1 if volume > avg_volume * 1.5 else 0
-
-    momentum = (df["close"].iloc[-1] - df["close"].iloc[-5]) / df["close"].iloc[-5]
-    momentum_factor = 1 if momentum > 0 else 0
-
-    volatility = (df["high"] - df["low"]).mean()
-    volatility_factor = 1 if volatility > df["close"].mean() * 0.01 else 0
-
     record = {
         "time": str(datetime.now()),
         "coin": coin,
         "signal": signal,
         "price": price,
-        "score": score,
-        "trend": trend,
-        "volume": volume_factor,
-        "momentum": momentum_factor,
-        "volatility": volatility_factor
+        "score": score
     }
 
     logs.append(record)
 
     with open(LOG_FILE, "w") as f:
         json.dump(logs, f, indent=4)
-
-
-# AI策略进化
-def evolve_strategy(accuracy):
-
-    memory = load_ai_memory()
-
-    if accuracy > 0.65:
-        memory["trend_weight"] += 0.02
-
-    if accuracy < 0.5:
-        memory["trend_weight"] -= 0.02
-
-    memory["trend_weight"] = max(0.1, min(0.5, memory["trend_weight"]))
-
-    with open(AI_MEMORY_FILE, "w") as f:
-        json.dump(memory, f, indent=4)
-
-    print("AI策略已更新:", memory)
 
 
 # AI复盘
@@ -181,6 +223,7 @@ def review_predictions():
         signal = record["signal"]
 
         try:
+
             df = get_okx_kline(coin)
             price_now = df["close"].iloc[-1]
 
@@ -205,96 +248,76 @@ def review_predictions():
     print("正确次数:", correct)
     print("准确率:", accuracy)
 
-    record = {
-        "time": str(datetime.now()),
-        "accuracy": accuracy,
-        "checked_predictions": total
-    }
-
-    try:
-        with open(LEARNING_FILE, "r") as f:
-            learning_logs = json.load(f)
-    except:
-        learning_logs = []
-
-    learning_logs.append(record)
-
-    with open(LEARNING_FILE, "w") as f:
-        json.dump(learning_logs, f, indent=4)
-
-    evolve_strategy(accuracy)
-
-
-# 分析币种
-def analyze_coin(inst, config, memory):
-
-    df = get_okx_kline(inst)
-
-    score = calculate_score(df, memory)
-
-    price = df["close"].iloc[-1]
-
-    if score >= config["buy_threshold"]:
-        signal = "BUY"
-    elif score <= config["sell_threshold"]:
-        signal = "SELL"
-    else:
-        signal = "NEUTRAL"
-
-    return signal, score, price, df
-
 
 # 主程序
 def main():
 
     config = load_config()
 
-    print("===================================")
-    print("AI交易系统已启动")
-    print("开始监控OKX市场数据")
-    print("监控币种:", config["coins"])
-    print("扫描周期:", config["check_interval"], "秒")
-    print("===================================")
+    print("AI交易系统启动")
 
     last_review = time.time()
+    last_scan = time.time()
 
     while True:
 
         memory = load_ai_memory()
 
         print("")
-        print("开始新一轮市场扫描:", datetime.now())
+        print("开始市场扫描:", datetime.now())
+
+        # 自动扫描暴涨币
+        if time.time() - last_scan > 3600:
+
+            hot_coins = scan_hot_coins()
+
+            for c in hot_coins:
+
+                if c not in config["coins"]:
+
+                    config["coins"].append(c)
+
+            last_scan = time.time()
 
         for coin in config["coins"]:
 
             try:
 
-                signal, score, price, df = analyze_coin(coin, config, memory)
+                df = get_okx_kline(coin)
+
+                whale_volume = detect_whale(coin)
+
+                trend = get_market_state(df)
+
+                score = calculate_score(df, memory, whale_volume)
+
+                price = df["close"].iloc[-1]
+
+                if score >= config["buy_threshold"]:
+                    signal = "BUY"
+                elif score <= config["sell_threshold"]:
+                    signal = "SELL"
+                else:
+                    signal = "NEUTRAL"
 
                 print(
-                    f"[{datetime.now()}] 币种:{coin} | 评分:{score} | 信号:{signal} | 当前价:{price}"
+                    f"[{datetime.now()}] {coin} | 评分:{score} | 信号:{signal} | 巨鲸:{whale_volume} | 市场:{trend}"
                 )
 
-                # 每次预测都记录
                 save_prediction(coin, signal, price, score, df)
 
-                # 只有 BUY/SELL 才提醒
                 if signal != "NEUTRAL":
 
                     msg = f"""
-【AI交易信号】
+AI交易信号
 
-币种：{coin}
+币种:{coin}
+评分:{score}
+价格:{price}
+市场:{trend}
+巨鲸资金:{whale_volume}
 
-评分：{score}
-
-当前价格：{price}
-
-交易信号：{signal}
-
-数据来源：OKX
-
-时间：{datetime.now()}
+信号:{signal}
 """
 
                     send_telegram(
@@ -305,17 +328,15 @@ def main():
 
             except Exception as e:
 
-                print(f"[{datetime.now()}] 发生错误:", e)
+                print("错误:", e)
 
         if time.time() - last_review > 21600:
 
-            print("开始AI复盘...")
+            print("开始AI复盘")
 
             review_predictions()
 
             last_review = time.time()
-
-        print("本轮扫描完成，等待下一次扫描...")
 
         time.sleep(config["check_interval"])
 
