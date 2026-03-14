@@ -1,0 +1,7 @@
+{
+"trend_weight": 0.3,
+"volume_weight": 0.2,
+"momentum_weight": 0.2,
+"volatility_weight": 0.1,
+"sentiment_weight": 0.2
+}
