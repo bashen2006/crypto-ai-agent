@@ -7,11 +7,26 @@ from datetime import datetime
 CONFIG_FILE = "config.json"
 LOG_FILE = "prediction_log.json"
 LEARNING_FILE = "learning_log.json"
+AI_MEMORY_FILE = "ai_memory.json"
 
 
 def load_config():
     with open(CONFIG_FILE, "r") as f:
         return json.load(f)
+
+
+def load_ai_memory():
+    try:
+        with open(AI_MEMORY_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {
+            "trend_weight": 0.3,
+            "volume_weight": 0.2,
+            "momentum_weight": 0.2,
+            "volatility_weight": 0.1,
+            "sentiment_weight": 0.2
+        }
 
 
 # 获取OKX K线
@@ -34,8 +49,8 @@ def get_okx_kline(inst):
     return df
 
 
-# AI评分
-def calculate_score(df):
+# AI评分（带权重）
+def calculate_score(df, memory):
 
     score = 50
 
@@ -45,18 +60,29 @@ def calculate_score(df):
     ma7 = df["ma7"].iloc[-1]
     ma30 = df["ma30"].iloc[-1]
 
-    if ma7 > ma30:
-        score += 20
-    else:
-        score -= 20
+    trend_score = 20 if ma7 > ma30 else -20
 
     volume = df["volume"].iloc[-1]
     avg_volume = df["volume"].mean()
 
-    if volume > avg_volume * 1.5:
-        score += 10
+    volume_score = 10 if volume > avg_volume * 1.5 else 0
 
-    return int(score)
+    momentum = (df["close"].iloc[-1] - df["close"].iloc[-5]) / df["close"].iloc[-5]
+
+    momentum_score = 10 if momentum > 0 else -10
+
+    volatility = (df["high"] - df["low"]).mean()
+
+    volatility_score = 5 if volatility > df["close"].mean() * 0.01 else 0
+
+    score += trend_score * memory["trend_weight"]
+    score += volume_score * memory["volume_weight"]
+    score += momentum_score * memory["momentum_weight"]
+    score += volatility_score * memory["volatility_weight"]
+
+    score = max(0, min(100, int(score)))
+
+    return score
 
 
 # 发送Telegram
@@ -72,7 +98,7 @@ def send_telegram(message, token, chat_id):
     requests.post(url, data=payload)
 
 
-# 保存预测日志
+# 保存预测
 def save_prediction(coin, signal, price, score):
 
     try:
@@ -95,7 +121,26 @@ def save_prediction(coin, signal, price, score):
         json.dump(logs, f, indent=4)
 
 
-# AI复盘系统
+# AI策略进化
+def evolve_strategy(accuracy):
+
+    memory = load_ai_memory()
+
+    if accuracy > 0.65:
+        memory["trend_weight"] += 0.02
+
+    if accuracy < 0.5:
+        memory["trend_weight"] -= 0.02
+
+    memory["trend_weight"] = max(0.1, min(0.5, memory["trend_weight"]))
+
+    with open(AI_MEMORY_FILE, "w") as f:
+        json.dump(memory, f, indent=4)
+
+    print("AI策略已更新:", memory)
+
+
+# AI复盘
 def review_predictions():
 
     try:
@@ -158,13 +203,15 @@ def review_predictions():
     with open(LEARNING_FILE, "w") as f:
         json.dump(learning_logs, f, indent=4)
 
+    evolve_strategy(accuracy)
+
 
 # 分析币种
-def analyze_coin(inst, config):
+def analyze_coin(inst, config, memory):
 
     df = get_okx_kline(inst)
 
-    score = calculate_score(df)
+    score = calculate_score(df, memory)
 
     price = df["close"].iloc[-1]
 
@@ -194,6 +241,8 @@ def main():
 
     while True:
 
+        memory = load_ai_memory()
+
         print("")
         print("开始新一轮市场扫描:", datetime.now())
 
@@ -201,7 +250,7 @@ def main():
 
             try:
 
-                signal, score, price = analyze_coin(coin, config)
+                signal, score, price = analyze_coin(coin, config, memory)
 
                 print(
                     f"[{datetime.now()}] 币种:{coin} | 评分:{score} | 信号:{signal} | 当前价:{price}"
@@ -237,7 +286,6 @@ def main():
 
                 print(f"[{datetime.now()}] 发生错误:", e)
 
-        # 每6小时复盘
         if time.time() - last_review > 21600:
 
             print("开始AI复盘...")
