@@ -49,7 +49,7 @@ def get_okx_kline(inst):
     return df
 
 
-# AI评分（带权重）
+# AI评分
 def calculate_score(df, memory):
 
     score = 50
@@ -98,8 +98,8 @@ def send_telegram(message, token, chat_id):
     requests.post(url, data=payload)
 
 
-# 保存预测
-def save_prediction(coin, signal, price, score):
+# 保存预测（包含因子）
+def save_prediction(coin, signal, price, score, df):
 
     try:
         with open(LOG_FILE, "r") as f:
@@ -107,12 +107,31 @@ def save_prediction(coin, signal, price, score):
     except:
         logs = []
 
+    df["ma7"] = df["close"].rolling(7).mean()
+    df["ma30"] = df["close"].rolling(30).mean()
+
+    trend = 1 if df["ma7"].iloc[-1] > df["ma30"].iloc[-1] else 0
+
+    volume = df["volume"].iloc[-1]
+    avg_volume = df["volume"].mean()
+    volume_factor = 1 if volume > avg_volume * 1.5 else 0
+
+    momentum = (df["close"].iloc[-1] - df["close"].iloc[-5]) / df["close"].iloc[-5]
+    momentum_factor = 1 if momentum > 0 else 0
+
+    volatility = (df["high"] - df["low"]).mean()
+    volatility_factor = 1 if volatility > df["close"].mean() * 0.01 else 0
+
     record = {
         "time": str(datetime.now()),
         "coin": coin,
         "signal": signal,
         "price": price,
-        "score": score
+        "score": score,
+        "trend": trend,
+        "volume": volume_factor,
+        "momentum": momentum_factor,
+        "volatility": volatility_factor
     }
 
     logs.append(record)
@@ -222,7 +241,7 @@ def analyze_coin(inst, config, memory):
     else:
         signal = "NEUTRAL"
 
-    return signal, score, price
+    return signal, score, price, df
 
 
 # 主程序
@@ -250,17 +269,19 @@ def main():
 
             try:
 
-                signal, score, price = analyze_coin(coin, config, memory)
+                signal, score, price, df = analyze_coin(coin, config, memory)
 
                 print(
                     f"[{datetime.now()}] 币种:{coin} | 评分:{score} | 信号:{signal} | 当前价:{price}"
                 )
 
-               save_prediction(coin, signal, price, score)
+                # 每次预测都记录
+                save_prediction(coin, signal, price, score, df)
 
-if signal != "NEUTRAL":
+                # 只有 BUY/SELL 才提醒
+                if signal != "NEUTRAL":
 
-    msg = f"""
+                    msg = f"""
 【AI交易信号】
 
 币种：{coin}
