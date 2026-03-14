@@ -10,6 +10,10 @@ AI_MEMORY_FILE = "ai_memory.json"
 
 WHALE_THRESHOLD = 20000
 
+# ===== 微信机器人配置 =====
+WECHAT_BOT_ID = "aibRY2AELN5hw8GS18BGLm3Zw-AebN9sIsC"
+WECHAT_SECRET = "IEsHdy4PpqjpvIu1G0JEwMW7ZTJ3MTU2whghxOcFwtv"
+
 
 def load_config():
     with open(CONFIG_FILE, "r") as f:
@@ -29,7 +33,69 @@ def load_ai_memory():
         }
 
 
+# =========================
+# 微信机器人发送
+# =========================
+def send_wechat(message):
+
+    try:
+
+        url = "https://api.coze.cn/v1/bot/message"
+
+        headers = {
+            "Authorization": f"Bearer {WECHAT_SECRET}",
+            "Content-Type": "application/json"
+        }
+
+        data = {
+            "bot_id": WECHAT_BOT_ID,
+            "content": message
+        }
+
+        requests.post(url, headers=headers, json=data)
+
+    except Exception as e:
+        print("微信发送失败:", e)
+
+
+# =========================
+# Telegram发送
+# =========================
+def send_telegram(message, token, chat_id):
+
+    try:
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+        payload = {
+            "chat_id": chat_id,
+            "text": message
+        }
+
+        requests.post(url, data=payload)
+
+    except Exception as e:
+
+        print("Telegram发送失败:", e)
+
+
+# =========================
+# 双通道发送
+# =========================
+def send_notification(message, config):
+
+    send_telegram(
+        message,
+        config["telegram_bot_token"],
+        config["telegram_chat_id"]
+    )
+
+    send_wechat(message)
+
+
+# =========================
 # 获取K线
+# =========================
 def get_okx_kline(inst):
 
     url = f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar=5m&limit=100"
@@ -49,7 +115,9 @@ def get_okx_kline(inst):
     return df
 
 
+# =========================
 # 巨鲸检测
+# =========================
 def detect_whale(inst):
 
     try:
@@ -78,7 +146,9 @@ def detect_whale(inst):
         return 0
 
 
+# =========================
 # AI行情评级
+# =========================
 def get_market_state(df):
 
     df["ma30"] = df["close"].rolling(30).mean()
@@ -99,7 +169,9 @@ def get_market_state(df):
         return "震荡"
 
 
-# AI行情周期识别
+# =========================
+# AI行情周期
+# =========================
 def detect_market_cycle(df):
 
     df["ma20"] = df["close"].rolling(20).mean()
@@ -129,7 +201,9 @@ def detect_market_cycle(df):
         return "震荡"
 
 
+# =========================
 # AI评分
+# =========================
 def calculate_score(df, memory, whale_volume):
 
     score = 50
@@ -168,7 +242,9 @@ def calculate_score(df, memory, whale_volume):
     return score
 
 
+# =========================
 # 信号强度
+# =========================
 def get_signal_strength(score):
 
     if score >= 75:
@@ -181,7 +257,9 @@ def get_signal_strength(score):
         return "弱信号"
 
 
-# 🔥超级信号判断
+# =========================
+# 超级信号
+# =========================
 def check_super_signal(score, cycle, whale_volume):
 
     if score >= 75 and cycle == "主升浪" and whale_volume >= 50000:
@@ -190,43 +268,9 @@ def check_super_signal(score, cycle, whale_volume):
     return False
 
 
-# Telegram
-def send_telegram(message, token, chat_id):
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-    payload = {
-        "chat_id": chat_id,
-        "text": message
-    }
-
-    requests.post(url, data=payload)
-
-
-# 保存预测
-def save_prediction(coin, signal, price, score, df):
-
-    try:
-        with open(LOG_FILE, "r") as f:
-            logs = json.load(f)
-    except:
-        logs = []
-
-    record = {
-        "time": str(datetime.now()),
-        "coin": coin,
-        "signal": signal,
-        "price": price,
-        "score": score
-    }
-
-    logs.append(record)
-
-    with open(LOG_FILE, "w") as f:
-        json.dump(logs, f, indent=4)
-
-
+# =========================
 # 主程序
+# =========================
 def main():
 
     config = load_config()
@@ -266,19 +310,9 @@ def main():
                 else:
                     signal = "中性"
 
-                if super_signal:
-
-                    print(
-                        f"[{datetime.now()}] 🔥超级信号 {coin} | 评分:{score} | 周期:{cycle} | 巨鲸:{int(whale_volume)}"
-                    )
-
-                else:
-
-                    print(
-                        f"[{datetime.now()}] {coin} | 评分:{score} | 信号:{signal} | 强度:{strength} | 周期:{cycle} | 市场:{trend} | 巨鲸:{int(whale_volume)}"
-                    )
-
-                save_prediction(coin, signal, price, score, df)
+                print(
+                    f"[{datetime.now()}] {coin} | 评分:{score} | 信号:{signal} | 周期:{cycle}"
+                )
 
                 if super_signal:
 
@@ -287,7 +321,7 @@ def main():
 
 币种：{coin}
 
-当前价格：{price}
+价格：{price}
 
 行情阶段：{cycle}
 行情评级：{trend}
@@ -299,11 +333,7 @@ AI评分：{score}
 建议：强买入
 """
 
-                    send_telegram(
-                        msg,
-                        config["telegram_bot_token"],
-                        config["telegram_chat_id"]
-                    )
+                    send_notification(msg, config)
 
                 elif signal != "中性":
 
@@ -312,24 +342,20 @@ AI交易信号
 
 币种：{coin}
 
-当前价格：{price}
+价格：{price}
 
 行情阶段：{cycle}
 行情评级：{trend}
 
-交易信号：{signal}
-信号强度：{strength}
+信号：{signal}
+强度：{strength}
 
-AI评分：{score}
+评分：{score}
 
-巨鲸资金：{int(whale_volume)} USDT
+巨鲸资金：{int(whale_volume)}
 """
 
-                    send_telegram(
-                        msg,
-                        config["telegram_bot_token"],
-                        config["telegram_chat_id"]
-                    )
+                    send_notification(msg, config)
 
             except Exception as e:
 
