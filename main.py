@@ -349,7 +349,14 @@ def load_memory():
         "volatility_weight": 0.1,
         "sentiment_weight": 0.2,
         "ml_weight": 0.7,
-        "feature_importance": {}
+        "buy_threshold": 70,        # 动态买入阈值
+        "sell_threshold": 35,        # 动态卖出阈值
+        "feature_importance": {},
+        "last_training_time": 0,
+        "total_training_sessions": 0,
+        "best_accuracy": 0.0,
+        "model_version": "1.0.0",
+        "training_history": []
     }
     try:
         with open(MEMORY_PATH) as f:
@@ -368,7 +375,7 @@ def save_memory(memory):
         json.dump(memory, f, indent=4)
 
 # =========================
-# 通知功能：Telegram和邮件（保持不变）
+# 通知功能：Telegram和邮件
 # =========================
 def send_telegram_message(text, config):
     """通过Telegram Bot发送消息"""
@@ -401,11 +408,9 @@ def send_email(subject, body, config):
     for host, port, use_tls in smtp_servers:
         try:
             if use_tls:
-                # 端口25需要先建立普通SMTP连接，再升级到TLS
                 server = smtplib.SMTP(host, port, timeout=10)
                 server.starttls()
             else:
-                # 端口465直接使用SSL
                 server = smtplib.SMTP_SSL(host, port, timeout=10)
 
             server.login(user, pwd)
@@ -417,7 +422,7 @@ def send_email(subject, body, config):
             server.send_message(msg)
             server.quit()
             print(f"邮件发送成功（使用 {host}:{port}）")
-            return  # 成功则退出函数
+            return
         except smtplib.SMTPAuthenticationError:
             print(f"认证失败（{host}:{port}），请检查邮箱授权码是否正确")
         except (smtplib.SMTPServerDisconnected, ConnectionRefusedError, TimeoutError) as e:
@@ -426,6 +431,7 @@ def send_email(subject, body, config):
             print(f"未知错误（{host}:{port}）: {type(e).__name__}: {e}")
 
     print("所有邮件服务器尝试均失败，请检查网络或邮箱配置")
+
 def send_notification(content, config, subject=None):
     """同时发送Telegram和邮件（若配置）"""
     send_telegram_message(content, config)
@@ -433,7 +439,7 @@ def send_notification(content, config, subject=None):
         send_email(subject, content, config)
 
 # =========================
-# 安全请求（保持不变）
+# 安全请求
 # =========================
 def safe_request(url, max_retries=3):
     for i in range(max_retries):
@@ -476,7 +482,7 @@ def detect_whale(inst):
         return 0
 
 # =========================
-# 市场周期识别（保持不变）
+# 市场周期识别
 # =========================
 def detect_market_cycle():
     """基于BTC判断市场周期：牛市/熊市/震荡"""
@@ -499,19 +505,41 @@ def detect_market_cycle():
         return "未知"
 
 def apply_cycle_strategy_adjustment(memory, cycle):
-    """根据市场周期调整权重并保存"""
+    """
+    根据市场周期调整权重和阈值，并保存
+    牛市：增强趋势，提高买入阈值、降低卖出阈值（顺势而为）
+    熊市：降低买入阈值、降低卖出阈值（谨慎抄底，快速止损）
+    震荡：放宽阈值，增加交易频率
+    """
     memory = memory.copy()
     if cycle == "牛市":
         memory["trend_weight"] = min(memory.get("trend_weight", 0.3) + 0.05, 1.0)
+        # 提高买入门槛，降低卖出门槛，避免回调下车
+        memory["buy_threshold"] = min(memory.get("buy_threshold", 70) + 2, 85)
+        memory["sell_threshold"] = max(memory.get("sell_threshold", 35) - 2, 20)
     elif cycle == "熊市":
         memory["trend_weight"] = max(memory.get("trend_weight", 0.3) - 0.05, 0.0)
+        # 降低买入门槛（博反弹），降低卖出门槛（及时止损）
+        memory["buy_threshold"] = max(memory.get("buy_threshold", 70) - 2, 55)
+        memory["sell_threshold"] = max(memory.get("sell_threshold", 35) - 2, 20)
     elif cycle == "震荡":
         memory["volume_weight"] = min(memory.get("volume_weight", 0.2) + 0.05, 1.0)
+        # 放宽阈值，增加交易频率
+        memory["buy_threshold"] = max(memory.get("buy_threshold", 70) - 3, 55)
+        memory["sell_threshold"] = min(memory.get("sell_threshold", 35) + 3, 45)
+
+    # 确保买入阈值 > 卖出阈值，且在一定范围内
+    memory["buy_threshold"] = max(memory["buy_threshold"], memory["sell_threshold"] + 5)
+    memory["buy_threshold"] = min(memory["buy_threshold"], 85)
+    memory["sell_threshold"] = max(memory["sell_threshold"], 15)
+    memory["sell_threshold"] = min(memory["sell_threshold"], 50)
+
     save_memory(memory)
+    print(f"周期调整: {cycle}, 新阈值: 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}")
     return memory
 
 # =========================
-# AI评分（增强版：结合规则和机器学习，保持不变）
+# AI评分（增强版：结合规则和机器学习）
 # =========================
 def calculate_score(df, memory, whale, market_cycle, coin, config):
     """
@@ -540,15 +568,15 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
             rule_score += 10 * memory.get("volume_weight", 0.2)
         if whale > 0:
             rule_score += 5
-            
+
         rule_score = max(0, min(100, int(rule_score)))
-    
+
     # 2. 机器学习评分（如果启用）
     ml_score = 50
     ml_confidence = 0
     feature_importance = {}
     features = None
-    
+
     if config.get("use_ml_model", True) and ai_model.is_trained:
         try:
             features = ai_model.extract_features(df, whale, market_cycle, coin)
@@ -561,11 +589,11 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
     else:
         # 即使未训练，也提取特征以备记录
         features = ai_model.extract_features(df, whale, market_cycle, coin)
-    
+
     # 3. 综合评分
     ml_weight = config.get("ml_weight", 0.7) if ai_model.is_trained else 0
     combined_score = rule_score * (1 - ml_weight) + ml_score * ml_weight
-    
+
     # 4. 构建因子信息
     factors = {
         'rule_score': rule_score,
@@ -574,11 +602,11 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
         'combined_score': combined_score,
         'feature_importance': feature_importance
     }
-    
+
     return int(combined_score), factors, features
 
 # =========================
-# 日志管理：验证与记录（增强版，使用持久化路径）
+# 日志管理：验证与记录
 # =========================
 def load_log():
     try:
@@ -603,25 +631,25 @@ def verify_past_signals(config):
                 current_price = df["close"].iloc[-1]
                 record_price = entry["price"]
                 signal = entry["signal"]
-                
+
                 if signal == "买入":
                     correct = current_price > record_price
                 elif signal == "卖出":
                     correct = current_price < record_price
                 else:
                     correct = False
-                    
+
                 entry["verified"] = True
                 entry["result"] = "correct" if correct else "wrong"
                 updated = True
             except Exception as e:
                 print(f"验证{coin}信号失败: {e}")
-                
+
     if updated:
         save_log(log)
 
 def log_signal(coin, signal, score, price, whale, market_cycle, factors, features):
-    """记录新信号到日志（增强版：保存更多上下文，包括特征）"""
+    """记录新信号到日志（保存特征）"""
     log = load_log()
     entry = {
         "timestamp": time.time(),
@@ -634,12 +662,12 @@ def log_signal(coin, signal, score, price, whale, market_cycle, factors, feature
         "rule_score": factors.get('rule_score', 50),
         "ml_score": factors.get('ml_score', 50),
         "ml_confidence": factors.get('ml_confidence', 0),
-        "features": features,  # 保存特征字典
+        "features": features,
         "verified": False,
         "result": None
     }
     log.append(entry)
-    
+
     # 限制日志大小
     if len(log) > MAX_LOG_SIZE:
         unverified = [e for e in log if not e.get("verified", False)]
@@ -650,56 +678,75 @@ def log_signal(coin, signal, score, price, whale, market_cycle, factors, feature
         else:
             verified = []
         log = unverified + verified
-        
+
     save_log(log)
 
 # =========================
-# 自适应优化（增强版：基于机器学习，使用日志中的特征）
+# 自适应优化（增强版：基于机器学习，同时微调阈值）
 # =========================
 def adaptive_strategy_optimization(config):
-    """增强版自适应优化：重新训练机器学习模型（使用日志中保存的特征）"""
+    """增强版自适应优化：重新训练机器学习模型，并根据胜率微调阈值"""
     global ai_model
-    
+
     log = load_log()
     verified = [e for e in log if e.get("verified") and e.get("result") in ("correct", "wrong")]
-    
+
     if len(verified) < MIN_TRAIN_SAMPLES:
         print(f"自适应优化：已验证记录不足{MIN_TRAIN_SAMPLES}条（{len(verified)}），跳过")
         return
-    
-    # 准备训练数据（直接从日志提取特征）
+
+    # 准备训练数据
     X_df, y = ai_model.prepare_training_data(verified)
-    
+
     if X_df is None:
         print("特征提取后样本不足")
         return
-    
+
     # 训练模型
     success = ai_model.train(X_df, y)
-    
+
     if success:
         # 保存模型
         ai_model.save()
-        
+
         # 更新内存中的特征重要性
         memory = load_memory()
         memory['feature_importance'] = ai_model.feature_importance
-        memory['ml_weight'] = min(0.9, memory.get('ml_weight', 0.7) + 0.05)  # 逐渐增加ML权重
+        memory['ml_weight'] = min(0.9, memory.get('ml_weight', 0.7) + 0.05)
+
+        # 根据模型胜率微调阈值
+        accuracy = ai_model.training_history[-1]['accuracy']
+        if accuracy > 0.65:
+            # 胜率高，可以收紧阈值，追求更高胜率
+            memory['buy_threshold'] = min(memory.get('buy_threshold', 70) + 2, 85)
+            memory['sell_threshold'] = max(memory.get('sell_threshold', 35) - 2, 20)
+        elif accuracy < 0.5:
+            # 胜率低，放宽阈值，增加交易频率以积累更多样本
+            memory['buy_threshold'] = max(memory.get('buy_threshold', 70) - 2, 55)
+            memory['sell_threshold'] = min(memory.get('sell_threshold', 35) + 2, 45)
+
+        # 确保买入 > 卖出
+        memory['buy_threshold'] = max(memory['buy_threshold'], memory['sell_threshold'] + 5)
+        memory['buy_threshold'] = min(memory['buy_threshold'], 85)
+        memory['sell_threshold'] = max(memory['sell_threshold'], 15)
+        memory['sell_threshold'] = min(memory['sell_threshold'], 50)
+
         save_memory(memory)
-        
+
         # 发送通知
         top_features = sorted(ai_model.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
         feature_msg = "\n".join([f"{f}: {v:.4f}" for f, v in top_features])
-        
+
         msg = (f"🤖 AI模型已进化\n"
                f"训练样本: {len(X_df)}\n"
-               f"准确率: {ai_model.training_history[-1]['accuracy']:.4f}\n"
+               f"准确率: {accuracy:.4f}\n"
+               f"新阈值: 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}\n"
                f"Top5特征:\n{feature_msg}")
-        
+
         send_notification(msg, config, "AI模型进化报告")
 
 # =========================
-# 热门币种扫描（保持不变）
+# 热门币种扫描
 # =========================
 def scan_hot_coins(limit=20):
     """从OKX获取涨幅榜，返回热门币种列表（包含币名和24h涨幅）"""
@@ -720,38 +767,34 @@ def scan_hot_coins(limit=20):
         if vol24h < 100000:
             continue
         change24h = float(t.get("change24h", 0))
-        hot.append((inst, change24h))  # 返回元组 (币种, 涨幅)
+        hot.append((inst, change24h))
     return hot
 
 def hot_coin_filter(coin_name):
-    """判断热门币是否符合加入动态列表的条件（coin_name是字符串）"""
     if coin_name in ["BTC-USDT", "ETH-USDT"]:
         return False
     return True
 
 # =========================
-# 回测报告（增强版，保持不变）
+# 回测报告
 # =========================
 def generate_backtest_report():
-    """基于已验证的日志生成回测统计"""
     log = load_log()
     verified = [e for e in log if e.get("verified")]
     if not verified:
         return "暂无已验证数据"
-    
+
     total = len(verified)
     correct = sum(1 for e in verified if e.get("result") == "correct")
     wrong = total - correct
     winrate = correct / total if total else 0
-    
-    # 按币种统计
+
     coins_stats = {}
-    # 按模型类型统计
     ml_correct = 0
     ml_total = 0
     rule_correct = 0
     rule_total = 0
-    
+
     for e in verified:
         coin = e["coin"]
         if coin not in coins_stats:
@@ -760,8 +803,7 @@ def generate_backtest_report():
             coins_stats[coin]["correct"] += 1
         else:
             coins_stats[coin]["wrong"] += 1
-            
-        # 统计ML vs 规则表现（根据置信度粗略判断）
+
         if e.get('ml_confidence', 0) > 0.6:
             ml_total += 1
             if e["result"] == "correct":
@@ -770,32 +812,31 @@ def generate_backtest_report():
             rule_total += 1
             if e["result"] == "correct":
                 rule_correct += 1
-    
+
     report = f"📊 回测报告\n"
     report += f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     report += f"总信号: {total}\n"
     report += f"正确: {correct}\n"
     report += f"错误: {wrong}\n"
     report += f"胜率: {winrate:.2%}\n\n"
-    
+
     if ml_total > 0:
         ml_winrate = ml_correct / ml_total
         report += f"🤖 ML信号: {ml_total}次, 胜率: {ml_winrate:.2%}\n"
     if rule_total > 0:
         rule_winrate = rule_correct / rule_total
         report += f"📐 规则信号: {rule_total}次, 胜率: {rule_winrate:.2%}\n"
-    
+
     report += "\n📈 币种表现:\n"
     for coin, stats in coins_stats.items():
         c = stats["correct"]
         w = stats["wrong"]
         rate = c / (c + w) if (c + w) else 0
         report += f"{coin}: {c}✓ {w}✗ ({rate:.2%})\n"
-    
+
     return report
 
 def get_recent_signals(n=3):
-    """获取最近的n个非中性信号，返回格式化字符串列表"""
     log = load_log()
     signals = [e for e in log if e.get("signal") in ("买入", "卖出")]
     signals.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
@@ -809,7 +850,6 @@ def get_recent_signals(n=3):
     return recent
 
 def get_signal_stats_since(hours):
-    """统计最近 hours 小时内的信号总数和正确数"""
     log = load_log()
     cutoff = time.time() - hours * 3600
     recent = [e for e in log if e.get("timestamp", 0) > cutoff and e.get("signal") in ("买入", "卖出")]
@@ -818,12 +858,11 @@ def get_signal_stats_since(hours):
     return total, correct
 
 def send_backtest_report(config):
-    """生成并发送回测报告"""
     report = generate_backtest_report()
     send_notification(report, config, "每日回测报告")
 
 # =========================
-# 主程序（增强版，已适配特征记录）
+# 主程序
 # =========================
 def main():
     global last_backtest_time, last_adaptive_time, last_cycle_check, current_market_cycle
@@ -857,25 +896,25 @@ def main():
 
             # 3. 获取热门币种
             hot_coins_with_change = scan_hot_coins()[:MAX_DYNAMIC_COINS]
-            hot_coins = [coin for coin, _ in hot_coins_with_change]  # 只取币名用于监控
+            hot_coins = [coin for coin, _ in hot_coins_with_change]
             coins = config["coins"].copy()
             for h in hot_coins:
                 if hot_coin_filter(h) and h not in coins:
                     coins.append(h)
 
-            # 4. 加载内存权重
+            # 4. 加载内存权重，并用内存中的阈值覆盖配置（实现动态阈值）
             memory = load_memory()
+            config["buy_threshold"] = memory.get("buy_threshold", config["buy_threshold"])
+            config["sell_threshold"] = memory.get("sell_threshold", config["sell_threshold"])
 
             # 5. 处理每个币种
             for coin in coins:
                 try:
                     df = get_kline(coin)
                     whale = detect_whale(coin)
-                    
-                    # 使用增强版评分，并获取特征字典
+
                     score, factors, features = calculate_score(df, memory, whale, current_market_cycle, coin, config)
 
-                    # 判断信号
                     if score >= config["buy_threshold"]:
                         signal = "买入"
                     elif score <= config["sell_threshold"]:
@@ -883,7 +922,6 @@ def main():
                     else:
                         signal = "中性"
 
-                    # 信号冷却检查
                     if signal in ("买入", "卖出"):
                         last_time = last_signal_time.get(coin, 0)
                         if now - last_time < SIGNAL_COOLDOWN:
@@ -891,12 +929,10 @@ def main():
                             continue
                         last_signal_time[coin] = now
 
-                    # 记录日志（增强版：保存更多信息，包括特征）
                     if signal in ("买入", "卖出"):
                         price = df["close"].iloc[-1]
                         log_signal(coin, signal, score, price, whale, current_market_cycle, factors, features)
 
-                    # 发送通知（增强版：包含ML信息）
                     if signal in ("买入", "卖出"):
                         ml_info = ""
                         if factors.get('ml_confidence', 0) > 0:
@@ -905,12 +941,13 @@ def main():
                                 top_feat = sorted(factors['feature_importance'].items(), key=lambda x: abs(x[1]), reverse=True)[:3]
                                 feat_str = ", ".join([f"{f[:10]}:{v:.2f}" for f, v in top_feat])
                                 ml_info += f"\n重要特征: {feat_str}"
-                        
+
                         msg = (f"🚨 {signal} 信号\n"
                                f"币种: {coin}\n"
                                f"综合评分: {score}\n"
                                f"规则评分: {factors['rule_score']}\n"
                                f"ML评分: {factors['ml_score']:.1f}{ml_info}\n"
+                               f"当前阈值: 买{config['buy_threshold']}/卖{config['sell_threshold']}\n"
                                f"周期: {current_market_cycle}\n"
                                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                         send_notification(msg, config, f"{signal}信号 {coin}")
@@ -920,25 +957,22 @@ def main():
                 except Exception as e:
                     print(f"处理{coin}时出错: {e}")
 
-            # 6. 检查回测报告间隔
+            # 6. 回测报告
             if now - last_backtest_time > BACKTEST_INTERVAL:
                 send_backtest_report(config)
                 last_backtest_time = now
 
-            # 7. 检查自适应优化间隔（增强版：重新训练模型）
+            # 7. 自适应优化（模型训练+阈值微调）
             if now - last_adaptive_time > ADAPTIVE_OPTIMIZATION_INTERVAL:
                 adaptive_strategy_optimization(config)
                 last_adaptive_time = now
 
-            # 8. 状态推送
-                                             
+            # 8. 状态推送（使用动态阈值）
             if now - last_status_push > STATUS_PUSH_INTERVAL:
-                # 计算运行时间
                 uptime_seconds = int(now - start_time)
                 hours = uptime_seconds // 3600
                 minutes = (uptime_seconds % 3600) // 60
 
-                # 模型信息
                 if ai_model.is_trained:
                     model_acc = ai_model.training_history[-1]['accuracy']
                     model_samples = ai_model.training_history[-1]['samples']
@@ -946,7 +980,6 @@ def main():
                 else:
                     model_info = "❌ 未训练"
 
-                # 当前监控币种评分/信号（含价格）
                 coin_lines = []
                 for coin in coins:
                     try:
@@ -954,7 +987,6 @@ def main():
                         price = df["close"].iloc[-1]
                         whale = detect_whale(coin)
                         score, factors, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
-                        # 判断信号
                         if score >= config["buy_threshold"]:
                             signal_icon = "🟢 买入"
                         elif score <= config["sell_threshold"]:
@@ -962,29 +994,21 @@ def main():
                         else:
                             signal_icon = "⚪ 中性"
                         coin_lines.append(f"{coin}: ${price:.4f} {score} {signal_icon}")
-                    except Exception as e:
+                    except:
                         coin_lines.append(f"{coin}: 获取失败")
 
-                # 最近买卖信号
                 recent_signals = get_recent_signals(3)
                 recent_str = "\n".join(recent_signals) if recent_signals else "暂无"
 
-                # 市场热点币种（前3个，带涨幅）
                 hot_coins_with_change = scan_hot_coins()[:3]
                 hot_lines = [f"{coin}: {change:+.2f}%" for coin, change in hot_coins_with_change]
                 hot_str = "\n".join(hot_lines) if hot_lines else "暂无"
 
-                # 今日信号统计
                 today_total, today_correct = get_signal_stats_since(24)
                 today_winrate = today_correct / today_total if today_total > 0 else 0
-
-                # 6小时和24小时统计
                 sixh_total, sixh_correct = get_signal_stats_since(6)
                 sixh_winrate = sixh_correct / sixh_total if sixh_total > 0 else 0
-                twenty4h_total, twenty4h_correct = today_total, today_correct
-                twenty4h_winrate = today_winrate
 
-                # 构建消息
                 status = f"🔥 AI超级信号\n\n"
                 status += "📈 当前监控币种:\n" + "\n".join(coin_lines) + "\n\n"
                 status += f"⏱️ 最近信号:\n{recent_str}\n\n"
@@ -993,11 +1017,19 @@ def main():
                 status += f"📆 今日信号: {today_total}次 (胜率: {today_winrate:.2%})\n\n"
                 status += f"📊 AI复盘报告:\n"
                 status += f"6小时: {sixh_total}次, 胜率 {sixh_winrate:.2%}\n"
-                status += f"24小时: {twenty4h_total}次, 胜率 {twenty4h_winrate:.2%}\n"
+                status += f"24小时: {today_total}次, 胜率 {today_winrate:.2%}\n"
+                status += f"当前阈值: 买入{config['buy_threshold']} / 卖出{config['sell_threshold']}\n"
                 status += f"运行时间: {hours}小时{minutes}分钟 | 周期: {current_market_cycle}"
 
-                send_telegram_message(status, config)
+                # 防重复机制
+                current_interval = int(now / STATUS_PUSH_INTERVAL)
+                last_interval = int(last_status_push / STATUS_PUSH_INTERVAL) if last_status_push > 0 else -1
+                if current_interval != last_interval:
+                    send_telegram_message(status, config)
+                else:
+                    print("状态推送跳过（同一周期内已发送）")
                 last_status_push = now
+
             # 9. 日报推送
             if now - last_daily_report > DAILY_REPORT_INTERVAL:
                 send_backtest_report(config)
