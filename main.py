@@ -32,7 +32,7 @@ def load_ai_memory():
 # 获取K线
 def get_okx_kline(inst):
 
-    url = f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar=5m&limit=50"
+    url = f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar=5m&limit=100"
 
     r = requests.get(url)
 
@@ -78,7 +78,7 @@ def detect_whale(inst):
         return 0
 
 
-# AI行情评级（升级版）
+# AI行情评级
 def get_market_state(df):
 
     df["ma30"] = df["close"].rolling(30).mean()
@@ -94,6 +94,36 @@ def get_market_state(df):
 
     elif ma30 < ma90 and momentum < -0.02:
         return "熊市"
+
+    else:
+        return "震荡"
+
+
+# AI行情周期识别
+def detect_market_cycle(df):
+
+    df["ma20"] = df["close"].rolling(20).mean()
+    df["ma60"] = df["close"].rolling(60).mean()
+
+    ma20 = df["ma20"].iloc[-1]
+    ma60 = df["ma60"].iloc[-1]
+
+    momentum = (df["close"].iloc[-1] - df["close"].iloc[-15]) / df["close"].iloc[-15]
+
+    volume = df["volume"].iloc[-1]
+    avg_volume = df["volume"].mean()
+
+    if ma20 < ma60 and momentum < -0.03:
+        return "底部"
+
+    elif ma20 > ma60 and momentum > 0.03 and volume > avg_volume:
+        return "启动"
+
+    elif ma20 > ma60 and momentum > 0.06:
+        return "主升浪"
+
+    elif ma20 > ma60 and momentum < 0:
+        return "顶部"
 
     else:
         return "震荡"
@@ -301,6 +331,8 @@ def main():
 
                 trend = get_market_state(df)
 
+                cycle = detect_market_cycle(df)
+
                 score = calculate_score(df, memory, whale_volume)
 
                 price = df["close"].iloc[-1]
@@ -315,7 +347,7 @@ def main():
                     signal = "中性"
 
                 print(
-                    f"[{datetime.now()}] {coin} | 评分:{score} | 信号:{signal} | 强度:{strength} | 市场:{trend} | 巨鲸:{int(whale_volume)}"
+                    f"[{datetime.now()}] {coin} | 评分:{score} | 信号:{signal} | 强度:{strength} | 周期:{cycle} | 市场:{trend} | 巨鲸:{int(whale_volume)}"
                 )
 
                 save_prediction(coin, signal, price, score, df)
@@ -329,12 +361,13 @@ AI交易信号
 
 当前价格：{price}
 
+行情阶段：{cycle}
+行情评级：{trend}
+
 交易信号：{signal}
 信号强度：{strength}
 
 AI评分：{score}
-
-行情评级：{trend}
 
 巨鲸资金：{int(whale_volume)} USDT
 """
