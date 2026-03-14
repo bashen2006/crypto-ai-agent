@@ -384,25 +384,44 @@ def send_telegram_message(text, config):
         print(f"Telegram发送失败: {e}")
 
 def send_email(subject, body, config):
-    """通过139邮箱发送邮件"""
+    """通过139邮箱发送邮件，支持多端口尝试"""
     user = config.get("email_user")
     pwd = config.get("email_pass")
     receiver = config.get("email_receiver")
     if not user or not pwd or not receiver:
+        print("邮件配置不完整，跳过发送")
         return
-    try:
-        msg = MIMEMultipart()
-        msg["From"] = user
-        msg["To"] = receiver
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-        server = smtplib.SMTP("smtp.139.com", 25)
-        server.starttls()
-        server.login(user, pwd)
-        server.send_message(msg)
-        server.quit()
-    except Exception as e:
-        print(f"邮件发送失败: {e}")
+
+    # 尝试不同的服务器和端口组合
+    smtp_servers = [
+        ("smtp.139.com", 25, True),   # 端口25 + STARTTLS
+        ("smtp.139.com", 587, True),  # 端口587 + STARTTLS
+        ("smtp.139.com", 465, False)  # 端口465 + SSL
+    ]
+
+    for host, port, use_tls in smtp_servers:
+        try:
+            if use_tls:
+                server = smtplib.SMTP(host, port, timeout=10)
+                server.starttls()
+            else:
+                server = smtplib.SMTP_SSL(host, port, timeout=10)
+
+            server.login(user, pwd)
+            msg = MIMEMultipart()
+            msg["From"] = user
+            msg["To"] = receiver
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            server.send_message(msg)
+            server.quit()
+            print(f"邮件发送成功（使用 {host}:{port}）")
+            return  # 成功则退出函数
+        except Exception as e:
+            print(f"尝试 {host}:{port} 失败: {e}")
+            continue
+
+    print("所有邮件服务器尝试均失败，请检查网络或邮箱配置")
 
 def send_notification(content, config, subject=None):
     """同时发送Telegram和邮件（若配置）"""
