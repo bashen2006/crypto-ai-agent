@@ -1,14 +1,11 @@
+
 {
   "coins": ["BTC-USDT","ETH-USDT","OKB-USDT"],
-
   "buy_threshold": 70,
   "sell_threshold": 35,
-
   "check_interval": 300,
-
   "telegram_bot_token": "8546952065:AAFx7E4-wx4AeGWS5sQthgnFLhtUvExOkrQ",
   "telegram_chat_id": "1392813886",
-
   "email_user": "13781411151@139.com",
   "email_pass": "98adfa5c93a3a509df00",
   "email_receiver": "13781411151@139.com"
