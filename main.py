@@ -2,6 +2,7 @@ import time
 import json
 import requests
 import pandas as pd
+LOG_FILE = "prediction_log.json"
 from datetime import datetime
 
 CONFIG_FILE = "config.json"
@@ -58,7 +59,29 @@ def calculate_score(df):
 
     return int(score)
 
+def save_prediction(coin, signal, price, score):
 
+    try:
+
+        with open(LOG_FILE, "r") as f:
+            logs = json.load(f)
+
+    except:
+        logs = []
+
+    record = {
+        "time": str(datetime.now()),
+        "coin": coin,
+        "signal": signal,
+        "price": price,
+        "score": score
+    }
+
+    logs.append(record)
+
+    with open(LOG_FILE, "w") as f:
+        json.dump(logs, f, indent=4)
+        
 # 发送Telegram
 def send_telegram(message, token, chat_id):
 
@@ -120,9 +143,11 @@ def main():
                     f"[{datetime.now()}] 币种:{coin} | 评分:{score} | 信号:{signal} | 当前价:{price}"
                 )
 
-                if signal != "NEUTRAL":
+               if signal != "NEUTRAL":
 
-                    msg = f"""
+                   save_prediction(coin, signal, price, score)
+
+                   msg = f"""
 【AI交易信号】
 
 币种：{coin}
