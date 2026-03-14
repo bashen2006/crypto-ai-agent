@@ -11,17 +11,17 @@ LOG_FILE="prediction_log.json"
 
 WHALE_THRESHOLD=20000
 
-# -------------------
-# 加载配置
-# -------------------
+# =========================
+# 配置加载
+# =========================
 
 def load_config():
     with open(CONFIG_FILE) as f:
         return json.load(f)
 
-# -------------------
+# =========================
 # AI权重
-# -------------------
+# =========================
 
 def load_memory():
 
@@ -47,9 +47,9 @@ def save_memory(memory):
     with open(MEMORY_FILE,"w") as f:
         json.dump(memory,f,indent=4)
 
-# -------------------
+# =========================
 # OKX行情
-# -------------------
+# =========================
 
 def get_kline(inst):
 
@@ -69,9 +69,9 @@ def get_kline(inst):
 
     return df
 
-# -------------------
-# 巨鲸检测
-# -------------------
+# =========================
+# 巨鲸监控
+# =========================
 
 def detect_whale(inst):
 
@@ -102,9 +102,9 @@ def detect_whale(inst):
 
         return 0
 
-# -------------------
-# AI评分
-# -------------------
+# =========================
+# AI评分（原功能）
+# =========================
 
 def calculate_score(df,memory,whale):
 
@@ -159,9 +159,72 @@ def calculate_score(df,memory,whale):
 
     return score,factors
 
-# -------------------
+# =========================
+# 新增：市场风险指数
+# =========================
+
+def market_risk_index():
+
+    try:
+
+        df=get_kline("BTC-USDT")
+
+        df["ma200"]=df["close"].rolling(200).mean()
+
+        price=df["close"].iloc[-1]
+        ma200=df["ma200"].iloc[-1]
+
+        if price<ma200:
+
+            return "HIGH"
+
+        else:
+
+            return "NORMAL"
+
+    except:
+
+        return "UNKNOWN"
+
+# =========================
+# 新增：扫描强势币
+# =========================
+
+def scan_hot_coins():
+
+    coins=[]
+
+    try:
+
+        url="https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+
+        r=requests.get(url)
+
+        data=r.json()["data"]
+
+        for c in data:
+
+            try:
+
+                change=float(c["chgUtc"])
+
+                if change>0.05:
+
+                    coins.append(c["instId"])
+
+            except:
+
+                pass
+
+        return coins[:3]
+
+    except:
+
+        return []
+
+# =========================
 # Telegram
-# -------------------
+# =========================
 
 def send_telegram(msg,token,chat):
 
@@ -171,9 +234,9 @@ def send_telegram(msg,token,chat):
 
     requests.post(url,data=data)
 
-# -------------------
+# =========================
 # Email
-# -------------------
+# =========================
 
 def send_email(subject,content,user,password,receiver):
 
@@ -191,9 +254,9 @@ def send_email(subject,content,user,password,receiver):
 
     server.quit()
 
-# -------------------
+# =========================
 # 记录预测
-# -------------------
+# =========================
 
 def log_prediction(coin,price,signal,factors):
 
@@ -216,9 +279,9 @@ def log_prediction(coin,price,signal,factors):
     with open(LOG_FILE,"w") as f:
         json.dump(logs,f)
 
-# -------------------
+# =========================
 # 验证预测
-# -------------------
+# =========================
 
 def evaluate_predictions():
 
@@ -264,9 +327,96 @@ def evaluate_predictions():
 
             json.dump(logs,f)
 
-# -------------------
+# =========================
+# 新增：AI权重优化
+# =========================
+
+def optimize_weights():
+
+    try:
+
+        with open(LOG_FILE) as f:
+
+            logs=json.load(f)
+
+    except:
+
+        return
+
+    memory=load_memory()
+
+    stats={"trend":[0,0],"momentum":[0,0],"volume":[0,0]}
+
+    for r in logs:
+
+        if r["result"]==None:
+
+            continue
+
+        for f in stats:
+
+            if f in r["factors"]:
+
+                stats[f][1]+=1
+
+                if r["result"]=="correct":
+
+                    stats[f][0]+=1
+
+    for f in stats:
+
+        if stats[f][1]>5:
+
+            rate=stats[f][0]/stats[f][1]
+
+            if rate>0.6:
+
+                memory[f+"_weight"]+=0.01
+
+            else:
+
+                memory[f+"_weight"]-=0.01
+
+    save_memory(memory)
+
+# =========================
+# 新增：系统统计
+# =========================
+
+def system_stats():
+
+    try:
+
+        with open(LOG_FILE) as f:
+
+            logs=json.load(f)
+
+    except:
+
+        return
+
+    total=0
+    correct=0
+
+    for r in logs:
+
+        if r["result"]!=None:
+
+            total+=1
+
+            if r["result"]=="correct":
+
+                correct+=1
+
+    if total>0:
+
+        winrate=round(correct/total*100,2)
+
+        print(f"AI统计 | 总预测:{total} 胜率:{winrate}%")
+
+# =========================
 # 主程序
-# -------------------
+# =========================
 
 def main():
 
@@ -276,11 +426,21 @@ def main():
 
     while True:
 
-        memory=load_memory()
-
         evaluate_predictions()
 
-        for coin in config["coins"]:
+        optimize_weights()
+
+        system_stats()
+
+        risk=market_risk_index()
+
+        hot=scan_hot_coins()
+
+        coins=config["coins"]+hot
+
+        memory=load_memory()
+
+        for coin in coins:
 
             try:
 
@@ -304,7 +464,7 @@ def main():
 
                     signal="NEUTRAL"
 
-                msg=f"{coin} | {signal} | score:{score}"
+                msg=f"{coin} | {signal} | score:{score} | risk:{risk}"
 
                 print(msg)
 
@@ -327,7 +487,6 @@ def main():
                 print("error:",e)
 
         time.sleep(config["check_interval"])
-
 
 if __name__=="__main__":
 
