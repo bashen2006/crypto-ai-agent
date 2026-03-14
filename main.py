@@ -857,7 +857,7 @@ def main():
 
             # 3. 获取热门币种
             hot_coins_with_change = scan_hot_coins()[:MAX_DYNAMIC_COINS]
-hot_coins = [coin for coin, _ in hot_coins_with_change]  # 只取币名用于监控
+            hot_coins = [coin for coin, _ in hot_coins_with_change]  # 只取币名用于监控
             coins = config["coins"].copy()
             for h in hot_coins:
                 if hot_coin_filter(h) and h not in coins:
