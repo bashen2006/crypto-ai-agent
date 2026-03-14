@@ -1,0 +1,10 @@
+{
+ "active_strategy": ["trend","momentum"],
+ "strategies": [
+  ["trend","momentum"],
+  ["trend","volume"],
+  ["momentum","volume"],
+  ["trend","whale"],
+  ["momentum","volatility"]
+ ]
+}
