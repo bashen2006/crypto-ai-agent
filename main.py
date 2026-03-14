@@ -384,7 +384,7 @@ def send_telegram_message(text, config):
         print(f"Telegram发送失败: {e}")
 
 def send_email(subject, body, config):
-    """通过139邮箱发送邮件，支持多端口尝试"""
+    """通过139邮箱发送邮件，仅使用官方端口25和465"""
     user = config.get("email_user")
     pwd = config.get("email_pass")
     receiver = config.get("email_receiver")
@@ -392,19 +392,20 @@ def send_email(subject, body, config):
         print("邮件配置不完整，跳过发送")
         return
 
-    # 尝试不同的服务器和端口组合
+    # 使用官方端口：25（STARTTLS）和465（SSL）
     smtp_servers = [
         ("smtp.139.com", 25, True),   # 端口25 + STARTTLS
-        ("smtp.139.com", 587, True),  # 端口587 + STARTTLS
         ("smtp.139.com", 465, False)  # 端口465 + SSL
     ]
 
     for host, port, use_tls in smtp_servers:
         try:
             if use_tls:
+                # 端口25需要先建立普通SMTP连接，再升级到TLS
                 server = smtplib.SMTP(host, port, timeout=10)
                 server.starttls()
             else:
+                # 端口465直接使用SSL
                 server = smtplib.SMTP_SSL(host, port, timeout=10)
 
             server.login(user, pwd)
@@ -417,12 +418,14 @@ def send_email(subject, body, config):
             server.quit()
             print(f"邮件发送成功（使用 {host}:{port}）")
             return  # 成功则退出函数
+        except smtplib.SMTPAuthenticationError:
+            print(f"认证失败（{host}:{port}），请检查邮箱授权码是否正确")
+        except (smtplib.SMTPServerDisconnected, ConnectionRefusedError, TimeoutError) as e:
+            print(f"连接失败（{host}:{port}）: {type(e).__name__}: {e}")
         except Exception as e:
-            print(f"尝试 {host}:{port} 失败: {e}")
-            continue
+            print(f"未知错误（{host}:{port}）: {type(e).__name__}: {e}")
 
     print("所有邮件服务器尝试均失败，请检查网络或邮箱配置")
-
 def send_notification(content, config, subject=None):
     """同时发送Telegram和邮件（若配置）"""
     send_telegram_message(content, config)
