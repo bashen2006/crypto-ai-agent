@@ -7,6 +7,10 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
+# 设置数据存储路径（如果Volume挂载了，就存到Volume里）
+DATA_DIR = '/app/data'  # Volume挂载点
+# 确保目录存在
+os.makedirs(DATA_DIR, exist_ok=True)
 from datetime import datetime
 import pickle
 import warnings
@@ -22,14 +26,23 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 import joblib
 
 # =========================
-# 配置常量
+# 配置常量（使用持久化路径）
 # =========================
-CONFIG_FILE = "config.json"
+CONFIG_FILE = "config.json"  # 配置文件保留在项目根目录
+
+# 所有需要持久化的文件都放入 DATA_DIR
 MEMORY_FILE = "ai_memory.json"
 LOG_FILE = "prediction_log.json"
 MODEL_FILE = "ai_model.pkl"
 SCALER_FILE = "scaler.pkl"
 FEATURES_FILE = "feature_config.json"
+
+# 构建完整路径
+MEMORY_PATH = os.path.join(DATA_DIR, MEMORY_FILE)
+LOG_PATH = os.path.join(DATA_DIR, LOG_FILE)
+MODEL_PATH = os.path.join(DATA_DIR, MODEL_FILE)
+SCALER_PATH = os.path.join(DATA_DIR, SCALER_FILE)
+FEATURES_PATH = os.path.join(DATA_DIR, FEATURES_FILE)
 
 WHALE_THRESHOLD = 20000
 SIGNAL_COOLDOWN = 1800
@@ -273,25 +286,25 @@ class AITradingModel:
         return score, {'confidence': confidence, 'contribution': contribution}
     
     def save(self):
-        """保存模型和缩放器"""
+        """保存模型和缩放器（使用持久化路径）"""
         if self.model:
-            joblib.dump(self.model, MODEL_FILE)
-            joblib.dump(self.scaler, SCALER_FILE)
+            joblib.dump(self.model, MODEL_PATH)
+            joblib.dump(self.scaler, SCALER_PATH)
             # 保存特征名称
-            with open(FEATURES_FILE, 'w') as f:
+            with open(FEATURES_PATH, 'w') as f:
                 json.dump({
                     'feature_names': self.feature_names,
                     'training_history': self.training_history,
                     'feature_importance': self.feature_importance
                 }, f, indent=4)
-            print("模型已保存")
+            print("模型已保存到持久化存储")
     
     def load(self):
-        """加载模型和缩放器"""
+        """加载模型和缩放器（使用持久化路径）"""
         try:
-            self.model = joblib.load(MODEL_FILE)
-            self.scaler = joblib.load(SCALER_FILE)
-            with open(FEATURES_FILE, 'r') as f:
+            self.model = joblib.load(MODEL_PATH)
+            self.scaler = joblib.load(SCALER_PATH)
+            with open(FEATURES_PATH, 'r') as f:
                 data = json.load(f)
                 self.feature_names = data.get('feature_names', [])
                 self.training_history = data.get('training_history', [])
@@ -311,10 +324,10 @@ ai_model = AITradingModel()
 ai_model.load()
 
 # =========================
-# 辅助函数：加载/保存配置与内存
+# 辅助函数：加载/保存配置与内存（使用持久化路径）
 # =========================
 def load_config():
-    """加载配置文件，缺失的键使用默认值"""
+    """加载配置文件，缺失的键使用默认值（配置文件保留在根目录）"""
     default_config = {
         "coins": ["BTC-USDT", "ETH-USDT"],
         "buy_threshold": 70,
@@ -325,8 +338,8 @@ def load_config():
         "email_user": "",
         "email_pass": "",
         "email_receiver": "",
-        "use_ml_model": True,  # 新增：是否使用机器学习模型
-        "ml_weight": 0.7  # 机器学习模型权重 vs 规则系统权重
+        "use_ml_model": True,
+        "ml_weight": 0.7
     }
     try:
         with open(CONFIG_FILE) as f:
@@ -341,18 +354,18 @@ def load_config():
         return default_config
 
 def load_memory():
-    """加载AI内存权重，若文件不存在则创建默认"""
+    """加载AI内存权重，若文件不存在则创建默认（使用持久化路径）"""
     default_memory = {
         "trend_weight": 0.3,
         "momentum_weight": 0.25,
         "volume_weight": 0.2,
         "volatility_weight": 0.1,
         "sentiment_weight": 0.2,
-        "ml_weight": 0.7,  # 新增：机器学习权重
-        "feature_importance": {}  # 新增：存储特征重要性
+        "ml_weight": 0.7,
+        "feature_importance": {}
     }
     try:
-        with open(MEMORY_FILE) as f:
+        with open(MEMORY_PATH) as f:
             memory = json.load(f)
         for key in default_memory:
             if key not in memory:
@@ -363,11 +376,11 @@ def load_memory():
         return default_memory
 
 def save_memory(memory):
-    with open(MEMORY_FILE, "w") as f:
+    with open(MEMORY_PATH, "w") as f:
         json.dump(memory, f, indent=4)
 
 # =========================
-# 通知功能：Telegram和邮件
+# 通知功能：Telegram和邮件（保持不变）
 # =========================
 def send_telegram_message(text, config):
     """通过Telegram Bot发送消息"""
@@ -410,7 +423,7 @@ def send_notification(content, config, subject=None):
         send_email(subject, content, config)
 
 # =========================
-# 安全请求
+# 安全请求（保持不变）
 # =========================
 def safe_request(url, max_retries=3):
     for i in range(max_retries):
@@ -453,7 +466,7 @@ def detect_whale(inst):
         return 0
 
 # =========================
-# 市场周期识别
+# 市场周期识别（保持不变）
 # =========================
 def detect_market_cycle():
     """基于BTC判断市场周期：牛市/熊市/震荡"""
@@ -488,7 +501,7 @@ def apply_cycle_strategy_adjustment(memory, cycle):
     return memory
 
 # =========================
-# AI评分（增强版：结合规则和机器学习）
+# AI评分（增强版：结合规则和机器学习，保持不变）
 # =========================
 def calculate_score(df, memory, whale, market_cycle, coin, config):
     """
@@ -550,17 +563,17 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
     return int(combined_score), factors
 
 # =========================
-# 日志管理：验证与记录（增强版）
+# 日志管理：验证与记录（增强版，使用持久化路径）
 # =========================
 def load_log():
     try:
-        with open(LOG_FILE) as f:
+        with open(LOG_PATH) as f:
             return json.load(f)
     except:
         return []
 
 def save_log(log):
-    with open(LOG_FILE, "w") as f:
+    with open(LOG_PATH, "w") as f:
         json.dump(log, f, indent=4)
 
 def verify_past_signals(config):
@@ -625,7 +638,7 @@ def log_signal(coin, signal, score, price, whale, market_cycle, factors):
     save_log(log)
 
 # =========================
-# 自适应优化（增强版：基于机器学习）
+# 自适应优化（增强版：基于机器学习，保持不变）
 # =========================
 def adaptive_strategy_optimization(config):
     """增强版自适应优化：重新训练机器学习模型"""
@@ -694,7 +707,7 @@ def adaptive_strategy_optimization(config):
         send_notification(msg, config, "AI模型进化报告")
 
 # =========================
-# 热门币种扫描
+# 热门币种扫描（保持不变）
 # =========================
 def scan_hot_coins(limit=20):
     """从OKX获取涨幅榜，返回热门币种列表（排除稳定币）"""
@@ -724,7 +737,7 @@ def hot_coin_filter(coin):
     return True
 
 # =========================
-# 回测报告（增强版）
+# 回测报告（增强版，保持不变）
 # =========================
 def generate_backtest_report():
     """基于已验证的日志生成回测统计"""
@@ -794,7 +807,7 @@ def send_backtest_report(config):
     send_notification(report, config, "每日回测报告")
 
 # =========================
-# 主程序（增强版）
+# 主程序（增强版，保持不变）
 # =========================
 def main():
     global last_backtest_time, last_adaptive_time, last_cycle_check, current_market_cycle
