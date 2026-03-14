@@ -1,15 +1,25 @@
 {
- "coins": [
-  "BTC-USDT",
-  "ETH-USDT",
-  "SOL-USDT",
-  "OKB-USDT"
- ],
+  "coins": [
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "OKB-USDT"
+  ],
 
- "buy_threshold": 70,
- "sell_threshold": 30,
+  "buy_threshold": 80,
+  "sell_threshold": 20,
 
- "check_interval": 300,
+  "check_interval": 300,
+
+  "whale_trade_usdt": 200000,
+
+  "volume_spike": 2.5,
+
+  "auto_scan_new_coins": true,
+
+  "max_auto_coins": 3,
+
+  "notify_method": "telegram",
 
  "telegram_bot_token": "8546952065:AAFx7E4-wx4AeGWS5sQthgnFLhtUvExOkrQ",
 
