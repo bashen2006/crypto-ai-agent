@@ -25,8 +25,7 @@ def load_ai_memory():
             "trend_weight": 0.3,
             "volume_weight": 0.2,
             "momentum_weight": 0.2,
-            "volatility_weight": 0.1,
-            "sentiment_weight": 0.2
+            "volatility_weight": 0.1
         }
 
 
@@ -79,7 +78,7 @@ def detect_whale(inst):
         return 0
 
 
-# 市场状态
+# AI行情评级（升级版）
 def get_market_state(df):
 
     df["ma30"] = df["close"].rolling(30).mean()
@@ -88,10 +87,14 @@ def get_market_state(df):
     ma30 = df["ma30"].iloc[-1]
     ma90 = df["ma90"].iloc[-1]
 
-    if ma30 > ma90:
+    momentum = (df["close"].iloc[-1] - df["close"].iloc[-10]) / df["close"].iloc[-10]
+
+    if ma30 > ma90 and momentum > 0.02:
         return "牛市"
-    elif ma30 < ma90:
+
+    elif ma30 < ma90 and momentum < -0.02:
         return "熊市"
+
     else:
         return "震荡"
 
@@ -133,6 +136,22 @@ def calculate_score(df, memory, whale_volume):
     score = max(0, min(100, int(score)))
 
     return score
+
+
+# 信号强度
+def get_signal_strength(score):
+
+    if score >= 75:
+        return "强信号"
+
+    elif score >= 60:
+        return "中等信号"
+
+    elif score >= 45:
+        return "观察"
+
+    else:
+        return "弱信号"
 
 
 # Telegram
@@ -183,71 +202,18 @@ def save_prediction(coin, signal, price, score, df):
     except:
         logs = []
 
-    df["ma7"] = df["close"].rolling(7).mean()
-    df["ma30"] = df["close"].rolling(30).mean()
-
-    trend = 1 if df["ma7"].iloc[-1] > df["ma30"].iloc[-1] else 0
-
-    volume = df["volume"].iloc[-1]
-    avg_volume = df["volume"].mean()
-    volume_factor = 1 if volume > avg_volume * 1.5 else 0
-
-    momentum = (df["close"].iloc[-1] - df["close"].iloc[-5]) / df["close"].iloc[-5]
-    momentum_factor = 1 if momentum > 0 else 0
-
-    volatility = (df["high"] - df["low"]).mean()
-    volatility_factor = 1 if volatility > df["close"].mean() * 0.01 else 0
-
     record = {
         "time": str(datetime.now()),
         "coin": coin,
         "signal": signal,
         "price": price,
-        "score": score,
-        "trend": trend,
-        "volume": volume_factor,
-        "momentum": momentum_factor,
-        "volatility": volatility_factor
+        "score": score
     }
 
     logs.append(record)
 
     with open(LOG_FILE, "w") as f:
         json.dump(logs, f, indent=4)
-
-
-# 因子贡献分析
-def analyze_factor_contribution(logs):
-
-    factors = ["trend", "volume", "momentum", "volatility"]
-
-    stats = {f: {"correct": 0, "total": 0} for f in factors}
-
-    for record in logs:
-
-        if "correct" not in record:
-            continue
-
-        for f in factors:
-
-            if f in record:
-                stats[f]["total"] += 1
-
-                if record["correct"]:
-                    stats[f]["correct"] += 1
-
-    result = {}
-
-    for f in factors:
-
-        total = stats[f]["total"]
-
-        if total == 0:
-            result[f] = 0
-        else:
-            result[f] = stats[f]["correct"] / total
-
-    return result
 
 
 # AI复盘
@@ -274,18 +240,14 @@ def review_predictions():
         try:
 
             df = get_okx_kline(coin)
+
             price_now = df["close"].iloc[-1]
 
-            if signal == "BUY" and price_now > price_then:
+            if signal == "买入" and price_now > price_then:
                 correct += 1
-                record["correct"] = True
 
-            elif signal == "SELL" and price_now < price_then:
+            elif signal == "卖出" and price_now < price_then:
                 correct += 1
-                record["correct"] = True
-
-            else:
-                record["correct"] = False
 
             total += 1
 
@@ -297,41 +259,10 @@ def review_predictions():
 
     accuracy = correct / total
 
-    factor_accuracy = analyze_factor_contribution(logs)
-
     print("AI复盘完成")
     print("预测次数:", total)
     print("正确次数:", correct)
     print("准确率:", accuracy)
-
-    print("因子贡献:")
-
-    for f in factor_accuracy:
-        print(f, round(factor_accuracy[f], 3))
-
-    memory = load_ai_memory()
-
-    for factor in factor_accuracy:
-
-        key = f"{factor}_weight"
-
-        if key not in memory:
-            continue
-
-        acc = factor_accuracy[factor]
-
-        if acc > 0.6:
-            memory[key] += 0.02
-
-        elif acc < 0.45:
-            memory[key] -= 0.02
-
-        memory[key] = max(0.05, min(0.5, memory[key]))
-
-    with open(AI_MEMORY_FILE, "w") as f:
-        json.dump(memory, f, indent=4)
-
-    print("AI策略已更新:", memory)
 
 
 # 主程序
@@ -374,31 +305,38 @@ def main():
 
                 price = df["close"].iloc[-1]
 
+                strength = get_signal_strength(score)
+
                 if score >= config["buy_threshold"]:
-                    signal = "BUY"
+                    signal = "买入"
                 elif score <= config["sell_threshold"]:
-                    signal = "SELL"
+                    signal = "卖出"
                 else:
-                    signal = "NEUTRAL"
+                    signal = "中性"
 
                 print(
-                    f"[{datetime.now()}] {coin} | 评分:{score} | 信号:{signal} | 巨鲸:{whale_volume} | 市场:{trend}"
+                    f"[{datetime.now()}] {coin} | 评分:{score} | 信号:{signal} | 强度:{strength} | 市场:{trend} | 巨鲸:{int(whale_volume)}"
                 )
 
                 save_prediction(coin, signal, price, score, df)
 
-                if signal != "NEUTRAL":
+                if signal != "中性":
 
                     msg = f"""
 AI交易信号
 
-币种:{coin}
-评分:{score}
-价格:{price}
-市场:{trend}
-巨鲸资金:{whale_volume}
+币种：{coin}
 
-信号:{signal}
+当前价格：{price}
+
+交易信号：{signal}
+信号强度：{strength}
+
+AI评分：{score}
+
+行情评级：{trend}
+
+巨鲸资金：{int(whale_volume)} USDT
 """
 
                     send_telegram(
