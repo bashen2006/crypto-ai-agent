@@ -878,6 +878,18 @@ def main():
 
     config = load_config()
     print("=" * 50)
+        # 简单文件写入测试（直接打印到日志）
+    try:
+        test_file = os.path.join(DATA_DIR, "volume_test.txt")
+        with open(test_file, "w") as f:
+            f.write("test")
+        print(f"✅ 测试文件创建成功：{test_file}")
+        if os.path.exists(test_file):
+            print("✅ 测试文件可读")
+        else:
+            print("❌ 测试文件不存在（写入后消失）")
+    except Exception as e:
+        print(f"❌ 测试文件写入失败：{e}")
     start_time = time.time()
     print("AI自主学习交易系统启动")
     print(f"模型状态: {'已训练' if ai_model.is_trained else '未训练'}")
