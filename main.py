@@ -884,6 +884,19 @@ def main():
     print(f"使用ML: {config.get('use_ml_model', True)}")
     print("=" * 50)
 
+    # ---------- 临时检测：检查日志文件是否存在 ----------
+    try:
+        if os.path.exists(LOG_PATH):
+            file_size = os.path.getsize(LOG_PATH)
+            msg = f"✅ 日志文件存在，大小：{file_size} 字节"
+        else:
+            msg = "❌ 日志文件不存在"
+        send_telegram_message(msg, config)
+        print(msg)  # 同时在控制台打印
+    except Exception as e:
+        print(f"检测日志文件时出错：{e}")
+    # --------------------------------------------------
+
     while True:
         try:
             now = time.time()
@@ -958,12 +971,19 @@ def main():
                             feat_str = "\n重要特征: " + ", ".join([f"{f[:10]}:{v:.2f}" for f, v in top_feat])
                         
                         # 构建消息主体（醒目部分 + 详细数据）
-                        msg = (f"{emoji}{emoji}{emoji} {action}信号 {emoji}{emoji}{emoji}\n"
-                               f"币种：{coin}\n"
-                               f"价格：${price:.4f}\n"
-                               f"综合评分：{score} (买入阈值 {config['buy_threshold']})\n" if signal == "买入" else
-                               f"综合评分：{score} (卖出阈值 {config['sell_threshold']})\n"
-                               f"规则评分：{factors['rule_score']} | ML评分：{factors['ml_score']:.1f}")
+                        # 注意：此处原代码有语法错误（if 放在字符串内），已修正
+                        if signal == "买入":
+                            msg = (f"{emoji}{emoji}{emoji} {action}信号 {emoji}{emoji}{emoji}\n"
+                                   f"币种：{coin}\n"
+                                   f"价格：${price:.4f}\n"
+                                   f"综合评分：{score} (买入阈值 {config['buy_threshold']})\n"
+                                   f"规则评分：{factors['rule_score']} | ML评分：{factors['ml_score']:.1f}")
+                        else:
+                            msg = (f"{emoji}{emoji}{emoji} {action}信号 {emoji}{emoji}{emoji}\n"
+                                   f"币种：{coin}\n"
+                                   f"价格：${price:.4f}\n"
+                                   f"综合评分：{score} (卖出阈值 {config['sell_threshold']})\n"
+                                   f"规则评分：{factors['rule_score']} | ML评分：{factors['ml_score']:.1f}")
                         
                         # 添加 ML 置信度和重要特征（如果有）
                         if factors.get('ml_confidence', 0) > 0:
