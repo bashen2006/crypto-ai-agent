@@ -770,6 +770,12 @@ def scan_hot_coins(limit=20):
         change24h = float(t.get("change24h", 0))
         hot.append((inst, change24h))
     return hot
+
+def hot_coin_filter(coin_name):
+    if coin_name in ["BTC-USDT", "ETH-USDT"]:
+        return False
+    return True
+
 # =========================
 # 回测报告
 # =========================
