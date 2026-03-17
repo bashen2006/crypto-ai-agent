@@ -71,9 +71,8 @@ AICOIN_API_SECRET = "vDw8ScV04GHOAbl2m9geWMf7ykWy64r3"  # 用于签名的密钥
 
 # 候选基础URL列表（按优先级排序）
 AICOIN_BASE_URLS = [
-    "https://open.aicoin.com/api/upgrade/v2",  # 高级数据API
-    "https://open.aicoin.com/api/v2",          # 综合数据API
-    "https://api.aicoin.com/api/v1",           # 旧版可能
+    "https://open.aicoin.com/api/upgrade/v2",  # 高级数据API，文档推荐
+    "https://open.aicoin.com/api/v2",          # 综合数据API，之前K线成功过
 ]
 
 # 交易对 到 AiCoin币种ID 的映射（用于实时价格接口）
@@ -528,117 +527,102 @@ def safe_request_with_headers(url, headers=None, params=None, max_retries=3):
     return None
 
 # =========================
-# AiCoin 数据获取函数（多路径尝试）
+# AiCoin 数据获取函数（基于正确的基础URL和路径）
 # =========================
 def get_kline(inst, limit=300):
     """
-    从 AiCoin 获取 K 线数据，自动尝试多个基础URL和路径
+    从 AiCoin 获取 K 线数据
+    inst 格式: 'BTC-USDT'
     """
     symbol = inst.replace("-", "").lower() + ":" + DEFAULT_EXCHANGE
-    # 可能的路径列表（按常见性排序）
-    kline_paths = [
-        "/commonKline/dataRecords",  # 您提供的路径
-        "/klines",
-        "/market/klines",
-        "/v2/klines",
-        "/v2/market/klines",
-        "/data/klines",
-        "/kline",
-    ]
+    # 接口路径
+    path = "/commonKline/dataRecords"
+    # 参数
+    custom_params = {
+        "symbol": symbol,
+        "period": "300",  # 5分钟 = 300秒
+        "limit": limit
+    }
     
     for base_url in AICOIN_BASE_URLS:
-        for path in kline_paths:
-            url = base_url + path
-            params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, {
-                "symbol": symbol,
-                "period": "300",  # 5分钟 = 300秒
-                "limit": limit
-            })
-            try:
-                data = safe_request_with_headers(url, params=params)
-                if data and data.get("success"):
-                    klines = data["data"]["kline_data"]
-                    df = pd.DataFrame(klines)
-                    df.columns = ["ts", "open", "high", "low", "close", "volume"]
-                    df = df.astype(float)
-                    print(f"成功从 AiCoin 获取 K 线（基础URL：{base_url}，路径：{path}）")
-                    return df
-            except Exception as e:
-                print(f"尝试 {base_url}{path} 失败: {e}")
-                continue
+        url = base_url + path
+        params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, custom_params)
+        try:
+            data = safe_request_with_headers(url, params=params)
+            if data and data.get("success"):
+                klines = data["data"]["kline_data"]
+                df = pd.DataFrame(klines)
+                df.columns = ["ts", "open", "high", "low", "close", "volume"]
+                df = df.astype(float)
+                print(f"成功从 AiCoin 获取 K 线（基础URL：{base_url}）")
+                return df
+        except Exception as e:
+            print(f"尝试 {base_url}{path} 失败: {e}")
+            continue
     
-    raise Exception(f"获取{inst} K线失败，所有尝试均失败")
+    raise Exception(f"获取{inst} K线失败，所有基础URL尝试均失败")
 
 def get_ticker(inst):
     """
-    从 AiCoin 获取实时最新价，自动尝试多个基础URL和路径
+    从 AiCoin 获取实时最新价
+    inst 格式: 'BTC-USDT'
     """
     coin_id = SYMBOL_TO_COIN_ID.get(inst)
     if not coin_id:
         coin_id = inst.replace("-USDT", "").lower()
     
-    ticker_paths = [
-        "/coin/ticker",
-        "/ticker",
-        "/market/ticker",
-        "/v2/coin/ticker",
-    ]
+    path = "/coin/ticker"
+    custom_params = {
+        "coin_list": coin_id
+    }
     
     for base_url in AICOIN_BASE_URLS:
-        for path in ticker_paths:
-            url = base_url + path
-            params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, {
-                "coin_list": coin_id
-            })
-            try:
-                data = safe_request_with_headers(url, params=params)
-                if data and data.get("success") and data.get("data"):
-                    price = float(data["data"][0]["price_usd"])
-                    print(f"成功从 AiCoin 获取实时价（基础URL：{base_url}，路径：{path}）")
-                    return price
-            except Exception as e:
-                continue
+        url = base_url + path
+        params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, custom_params)
+        try:
+            data = safe_request_with_headers(url, params=params)
+            if data and data.get("success") and data.get("data"):
+                price = float(data["data"][0]["price_usd"])
+                print(f"成功从 AiCoin 获取实时价（基础URL：{base_url}）")
+                return price
+        except Exception as e:
+            continue
     
     return None
 
 def scan_hot_coins(limit=20):
     """
-    从 AiCoin 获取热门新币榜，自动尝试多个基础URL和路径
+    从 AiCoin 获取热门新币榜，返回列表 [(币种, 24h涨幅), ...]
     """
-    hot_paths = [
-        "/market/hotTabCoins",
-        "/hotTabCoins",
-        "/v2/market/hotTabCoins",
-        "/tickers",
-    ]
+    path = "/market/hotTabCoins"
+    custom_params = {
+        "key": "newcoin",
+        "currency": "usd"
+    }
     
     for base_url in AICOIN_BASE_URLS:
-        for path in hot_paths:
-            url = base_url + path
-            params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, {
-                "key": "newcoin",
-                "currency": "usd"
-            })
-            try:
-                data = safe_request_with_headers(url, params=params)
-                if data and data.get("success") and "data" in data:
-                    items = data["data"].get("list", [])
-                    hot = []
-                    for item in items[:limit]:
-                        coin_key = item.get("key")
-                        if not coin_key:
-                            continue
-                        inst = coin_key.upper() + "-USDT"
-                        change = float(item.get("degree24H", 0))
-                        vol = float(item.get("vol24H", 0))
-                        if vol < 100000:
-                            continue
-                        hot.append((inst, change))
-                    if hot:
-                        print(f"成功从 AiCoin 获取热门币种（基础URL：{base_url}，路径：{path}）")
-                        return hot
-            except Exception as e:
-                continue
+        url = base_url + path
+        params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, custom_params)
+        try:
+            data = safe_request_with_headers(url, params=params)
+            if data and data.get("success") and "data" in data:
+                items = data["data"].get("list", [])
+                hot = []
+                for item in items[:limit]:
+                    coin_key = item.get("key")
+                    if not coin_key:
+                        continue
+                    inst = coin_key.upper() + "-USDT"
+                    change = float(item.get("degree24H", 0))
+                    vol = float(item.get("vol24H", 0))
+                    if vol < 100000:
+                        continue
+                    hot.append((inst, change))
+                if hot:
+                    print(f"成功从 AiCoin 获取热门币种（基础URL：{base_url}）")
+                    return hot
+        except Exception as e:
+            continue
 
     # 所有AiCoin尝试失败，回退到OKX
     print("AiCoin 热门币种获取失败，尝试回退 OKX")
