@@ -835,7 +835,7 @@ def main():
         try:
             now = time.time()
 
-            if now - last_cycle_check > MARKET_CYCLE_INTERVAL:
+            if False: #临时禁用周期调整（原代码if now - last_cycle_check > MARKET_CYCLE_INTERVAL:）
                 new_cycle = detect_market_cycle()
                 if new_cycle != current_market_cycle:
                     current_market_cycle = new_cycle
