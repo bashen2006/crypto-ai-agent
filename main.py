@@ -477,16 +477,25 @@ def safe_request(url, params=None, max_retries=3):
 # =========================
 # CoinGecko 数据获取函数
 # =========================
+# =========================
+# CoinGecko 数据获取函数（稳定、免费、无需Key）
+# =========================
 def get_kline(inst, limit=300):
     """
     从 CoinGecko 获取 K 线数据
     inst 格式: 'BTC-USDT'
     """
-    # 获取币种ID
-    coin_id = SYMBOL_TO_COINGECKO_ID.get(inst)
-    if not coin_id:
-        # 如果不在映射中，尝试用交易对的前缀（如 btc）作为ID，可能失败
-        coin_id = inst.split('-')[0].lower()
+    # 提取币种ID (如 'bitcoin')
+    coin_id = inst.split('-')[0].lower()
+    # CoinGecko 的币种ID映射（主流币需要手动确认，例如 bitcoin, ethereum, okb）
+    # 这里提供一个基本映射，如有缺失请补充
+    coin_id_map = {
+        "btc": "bitcoin",
+        "eth": "ethereum",
+        "okb": "okb",
+    }
+    # 从映射中获取ID，如果没有则使用原名称（可能失败，但会通过异常处理）
+    coin_id = coin_id_map.get(coin_id, coin_id)
 
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
     params = {
@@ -503,7 +512,7 @@ def get_kline(inst, limit=300):
     if not prices:
         raise Exception(f"CoinGecko 返回数据为空")
 
-    # 构建 DataFrame（使用收盘价作为OHLC，因为CoinGecko不提供完整OHLCV）
+    # 构建 DataFrame，使用收盘价作为 OHLC（简化处理）
     rows = []
     for i in range(min(len(prices), len(volumes))):
         ts = prices[i][0]
@@ -525,11 +534,11 @@ def get_ticker(inst):
     """
     从 CoinGecko 获取实时最新价
     """
-    coin_id = SYMBOL_TO_COINGECKO_ID.get(inst)
-    if not coin_id:
-        coin_id = inst.split('-')[0].lower()
+    coin_id = inst.split('-')[0].lower()
+    coin_id_map = {"btc": "bitcoin", "eth": "ethereum", "okb": "okb"}
+    coin_id = coin_id_map.get(coin_id, coin_id)
 
-    url = "https://api.coingecko.com/api/v3/simple/price"
+    url = f"https://api.coingecko.com/api/v3/simple/price"
     params = {
         "ids": coin_id,
         "vs_currencies": "usd"
@@ -561,7 +570,7 @@ def scan_hot_coins(limit=20):
         symbol = coin["symbol"].upper() + "-USDT"
         change = coin.get("price_change_percentage_24h", 0)
         volume = coin.get("total_volume", 0)
-        if volume < 100000:  # 成交量过滤
+        if volume < 100000:
             continue
         hot.append((symbol, change))
     return hot
