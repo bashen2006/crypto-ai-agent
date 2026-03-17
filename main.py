@@ -65,26 +65,13 @@ MIN_TRAIN_SAMPLES = 50  # 最少训练样本数
 # 评分变化阈值（用于状态推送）
 SCORE_CHANGE_THRESHOLD = 10
 
-# AiCoin 配置（使用您提供的密钥）
-AICOIN_API_KEY = "JcgzB9qCy90qxJm3daJyrKV10IfikIct"
-AICOIN_API_SECRET = "vDw8ScV04GHOAbl2m9geWMf7ykWy64r3"  # 用于签名的密钥
-
-# 候选基础URL列表（按优先级排序）
-AICOIN_BASE_URLS = [
-    "https://open.aicoin.com/api/upgrade/v2",  # 高级数据API，文档推荐
-    "https://open.aicoin.com/api/v2",          # 综合数据API，之前K线成功过
-]
-
-# 交易对 到 AiCoin币种ID 的映射（用于实时价格接口）
-SYMBOL_TO_COIN_ID = {
+# CoinGecko 币种ID映射（将交易对符号转换为 CoinGecko 使用的ID）
+SYMBOL_TO_COINGECKO_ID = {
     "BTC-USDT": "bitcoin",
     "ETH-USDT": "ethereum",
     "OKB-USDT": "okb",
-    # 可根据需要添加更多
+    # 可根据需要添加更多映射
 }
-
-# 默认交易所（用于K线接口的 symbol 参数，如 btcusdt:binance）
-DEFAULT_EXCHANGE = "binance"
 
 # 全局状态变量
 last_signal_time = {}
@@ -98,32 +85,6 @@ current_market_cycle = "未知"
 
 # 记录上次推送时的币种评分，用于判断变化
 last_scores = {}
-
-# =========================
-# AiCoin 签名生成函数（官方Python示例）
-# =========================
-def generate_aicoin_signature(access_key_id, access_secret, signature_nonce=None, timestamp=None):
-    """完全按照官方示例实现"""
-    nonce = signature_nonce or os.urandom(4).hex()
-    ts = str(timestamp or int(time.time()))
-    string_to_sign = f"AccessKeyId={access_key_id}&SignatureNonce={nonce}&Timestamp={ts}"
-    key = access_secret.encode('utf-8')
-    message = string_to_sign.encode('utf-8')
-    hex_signature = hmac.new(key, message, hashlib.sha1).hexdigest()
-    signature = base64.b64encode(hex_signature.encode('ascii')).decode('utf-8')
-    return signature, nonce, ts
-
-def build_aicoin_params(access_key_id, access_secret, custom_params=None):
-    signature, nonce, ts = generate_aicoin_signature(access_key_id, access_secret)
-    params = {
-        "AccessKeyId": access_key_id,
-        "SignatureNonce": nonce,
-        "Timestamp": ts,
-        "Signature": signature
-    }
-    if custom_params:
-        params.update(custom_params)
-    return params
 
 # =========================
 # AI模型类 - 真正的自主学习核心
@@ -496,30 +457,17 @@ def send_notification(content, config, subject=None):
         send_email(subject, content, config)
 
 # =========================
-# 安全请求
+# 安全请求（支持params）
 # =========================
-def safe_request(url, max_retries=3):
+def safe_request(url, params=None, max_retries=3):
+    """通用的GET请求函数，支持params参数"""
     for i in range(max_retries):
         try:
-            r = requests.get(url, timeout=10)
+            r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
                 return r.json()
             else:
                 print(f"请求失败，状态码：{r.status_code}，URL：{url}")
-        except Exception as e:
-            print(f"请求异常：{e}")
-            time.sleep(2)
-    return None
-
-def safe_request_with_headers(url, headers=None, params=None, max_retries=3):
-    """支持 headers 和 params 的请求函数"""
-    for i in range(max_retries):
-        try:
-            r = requests.get(url, headers=headers, params=params, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-            else:
-                print(f"请求失败，状态码：{r.status_code}")
                 print(f"响应内容：{r.text[:200]}")
         except Exception as e:
             print(f"请求异常：{e}")
@@ -527,106 +475,96 @@ def safe_request_with_headers(url, headers=None, params=None, max_retries=3):
     return None
 
 # =========================
-# AiCoin 数据获取函数（基于正确的基础URL和路径）
+# CoinGecko 数据获取函数
 # =========================
 def get_kline(inst, limit=300):
     """
-    从 AiCoin 获取 K 线数据
+    从 CoinGecko 获取 K 线数据
     inst 格式: 'BTC-USDT'
     """
-    symbol = inst.replace("-", "").lower() + ":" + DEFAULT_EXCHANGE
-    # 接口路径
-    path = "/commonKline/dataRecords"
-    # 参数
-    custom_params = {
-        "symbol": symbol,
-        "period": "300",  # 5分钟 = 300秒
-        "limit": limit
+    # 获取币种ID
+    coin_id = SYMBOL_TO_COINGECKO_ID.get(inst)
+    if not coin_id:
+        # 如果不在映射中，尝试用交易对的前缀（如 btc）作为ID，可能失败
+        coin_id = inst.split('-')[0].lower()
+
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {
+        "vs_currency": "usd",
+        "days": "1",
+        "interval": "5m"
     }
-    
-    for base_url in AICOIN_BASE_URLS:
-        url = base_url + path
-        params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, custom_params)
-        try:
-            data = safe_request_with_headers(url, params=params)
-            if data and data.get("success"):
-                klines = data["data"]["kline_data"]
-                df = pd.DataFrame(klines)
-                df.columns = ["ts", "open", "high", "low", "close", "volume"]
-                df = df.astype(float)
-                print(f"成功从 AiCoin 获取 K 线（基础URL：{base_url}）")
-                return df
-        except Exception as e:
-            print(f"尝试 {base_url}{path} 失败: {e}")
-            continue
-    
-    raise Exception(f"获取{inst} K线失败，所有基础URL尝试均失败")
+    data = safe_request(url, params=params)
+    if not data:
+        raise Exception(f"获取{inst} K线失败")
+
+    prices = data.get("prices", [])
+    volumes = data.get("total_volumes", [])
+    if not prices:
+        raise Exception(f"CoinGecko 返回数据为空")
+
+    # 构建 DataFrame（使用收盘价作为OHLC，因为CoinGecko不提供完整OHLCV）
+    rows = []
+    for i in range(min(len(prices), len(volumes))):
+        ts = prices[i][0]
+        price = prices[i][1]
+        volume = volumes[i][1] if i < len(volumes) else 0
+        rows.append({
+            "ts": ts,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+            "volume": volume
+        })
+    df = pd.DataFrame(rows)
+    df = df.astype(float)
+    return df
 
 def get_ticker(inst):
     """
-    从 AiCoin 获取实时最新价
-    inst 格式: 'BTC-USDT'
+    从 CoinGecko 获取实时最新价
     """
-    coin_id = SYMBOL_TO_COIN_ID.get(inst)
+    coin_id = SYMBOL_TO_COINGECKO_ID.get(inst)
     if not coin_id:
-        coin_id = inst.replace("-USDT", "").lower()
-    
-    path = "/coin/ticker"
-    custom_params = {
-        "coin_list": coin_id
+        coin_id = inst.split('-')[0].lower()
+
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": coin_id,
+        "vs_currencies": "usd"
     }
-    
-    for base_url in AICOIN_BASE_URLS:
-        url = base_url + path
-        params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, custom_params)
-        try:
-            data = safe_request_with_headers(url, params=params)
-            if data and data.get("success") and data.get("data"):
-                price = float(data["data"][0]["price_usd"])
-                print(f"成功从 AiCoin 获取实时价（基础URL：{base_url}）")
-                return price
-        except Exception as e:
-            continue
-    
+    data = safe_request(url, params=params)
+    if data and coin_id in data:
+        return float(data[coin_id]["usd"])
     return None
 
 def scan_hot_coins(limit=20):
     """
-    从 AiCoin 获取热门新币榜，返回列表 [(币种, 24h涨幅), ...]
+    从 CoinGecko 获取热门币种（按24h交易量排序）
     """
-    path = "/market/hotTabCoins"
-    custom_params = {
-        "key": "newcoin",
-        "currency": "usd"
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "volume_desc",
+        "per_page": limit,
+        "page": 1,
+        "sparkline": "false"
     }
-    
-    for base_url in AICOIN_BASE_URLS:
-        url = base_url + path
-        params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, custom_params)
-        try:
-            data = safe_request_with_headers(url, params=params)
-            if data and data.get("success") and "data" in data:
-                items = data["data"].get("list", [])
-                hot = []
-                for item in items[:limit]:
-                    coin_key = item.get("key")
-                    if not coin_key:
-                        continue
-                    inst = coin_key.upper() + "-USDT"
-                    change = float(item.get("degree24H", 0))
-                    vol = float(item.get("vol24H", 0))
-                    if vol < 100000:
-                        continue
-                    hot.append((inst, change))
-                if hot:
-                    print(f"成功从 AiCoin 获取热门币种（基础URL：{base_url}）")
-                    return hot
-        except Exception as e:
-            continue
+    data = safe_request(url, params=params)
+    if not data:
+        print("CoinGecko 热门币种获取失败，尝试回退 OKX")
+        return scan_hot_coins_okx(limit)
 
-    # 所有AiCoin尝试失败，回退到OKX
-    print("AiCoin 热门币种获取失败，尝试回退 OKX")
-    return scan_hot_coins_okx(limit)
+    hot = []
+    for coin in data:
+        symbol = coin["symbol"].upper() + "-USDT"
+        change = coin.get("price_change_percentage_24h", 0)
+        volume = coin.get("total_volume", 0)
+        if volume < 100000:  # 成交量过滤
+            continue
+        hot.append((symbol, change))
+    return hot
 
 def scan_hot_coins_okx(limit=20):
     """原有的 OKX 热点币函数，作为备选"""
@@ -657,7 +595,7 @@ def hot_coin_filter(coin_name):
     return True
 
 def detect_whale(inst):
-    """AiCoin暂无巨鲸数据，返回0"""
+    """CoinGecko 暂无巨鲸数据，返回0"""
     return 0
 
 # =========================
