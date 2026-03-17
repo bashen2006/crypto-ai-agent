@@ -59,7 +59,7 @@ MAX_DYNAMIC_COINS = 3
 MIN_TRAIN_SAMPLES = 50  # 最少训练样本数
 
 # 新增：评分变化阈值（用于状态推送）
-SCORE_CHANGE_THRESHOLD = 5
+SCORE_CHANGE_THRESHOLD = 8
 
 # 全局状态变量
 last_signal_time = {}
