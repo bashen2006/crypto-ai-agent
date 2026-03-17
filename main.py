@@ -15,10 +15,6 @@ from datetime import datetime
 import pickle
 import warnings
 warnings.filterwarnings('ignore')
-import hashlib
-import hmac
-import base64
-import uuid
 
 # =========================
 # 机器学习库导入
@@ -64,14 +60,6 @@ MIN_TRAIN_SAMPLES = 50  # 最少训练样本数
 
 # 评分变化阈值（用于状态推送）
 SCORE_CHANGE_THRESHOLD = 10
-
-# CoinGecko 币种ID映射（将交易对符号转换为 CoinGecko 使用的ID）
-SYMBOL_TO_COINGECKO_ID = {
-    "BTC-USDT": "bitcoin",
-    "ETH-USDT": "ethereum",
-    "OKB-USDT": "okb",
-    # 可根据需要添加更多映射
-}
 
 # 全局状态变量
 last_signal_time = {}
@@ -457,10 +445,23 @@ def send_notification(content, config, subject=None):
         send_email(subject, content, config)
 
 # =========================
-# 安全请求（支持params）
+# 安全请求
 # =========================
-def safe_request(url, params=None, max_retries=3):
-    """通用的GET请求函数，支持params参数"""
+def safe_request(url, max_retries=3):
+    for i in range(max_retries):
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                print(f"请求失败，状态码：{r.status_code}，URL：{url}")
+        except Exception as e:
+            print(f"请求异常：{e}")
+            time.sleep(2)
+    return None
+
+def safe_request_with_params(url, params=None, max_retries=3):
+    """支持params参数的GET请求"""
     for i in range(max_retries):
         try:
             r = requests.get(url, params=params, timeout=10)
@@ -475,108 +476,57 @@ def safe_request(url, params=None, max_retries=3):
     return None
 
 # =========================
-# CoinGecko 数据获取函数
-# =========================
-# =========================
-# CoinGecko 数据获取函数（稳定、免费、无需Key）
+# OKX 数据获取函数
 # =========================
 def get_kline(inst, limit=300):
     """
-    从 CoinGecko 获取 K 线数据
+    从 OKX 获取 K 线数据
     inst 格式: 'BTC-USDT'
     """
-    # 提取币种ID (如 'bitcoin')
-    coin_id = inst.split('-')[0].lower()
-    # CoinGecko 的币种ID映射（主流币需要手动确认，例如 bitcoin, ethereum, okb）
-    # 这里提供一个基本映射，如有缺失请补充
-    coin_id_map = {
-        "btc": "bitcoin",
-        "eth": "ethereum",
-        "okb": "okb",
-    }
-    # 从映射中获取ID，如果没有则使用原名称（可能失败，但会通过异常处理）
-    coin_id = coin_id_map.get(coin_id, coin_id)
-
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {
-        "vs_currency": "usd",
-        "days": "1",
-        "interval": "5m"
-    }
-    data = safe_request(url, params=params)
-    if not data:
-        raise Exception(f"获取{inst} K线失败")
-
-    prices = data.get("prices", [])
-    volumes = data.get("total_volumes", [])
-    if not prices:
-        raise Exception(f"CoinGecko 返回数据为空")
-
-    # 构建 DataFrame，使用收盘价作为 OHLC（简化处理）
-    rows = []
-    for i in range(min(len(prices), len(volumes))):
-        ts = prices[i][0]
-        price = prices[i][1]
-        volume = volumes[i][1] if i < len(volumes) else 0
-        rows.append({
-            "ts": ts,
-            "open": price,
-            "high": price,
-            "low": price,
-            "close": price,
-            "volume": volume
-        })
-    df = pd.DataFrame(rows)
+    url = f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar=5m&limit={limit}"
+    data = safe_request(url)
+    if not data or "data" not in data:
+        raise Exception(f"获取{inst}行情失败")
+    df = pd.DataFrame(data["data"])
+    df = df.iloc[:, :6]
+    df.columns = ["ts", "open", "high", "low", "close", "volume"]
     df = df.astype(float)
     return df
 
 def get_ticker(inst):
     """
-    从 CoinGecko 获取实时最新价
+    从 OKX 获取实时最新价
     """
-    coin_id = inst.split('-')[0].lower()
-    coin_id_map = {"btc": "bitcoin", "eth": "ethereum", "okb": "okb"}
-    coin_id = coin_id_map.get(coin_id, coin_id)
-
-    url = f"https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": coin_id,
-        "vs_currencies": "usd"
-    }
-    data = safe_request(url, params=params)
-    if data and coin_id in data:
-        return float(data[coin_id]["usd"])
+    url = f"https://www.okx.com/api/v5/market/ticker?instId={inst}"
+    data = safe_request(url)
+    if data and "data" in data and len(data["data"]) > 0:
+        return float(data["data"][0]["last"])
     return None
+
+def detect_whale(inst):
+    """
+    从 OKX 获取最近成交，检测巨鲸交易
+    """
+    try:
+        url = f"https://www.okx.com/api/v5/market/trades?instId={inst}&limit=100"
+        data = safe_request(url)
+        if not data or "data" not in data:
+            return 0
+        whale_total = 0
+        for trade in data["data"]:
+            size = float(trade["sz"])
+            price = float(trade["px"])
+            value = size * price
+            if value > WHALE_THRESHOLD:
+                whale_total += value
+        return whale_total
+    except:
+        return 0
 
 def scan_hot_coins(limit=20):
     """
-    从 CoinGecko 获取热门币种（按24h交易量排序）
+    从 OKX 获取涨幅榜，返回热门币种列表（只包含以USDT计价的交易对）
     """
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "volume_desc",
-        "per_page": limit,
-        "page": 1,
-        "sparkline": "false"
-    }
-    data = safe_request(url, params=params)
-    if not data:
-        print("CoinGecko 热门币种获取失败，尝试回退 OKX")
-        return scan_hot_coins_okx(limit)
-
-    hot = []
-    for coin in data:
-        symbol = coin["symbol"].upper() + "-USDT"
-        change = coin.get("price_change_percentage_24h", 0)
-        volume = coin.get("total_volume", 0)
-        if volume < 100000:
-            continue
-        hot.append((symbol, change))
-    return hot
-
-def scan_hot_coins_okx(limit=20):
-    """原有的 OKX 热点币函数，作为备选"""
     url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
     data = safe_request(url)
     if not data or "data" not in data:
@@ -584,6 +534,7 @@ def scan_hot_coins_okx(limit=20):
     tickers = data["data"]
     tickers.sort(key=lambda x: float(x.get("change24h", 0)), reverse=True)
     hot = []
+    stable_coins = ["USDT", "USDC", "DAI", "BUSD", "TUSD", "USDJ", "PAX", "GUSD", "HUSD", "USDK", "EURS", "CEUR"]
     for t in tickers[:limit]:
         inst = t["instId"]
         if "-" not in inst:
@@ -602,10 +553,6 @@ def hot_coin_filter(coin_name):
     if coin_name in ["BTC-USDT", "ETH-USDT"]:
         return False
     return True
-
-def detect_whale(inst):
-    """CoinGecko 暂无巨鲸数据，返回0"""
-    return 0
 
 # =========================
 # 市场周期识别
