@@ -15,6 +15,10 @@ from datetime import datetime
 import pickle
 import warnings
 warnings.filterwarnings('ignore')
+import hashlib
+import hmac
+import base64
+import uuid
 
 # =========================
 # 机器学习库导入
@@ -61,9 +65,10 @@ MIN_TRAIN_SAMPLES = 50  # 最少训练样本数
 # 评分变化阈值（用于状态推送）
 SCORE_CHANGE_THRESHOLD = 10
 
-# AiCoin 配置（使用您提供的新 Key）
+# AiCoin 配置（使用您提供的密钥）
 AICOIN_API_KEY = "JcgzB9qCy90qxJm3daJyrKV10IfikIct"
-AICOIN_BASE_URL = "https://api.aicoin.com/v1"  # 根据官方文档确认
+AICOIN_API_SECRET = "vDw8ScV04GHOAbl2m9geWMf7ykWy64r3"  # 用于签名的密钥
+AICOIN_BASE_URL = "https://api.aicoin.com/api/v1"  # 基础路径，可调
 
 # 全局状态变量
 last_signal_time = {}
@@ -77,6 +82,51 @@ current_market_cycle = "未知"
 
 # 记录上次推送时的币种评分，用于判断变化
 last_scores = {}
+
+# =========================
+# AiCoin 签名生成函数（完全参照您提供的 Go 代码）
+# =========================
+def generate_aicoin_signature(access_key, access_secret, signature_nonce=None, timestamp=None):
+    """
+    生成 AiCoin API 签名
+    算法：HMAC-SHA1(参数串) -> hex -> base64
+    参数串格式：AccessKeyId=xxx&SignatureNonce=xxx&Timestamp=xxx
+    """
+    # 生成随机数和时间戳（如果未提供）
+    if signature_nonce is None:
+        # 生成8位随机十六进制字符串（与Go代码对应）
+        signature_nonce = uuid.uuid4().hex[:8]
+    if timestamp is None:
+        timestamp = str(int(time.time()))
+    else:
+        timestamp = str(timestamp)
+
+    # 构建待签名字符串
+    str_to_sign = f"AccessKeyId={access_key}&SignatureNonce={signature_nonce}&Timestamp={timestamp}"
+
+    # HMAC-SHA1 签名
+    h = hmac.new(access_secret.encode('utf-8'), str_to_sign.encode('utf-8'), hashlib.sha1)
+    hex_signature = h.hexdigest()
+
+    # 将 hex 字符串再进行 base64 编码
+    signature = base64.b64encode(hex_signature.encode('utf-8')).decode('utf-8')
+    return signature, signature_nonce, timestamp
+
+def build_aicoin_params(access_key, access_secret, custom_params=None):
+    """
+    为 AiCoin 请求生成带签名的参数
+    返回包含 AccessKeyId, SignatureNonce, Timestamp, Signature 的字典
+    """
+    signature, nonce, ts = generate_aicoin_signature(access_key, access_secret)
+    params = {
+        "AccessKeyId": access_key,
+        "SignatureNonce": nonce,
+        "Timestamp": ts,
+        "Signature": signature
+    }
+    if custom_params:
+        params.update(custom_params)
+    return params
 
 # =========================
 # AI模型类 - 真正的自主学习核心
@@ -449,7 +499,7 @@ def send_notification(content, config, subject=None):
         send_email(subject, content, config)
 
 # =========================
-# 安全请求
+# 安全请求（增强版）
 # =========================
 def safe_request(url, max_retries=3):
     for i in range(max_retries):
@@ -465,7 +515,7 @@ def safe_request(url, max_retries=3):
     return None
 
 def safe_request_with_headers(url, headers=None, params=None, max_retries=3):
-    """支持 headers 的请求函数"""
+    """支持 headers 和 params 的请求函数"""
     for i in range(max_retries):
         try:
             r = requests.get(url, headers=headers, params=params, timeout=10)
@@ -479,52 +529,139 @@ def safe_request_with_headers(url, headers=None, params=None, max_retries=3):
             time.sleep(2)
     return None
 
+# =========================
+# AiCoin 数据获取函数（多路径尝试）
+# =========================
 def get_kline(inst, limit=300):
     """
-    从 AiCoin 获取 K 线数据
-    inst 格式：'BTC-USDT'
+    从 AiCoin 获取 K 线数据，自动尝试多个可能路径
     """
-    # AiCoin 可能要求的格式：BTC_USDT
     symbol = inst.replace("-", "_")
-    url = f"{AICOIN_BASE_URL}/market/klines"
-    headers = {"X-API-Key": AICOIN_API_KEY}
-    params = {
-        "symbol": symbol,
-        "period": "5m",
-        "size": limit
-    }
+    # 可能的路径列表
+    paths = [
+        "/klines",
+        "/market/klines",
+        "/api/v1/klines",
+        "/v1/klines",
+        "/data/klines"
+    ]
     
-    data = safe_request_with_headers(url, headers=headers, params=params)
-    if not data:
-        raise Exception(f"获取{inst}行情失败")
+    for path in paths:
+        url = f"{AICOIN_BASE_URL}{path}"
+        params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, {
+            "symbol": symbol,
+            "period": "5m",
+            "size": limit
+        })
+        try:
+            data = safe_request_with_headers(url, params=params)
+            if data and "data" in data:
+                klines = data["data"]
+                if klines:
+                    df = pd.DataFrame(klines)
+                    # 假设返回的是数组 [ts, open, high, low, close, volume]
+                    df = df.iloc[:, :6]
+                    df.columns = ["ts", "open", "high", "low", "close", "volume"]
+                    df = df.astype(float)
+                    print(f"成功从 AiCoin 获取 K 线（路径：{path}）")
+                    return df
+        except Exception as e:
+            print(f"路径 {path} 失败: {e}")
+            continue
     
-    # 假设返回格式为 { "data": [ [ts, open, high, low, close, volume], ... ] }
-    klines = data.get("data", [])
-    if not klines:
-        raise Exception(f"AiCoin 返回数据为空")
-    
-    df = pd.DataFrame(klines)
-    df = df.iloc[:, :6]
-    df.columns = ["ts", "open", "high", "low", "close", "volume"]
-    df = df.astype(float)
-    return df
+    raise Exception(f"获取{inst}行情失败，所有路径尝试均失败")
 
 def get_ticker(inst):
-    """从 AiCoin 获取实时最新价"""
+    """
+    从 AiCoin 获取实时最新价
+    """
     symbol = inst.replace("-", "_")
-    url = f"{AICOIN_BASE_URL}/market/ticker"
-    headers = {"X-API-Key": AICOIN_API_KEY}
-    params = {"symbol": symbol}
+    paths = [
+        "/ticker",
+        "/market/ticker",
+        "/api/v1/ticker",
+        "/v1/ticker"
+    ]
     
-    data = safe_request_with_headers(url, headers=headers, params=params)
-    if data and "data" in data:
-        # 假设返回 { "data": { "last": 12345.67 } }
-        return float(data["data"]["last"])
+    for path in paths:
+        url = f"{AICOIN_BASE_URL}{path}"
+        params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET, {"symbol": symbol})
+        try:
+            data = safe_request_with_headers(url, params=params)
+            if data and "data" in data:
+                price = data["data"].get("last")
+                if price:
+                    return float(price)
+        except Exception as e:
+            continue
+    
     return None
 
-def detect_whale(inst):
-    """检测巨鲸交易（暂时无法通过AiCoin实现，返回0）"""
-    return 0
+def scan_hot_coins(limit=20):
+    """
+    从 AiCoin 获取热点币种/涨幅榜，失败则回退到 OKX
+    """
+    # 尝试多个可能的 AiCoin 热点接口
+    hot_paths = [
+        "/tickers",
+        "/market/tickers",
+        "/ranking/hot",
+        "/v1/tickers",
+        "/api/v1/tickers"
+    ]
+    
+    for path in hot_paths:
+        url = f"{AICOIN_BASE_URL}{path}"
+        params = build_aicoin_params(AICOIN_API_KEY, AICOIN_API_SECRET)
+        try:
+            data = safe_request_with_headers(url, params=params)
+            if data and "data" in data:
+                items = data["data"]
+                hot = []
+                for item in items[:limit]:
+                    symbol = item.get("symbol") or item.get("instId") or item.get("pair")
+                    if not symbol:
+                        continue
+                    formatted_inst = symbol.replace("_", "-").replace("/", "-").upper()
+                    change = float(item.get("change24h") or item.get("change_percent") or item.get("increase") or 0)
+                    volume = float(item.get("volume24h") or item.get("vol") or 0)
+                    if volume < 100000:
+                        continue
+                    hot.append((formatted_inst, change))
+                if hot:
+                    print(f"成功从 AiCoin 获取热门币种（路径：{path}）")
+                    return hot
+        except Exception as e:
+            print(f"AiCoin 路径 {path} 失败: {e}")
+            continue
+
+    # 回退到 OKX
+    print("尝试从 OKX 获取热门币种")
+    url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+    data = safe_request(url)
+    if not data or "data" not in data:
+        return []
+    tickers = data["data"]
+    tickers.sort(key=lambda x: float(x.get("change24h", 0)), reverse=True)
+    hot = []
+    for t in tickers[:limit]:
+        inst = t["instId"]
+        if "-" not in inst:
+            continue
+        base, quote = inst.split("-")
+        if quote != "USDT":
+            continue
+        vol24h = float(t.get("vol24h", 0))
+        if vol24h < 100000:
+            continue
+        change24h = float(t.get("change24h", 0))
+        hot.append((inst, change24h))
+    return hot
+
+def hot_coin_filter(coin_name):
+    if coin_name in ["BTC-USDT", "ETH-USDT"]:
+        return False
+    return True
 
 # =========================
 # 市场周期识别
@@ -791,83 +928,6 @@ def adaptive_strategy_optimization(config):
         send_notification(msg, config, "AI模型进化报告")
 
 # =========================
-# 热门币种扫描（优先使用AiCoin，失败后回退到OKX）
-# =========================
-def scan_hot_coins(limit=20):
-    """
-    从AiCoin获取热点币种/涨幅榜，如果失败则回退到OKX
-    返回格式：[(币种, 24h涨幅百分比), ...]
-    """
-    # 尝试从AiCoin获取（根据文档推测可能有以下接口）
-    try:
-        # 方案1：涨幅榜接口
-        url = f"{AICOIN_BASE_URL}/market/tickers"  # 假设的接口
-        headers = {"X-API-Key": AICOIN_API_KEY}
-        data = safe_request_with_headers(url, headers=headers)
-        
-        # 如果上面的接口不存在，尝试热度排名接口
-        if not data or "data" not in data:
-            url = f"{AICOIN_BASE_URL}/ranking/hot"  # 假设的热度接口
-            data = safe_request_with_headers(url, headers=headers)
-        
-        if data and "data" in data:
-            tickers = data["data"]
-            # 按涨幅或热度排序
-            hot = []
-            for t in tickers[:limit]:
-                # 假设返回格式有多种可能，我们尝试几种常见字段
-                symbol = t.get("symbol") or t.get("instId") or t.get("pair")
-                if not symbol:
-                    continue
-                
-                # 转换为 BTC-USDT 格式
-                formatted_inst = symbol.replace("_", "-").replace("/", "-").upper()
-                
-                # 涨幅字段可能为 change24h、change_percent、increase 等
-                change = float(t.get("change24h") or t.get("change_percent") or t.get("increase") or 0)
-                
-                # 可选：成交量过滤
-                volume = float(t.get("volume24h") or t.get("vol") or 0)
-                if volume < 100000:  # 成交量过滤
-                    continue
-                    
-                hot.append((formatted_inst, change))
-            
-            if hot:
-                print("成功从AiCoin获取热门币种")
-                return hot
-    except Exception as e:
-        print(f"AiCoin获取热门币种失败: {e}")
-
-    # 如果AiCoin失败，回退到OKX
-    print("尝试从OKX获取热门币种")
-    url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
-    data = safe_request(url)
-    if not data or "data" not in data:
-        return []
-    tickers = data["data"]
-    tickers.sort(key=lambda x: float(x.get("change24h", 0)), reverse=True)
-    hot = []
-    for t in tickers[:limit]:
-        inst = t["instId"]
-        if "-" not in inst:
-            continue
-        base, quote = inst.split("-")
-        if quote != "USDT":
-            continue
-        vol24h = float(t.get("vol24h", 0))
-        if vol24h < 100000:
-            continue
-        change24h = float(t.get("change24h", 0))
-        hot.append((inst, change24h))
-    return hot
-
-def hot_coin_filter(coin_name):
-    if coin_name in ["BTC-USDT", "ETH-USDT"]:
-        return False
-    return True
-
-# =========================
 # 回测报告
 # =========================
 def generate_backtest_report():
@@ -1016,7 +1076,7 @@ def main():
             for coin in coins:
                 try:
                     df = get_kline(coin)
-                    whale = detect_whale(coin)
+                    whale = 0  # AiCoin暂无巨鲸接口，暂设为0
 
                     score, factors, features = calculate_score(df, memory, whale, current_market_cycle, coin, config)
 
@@ -1099,7 +1159,7 @@ def main():
                 for coin in coins:
                     try:
                         df = get_kline(coin)
-                        whale = detect_whale(coin)
+                        whale = 0
                         score, _, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
                         current_scores[coin] = score
                     except:
@@ -1146,7 +1206,7 @@ def main():
                     for coin in coins:
                         try:
                             df = get_kline(coin)
-                            whale = detect_whale(coin)
+                            whale = 0
                             score, factors, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
                             ticker_price = get_ticker(coin)
                             display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
