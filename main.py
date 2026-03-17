@@ -225,12 +225,23 @@ def get_market_sentiment():
 # 新增：资金费率（Gate.io合约）
 # =========================
 @cache(ttl_seconds=3600)  # 资金费率通常8小时结算，缓存1小时足够
+@cache(ttl_seconds=3600)  # 资金费率通常8小时结算，缓存1小时足够
 def get_funding_rate(inst):
-    """获取永续合约资金费率，如 BTC_USDT"""
+    """
+    获取永续合约资金费率。
+    只对主流币种（如BTC, ETH）尝试获取，其他币种直接返回None。
+    如果请求失败或合约不存在，返回None。
+    """
+    # 定义主流币种白名单（大写），您可以根据需要增删
+    WHITELIST = {"BTC", "ETH", "OKB", "BNB", "SOL", "XRP", "ADA", "DOGE", "DOT", "LINK"}
+    base = inst.split("-")[0].upper()
+    if base not in WHITELIST:
+        return None
+
     symbol = format_gateio_symbol(inst)
     url = f"{GATEIO_BASE_URL}/futures/usdt/contracts/{symbol}"
     data = safe_request(url)
-    if data and 'funding_rate' in data:
+    if data and isinstance(data, dict) and 'funding_rate' in data:
         return float(data['funding_rate'])
     return None
 
