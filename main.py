@@ -856,7 +856,10 @@ def main():
             memory = load_memory()
             config["buy_threshold"] = memory.get("buy_threshold", config["buy_threshold"])
             config["sell_threshold"] = memory.get("sell_threshold", config["sell_threshold"])
-
+memory = load_memory()
+config["buy_threshold"] = memory.get("buy_threshold", config["buy_threshold"])
+config["sell_threshold"] = memory.get("sell_threshold", config["sell_threshold"])
+print(f"[DEBUG] 当前买入阈值: {config['buy_threshold']}, 卖出阈值: {config['sell_threshold']}")
             for coin in coins:
                 try:
                     df = get_kline(coin, interval="5m", limit=300)
