@@ -24,7 +24,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 import joblib
 
 # =========================
-# 贝叶斯优化（可选，需要安装 scikit-optimize）
+# 贝叶斯优化（可选）
 # =========================
 try:
     from skopt import BayesSearchCV
@@ -74,7 +74,6 @@ GATEIO_BASE_URL = "https://api.gateio.ws/api/v4"
 # 缓存装饰器
 # =========================
 def cache(ttl_seconds=60):
-    """简单的内存缓存装饰器，支持 TTL"""
     cache_store = {}
     lock = threading.Lock()
     def decorator(func):
@@ -104,8 +103,6 @@ last_cycle_check = 0
 last_model_retrain = 0
 current_market_cycle = "未知"
 last_scores = {}
-
-# BTC 特征缓存（用于大盘指标）
 btc_features_cache = {'timestamp': 0, 'features': None}
 market_sentiment_cache = {'timestamp': 0, 'data': None}
 
@@ -113,13 +110,12 @@ market_sentiment_cache = {'timestamp': 0, 'data': None}
 # 辅助函数：交易对格式转换
 # =========================
 def format_gateio_symbol(inst):
-    """将 BTC-USDT 转换为 BTC_USDT"""
     return inst.replace("-", "_").upper()
 
 # =========================
 # 安全请求（带缓存）
 # =========================
-@cache(ttl_seconds=2)  # 缓存2秒，避免高频重复请求
+@cache(ttl_seconds=2)
 def safe_request(url, params=None, max_retries=3):
     for i in range(max_retries):
         try:
@@ -138,7 +134,7 @@ def safe_request(url, params=None, max_retries=3):
 # =========================
 # Gate.io 数据获取函数（带缓存）
 # =========================
-@cache(ttl_seconds=5)  # 价格5秒缓存
+@cache(ttl_seconds=5)
 def get_ticker(inst):
     symbol = format_gateio_symbol(inst)
     url = f"{GATEIO_BASE_URL}/spot/tickers"
@@ -148,7 +144,7 @@ def get_ticker(inst):
         return float(data[0]['last'])
     return None
 
-@cache(ttl_seconds=30)  # K线30秒缓存，减少请求
+@cache(ttl_seconds=30)
 def get_kline(inst, interval="5m", limit=300):
     symbol = format_gateio_symbol(inst)
     url = f"{GATEIO_BASE_URL}/spot/candlesticks"
@@ -168,7 +164,7 @@ def get_kline(inst, interval="5m", limit=300):
     df["ts"] = df["ts"] * 1000
     return df
 
-@cache(ttl_seconds=60)  # 热门币种缓存1分钟
+@cache(ttl_seconds=60)
 def scan_hot_coins(limit=20):
     url = f"{GATEIO_BASE_URL}/spot/tickers"
     data = safe_request(url)
@@ -189,19 +185,16 @@ def scan_hot_coins(limit=20):
     return hot
 
 def hot_coin_filter(coin_name):
-    if coin_name in ["BTC-USDT", "ETH-USDT", "OKB-USDT"]:
-        return False
-    return True
+    return coin_name not in ["BTC-USDT", "ETH-USDT", "OKB-USDT"]
 
 def detect_whale(inst):
     return 0
 
 # =========================
-# 新增：市场情绪指标
+# 市场情绪指标
 # =========================
-@cache(ttl_seconds=300)  # 5分钟更新一次
+@cache(ttl_seconds=300)
 def get_market_sentiment():
-    """获取市场情绪指标：涨跌家数比、成交量排名平均涨幅"""
     url = f"{GATEIO_BASE_URL}/spot/tickers"
     data = safe_request(url)
     if not isinstance(data, list):
@@ -211,7 +204,6 @@ def get_market_sentiment():
     up = sum(1 for d in usdt_pairs if float(d["change_percentage"]) > 0)
     down = total - up
     ratio = up / down if down > 0 else up
-    # 成交量排名前5的币种平均涨幅
     sorted_by_vol = sorted(usdt_pairs, key=lambda x: float(x["quote_volume"]), reverse=True)[:5]
     avg_top_vol_change = sum(float(d["change_percentage"]) for d in sorted_by_vol) / 5 if sorted_by_vol else 0
     return {
@@ -222,22 +214,14 @@ def get_market_sentiment():
     }
 
 # =========================
-# 新增：资金费率（Gate.io合约）
+# 资金费率（仅主流币）
 # =========================
-@cache(ttl_seconds=3600)  # 资金费率通常8小时结算，缓存1小时足够
-@cache(ttl_seconds=3600)  # 资金费率通常8小时结算，缓存1小时足够
+@cache(ttl_seconds=3600)
 def get_funding_rate(inst):
-    """
-    获取永续合约资金费率。
-    只对主流币种（如BTC, ETH）尝试获取，其他币种直接返回None。
-    如果请求失败或合约不存在，返回None。
-    """
-    # 定义主流币种白名单（大写），您可以根据需要增删
     WHITELIST = {"BTC", "ETH", "OKB", "BNB", "SOL", "XRP", "ADA", "DOGE", "DOT", "LINK"}
     base = inst.split("-")[0].upper()
     if base not in WHITELIST:
         return None
-
     symbol = format_gateio_symbol(inst)
     url = f"{GATEIO_BASE_URL}/futures/usdt/contracts/{symbol}"
     data = safe_request(url)
@@ -250,7 +234,7 @@ def get_funding_rate(inst):
 # =========================
 class AITradingModel:
     def __init__(self):
-        self.models = {}           # 改为模型字典，支持集成
+        self.models = {}
         self.scaler = StandardScaler()
         self.feature_importance = {}
         self.training_history = []
@@ -259,7 +243,6 @@ class AITradingModel:
         self.feature_names = []
         
     def extract_features(self, df, whale, market_cycle, coin_name):
-        """增强版特征提取，包含多周期、大盘、时间、情绪、资金费率"""
         features = {}
         if len(df) < 100:
             return None
@@ -294,7 +277,6 @@ class AITradingModel:
         low_20 = np.min(close[-20:])
         features['price_position_20'] = (close[-1] - low_20) / (high_20 - low_20) if high_20 > low_20 else 0.5
         
-        # RSI
         delta = np.diff(close)
         gain = np.where(delta > 0, delta, 0)
         loss = np.where(delta < 0, -delta, 0)
@@ -306,7 +288,6 @@ class AITradingModel:
         else:
             features['rsi'] = 50
             
-        # MACD
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         macd = exp1 - exp2
@@ -315,37 +296,33 @@ class AITradingModel:
         features['macd_signal'] = signal.iloc[-1]
         features['macd_histogram'] = macd.iloc[-1] - signal.iloc[-1]
         
-        # 布林带
         sma = df['close'].rolling(20).mean()
         std = df['close'].rolling(20).std()
         bb_upper = sma + (std * 2)
         bb_lower = sma - (std * 2)
         features['bb_position'] = (close[-1] - bb_lower.iloc[-1]) / (bb_upper.iloc[-1] - bb_lower.iloc[-1]) if bb_upper.iloc[-1] > bb_lower.iloc[-1] else 0.5
         
-        # 外部特征
         features['whale_value'] = whale / 10000
         features['market_cycle'] = 2 if market_cycle == "牛市" else (1 if market_cycle == "震荡" else 0)
         coin_hash = abs(hash(coin_name)) % 100 / 100
         features['coin_id'] = coin_hash
         
-        # ---- 2. 新增：1小时周期特征 ----
+        # ---- 2. 1小时周期特征 ----
         try:
             df_h1 = get_kline(coin_name, interval="1h", limit=100)
             if df_h1 is not None and len(df_h1) >= 60:
-                # 计算部分关键1h指标，避免重复全部计算，但可扩展
                 ma20_h1 = df_h1['close'].rolling(20).mean().iloc[-1]
                 features['h1_ma20'] = ma20_h1
                 features['h1_price_ma20_ratio'] = close[-1] / ma20_h1 if ma20_h1 != 0 else 1
                 momentum_h1 = (df_h1['close'].iloc[-1] - df_h1['close'].iloc[-10]) / df_h1['close'].iloc[-10]
                 features['h1_momentum_10'] = momentum_h1
-                # 可以继续添加更多h1指标
         except Exception as e:
-            print(f"获取1h K线失败: {e}")
+            pass
         
         # ---- 3. 大盘（BTC）特征 ----
         global btc_features_cache
         now = time.time()
-        if now - btc_features_cache['timestamp'] > 60:  # 缓存1分钟
+        if now - btc_features_cache['timestamp'] > 60:
             try:
                 df_btc = get_kline("BTC-USDT", interval="5m", limit=100)
                 if df_btc is not None and len(df_btc) >= 60:
@@ -355,11 +332,10 @@ class AITradingModel:
                     btc_feat['btc_price_ma20_ratio'] = df_btc['close'].iloc[-1] / ma20_btc if ma20_btc != 0 else 1
                     momentum_btc = (df_btc['close'].iloc[-1] - df_btc['close'].iloc[-10]) / df_btc['close'].iloc[-10]
                     btc_feat['btc_momentum_10'] = momentum_btc
-                    # 可继续添加更多
                     btc_features_cache['features'] = btc_feat
                     btc_features_cache['timestamp'] = now
             except Exception as e:
-                print(f"获取BTC特征失败: {e}")
+                pass
         if btc_features_cache['features']:
             features.update(btc_features_cache['features'])
         
@@ -374,7 +350,7 @@ class AITradingModel:
         if sentiment:
             features.update(sentiment)
         
-        # ---- 6. 资金费率（可选） ----
+        # ---- 6. 资金费率（仅主流币） ----
         funding = get_funding_rate(coin_name)
         if funding is not None:
             features['funding_rate'] = funding
@@ -404,7 +380,6 @@ class AITradingModel:
         
         X_scaled = self.scaler.fit_transform(X)
         
-        # 定义多个基模型
         base_models = [
             ('gb', GradientBoostingClassifier(
                 n_estimators=100, max_depth=5, learning_rate=0.1,
@@ -415,7 +390,6 @@ class AITradingModel:
             ))
         ]
         
-        # 使用贝叶斯优化调整参数（如果可用且样本足够）
         if BAYES_OPT_AVAILABLE and len(X) > MIN_TRAIN_SAMPLES * 2:
             print("开始贝叶斯优化超参数...")
             opt = BayesSearchCV(
@@ -425,22 +399,18 @@ class AITradingModel:
                     'max_depth': Integer(3, 8),
                     'learning_rate': Real(0.01, 0.3, prior='log-uniform'),
                 },
-                n_iter=10,  # 迭代次数，可调整
+                n_iter=10,
                 cv=3,
                 random_state=42
             )
             opt.fit(X_scaled, y)
             print(f"最优参数: {opt.best_params_}")
-            # 将优化后的模型加入集成
             base_models.append(('gb_opt', opt.best_estimator_))
         
-        # 创建投票分类器（软投票，使用概率平均）
         self.model = VotingClassifier(estimators=base_models, voting='soft')
         self.model.fit(X_scaled, y)
         
-        # 计算特征重要性（取所有模型特征重要性的平均）
         if hasattr(self.model, 'estimators_'):
-            # 对于 VotingClassifier，需要从每个估计器获取重要性
             importances = []
             for name, est in base_models:
                 if hasattr(est, 'feature_importances_'):
@@ -448,7 +418,6 @@ class AITradingModel:
             if importances:
                 self.feature_importance = dict(zip(self.feature_names, np.mean(importances, axis=0)))
         
-        # 评估
         y_pred = self.model.predict(X_scaled)
         accuracy = accuracy_score(y, y_pred)
         
@@ -480,7 +449,6 @@ class AITradingModel:
         proba = self.model.predict_proba(feature_scaled)[0]
         score = proba[1] * 100 if len(proba) == 2 else 50
         confidence = np.max(proba)
-        # 特征贡献（简化，取第一个模型的重要性）
         contribution = {}
         if hasattr(self.model, 'estimators_') and len(self.model.estimators_) > 0:
             first_est = self.model.estimators_[0]
@@ -516,14 +484,11 @@ class AITradingModel:
             print("未找到已训练模型")
             return False
 
-# =========================
-# 初始化全局AI模型
-# =========================
 ai_model = AITradingModel()
 ai_model.load()
 
 # =========================
-# 辅助函数：加载/保存配置与内存（同之前）
+# 辅助函数：加载/保存配置与内存
 # =========================
 def load_config():
     default_config = {
@@ -573,7 +538,7 @@ def save_memory(memory):
         json.dump(memory, f, indent=4)
 
 # =========================
-# 通知功能（同之前）
+# 通知功能
 # =========================
 def send_telegram_message(text, config):
     token = config.get("telegram_bot_token")
@@ -620,7 +585,7 @@ def send_notification(content, config, subject=None):
         send_email(subject, content, config)
 
 # =========================
-# 市场周期识别（同之前，但调用get_kline需指定interval）
+# 市场周期识别
 # =========================
 def detect_market_cycle():
     try:
@@ -663,9 +628,6 @@ def apply_cycle_strategy_adjustment(memory, cycle):
     print(f"周期调整: {cycle}, 新阈值: 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}")
     return memory
 
-# =========================
-# AI评分（与之前相同，但注意calculate_score调用extract_features时features已包含新特征）
-# =========================
 def calculate_score(df, memory, whale, market_cycle, coin, config):
     df = df.dropna().copy()
     if len(df) < 60:
@@ -714,7 +676,7 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
     return int(combined_score), factors, features
 
 # =========================
-# 日志管理（同之前）
+# 日志管理（自动限制大小）
 # =========================
 def load_log():
     try:
@@ -770,7 +732,7 @@ def log_signal(coin, signal, score, price, whale, market_cycle, factors, feature
     save_log(log)
 
 # =========================
-# 自适应优化（需调整，因为模型结构变了，但阈值调整逻辑可复用）
+# 自适应优化
 # =========================
 def adaptive_strategy_optimization(config):
     global ai_model
@@ -807,9 +769,6 @@ def adaptive_strategy_optimization(config):
                f"新阈值: 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}\nTop5特征:\n{feature_msg}")
         send_notification(msg, config, "AI模型进化报告")
 
-# =========================
-# 回测报告（同之前）
-# =========================
 def generate_backtest_report():
     log = load_log()
     verified = [e for e in log if e.get("verified")]
@@ -856,12 +815,11 @@ def main():
     config = load_config()
     print("=" * 50)
     start_time = time.time()
-    print("AI自主学习交易系统启动 (增强版)")
+    print("AI自主学习交易系统启动 (Gate.io 精简版)")
     print(f"模型状态: {'已训练' if ai_model.is_trained else '未训练'}")
     print(f"使用ML: {config.get('use_ml_model', True)}")
     print("=" * 50)
 
-    # 检查日志文件
     try:
         if os.path.exists(LOG_PATH):
             file_size = os.path.getsize(LOG_PATH)
@@ -877,7 +835,6 @@ def main():
         try:
             now = time.time()
 
-            # 市场周期检查
             if now - last_cycle_check > MARKET_CYCLE_INTERVAL:
                 new_cycle = detect_market_cycle()
                 if new_cycle != current_market_cycle:
@@ -887,10 +844,8 @@ def main():
                     memory = apply_cycle_strategy_adjustment(memory, current_market_cycle)
                 last_cycle_check = now
 
-            # 验证信号
             verify_past_signals(config)
 
-            # 获取热门币种
             hot_coins_with_change = scan_hot_coins()[:MAX_DYNAMIC_COINS]
             hot_coins = [coin for coin, _ in hot_coins_with_change]
             coins = config["coins"].copy()
@@ -898,17 +853,14 @@ def main():
                 if hot_coin_filter(h) and h not in coins:
                     coins.append(h)
 
-            # 加载内存权重
             memory = load_memory()
             config["buy_threshold"] = memory.get("buy_threshold", config["buy_threshold"])
             config["sell_threshold"] = memory.get("sell_threshold", config["sell_threshold"])
 
-            # 处理每个币种
             for coin in coins:
                 try:
                     df = get_kline(coin, interval="5m", limit=300)
                     whale = detect_whale(coin)
-
                     score, factors, features = calculate_score(df, memory, whale, current_market_cycle, coin, config)
 
                     if score >= config["buy_threshold"]:
@@ -929,7 +881,6 @@ def main():
                         price = df["close"].iloc[-1]
                         log_signal(coin, signal, score, price, whale, current_market_cycle, factors, features)
 
-                    # 实时价格显示
                     ticker_price = get_ticker(coin)
                     display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
 
@@ -955,17 +906,14 @@ def main():
                 except Exception as e:
                     print(f"处理{coin}时出错: {e}")
 
-            # 回测报告
             if now - last_backtest_time > BACKTEST_INTERVAL:
                 send_backtest_report(config)
                 last_backtest_time = now
 
-            # 自适应优化
             if now - last_adaptive_time > ADAPTIVE_OPTIMIZATION_INTERVAL:
                 adaptive_strategy_optimization(config)
                 last_adaptive_time = now
 
-            # 状态推送
             if now - last_status_push > STATUS_PUSH_INTERVAL:
                 current_scores = {}
                 for coin in coins:
@@ -1055,7 +1003,6 @@ def main():
                     print("状态推送跳过（无变化）")
                 last_status_push = now
 
-            # 日报推送
             if now - last_daily_report > DAILY_REPORT_INTERVAL:
                 send_backtest_report(config)
                 last_daily_report = now
