@@ -61,6 +61,9 @@ MIN_TRAIN_SAMPLES = 50  # 最少训练样本数
 # 评分变化阈值（用于状态推送）
 SCORE_CHANGE_THRESHOLD = 10
 
+# 币安配置
+BINANCE_BASE_URL = "https://api.binance.com"
+
 # 全局状态变量
 last_signal_time = {}
 last_status_push = 0
@@ -73,6 +76,13 @@ current_market_cycle = "未知"
 
 # 记录上次推送时的币种评分，用于判断变化
 last_scores = {}
+
+# =========================
+# 辅助函数：交易对格式转换
+# =========================
+def format_symbol(inst):
+    """将 BTC-USDT 转换为 BTCUSDT"""
+    return inst.replace("-", "").upper()
 
 # =========================
 # AI模型类 - 真正的自主学习核心
@@ -447,21 +457,8 @@ def send_notification(content, config, subject=None):
 # =========================
 # 安全请求
 # =========================
-def safe_request(url, max_retries=3):
-    for i in range(max_retries):
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-            else:
-                print(f"请求失败，状态码：{r.status_code}，URL：{url}")
-        except Exception as e:
-            print(f"请求异常：{e}")
-            time.sleep(2)
-    return None
-
-def safe_request_with_params(url, params=None, max_retries=3):
-    """支持params参数的GET请求"""
+def safe_request(url, params=None, max_retries=3):
+    """通用的GET请求函数，支持params参数"""
     for i in range(max_retries):
         try:
             r = requests.get(url, params=params, timeout=10)
@@ -476,77 +473,72 @@ def safe_request_with_params(url, params=None, max_retries=3):
     return None
 
 # =========================
-# OKX 数据获取函数
+# 币安数据获取函数（基于官方API）
 # =========================
-def get_kline(inst, limit=300):
+def get_ticker(inst):
     """
-    从 OKX 获取 K 线数据
+    从币安获取实时价格
     inst 格式: 'BTC-USDT'
     """
-    url = f"https://www.okx.com/api/v5/market/candles?instId={inst}&bar=5m&limit={limit}"
-    data = safe_request(url)
-    if not data or "data" not in data:
-        raise Exception(f"获取{inst}行情失败")
-    df = pd.DataFrame(data["data"])
-    df = df.iloc[:, :6]
+    symbol = format_symbol(inst)
+    url = f"{BINANCE_BASE_URL}/api/v3/ticker/price"
+    params = {"symbol": symbol}
+    data = safe_request(url, params=params)
+    if data and "price" in data:
+        return float(data["price"])
+    return None
+
+def get_kline(inst, interval="5m", limit=300):
+    """
+    从币安获取K线数据
+    inst 格式: 'BTC-USDT'
+    返回DataFrame，列: ts, open, high, low, close, volume
+    """
+    symbol = format_symbol(inst)
+    url = f"{BINANCE_BASE_URL}/api/v3/klines"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+    data = safe_request(url, params=params)
+    if not isinstance(data, list):
+        raise Exception(f"获取{inst} K线失败: {data}")
+
+    # 币安返回的列：0时间戳(ms),1开,2高,3低,4收,5成交量,...
+    df = pd.DataFrame(data)
+    df = df.iloc[:, :6]  # 只取前6列
     df.columns = ["ts", "open", "high", "low", "close", "volume"]
     df = df.astype(float)
     return df
 
-def get_ticker(inst):
-    """
-    从 OKX 获取实时最新价
-    """
-    url = f"https://www.okx.com/api/v5/market/ticker?instId={inst}"
-    data = safe_request(url)
-    if data and "data" in data and len(data["data"]) > 0:
-        return float(data["data"][0]["last"])
-    return None
-
-def detect_whale(inst):
-    """
-    从 OKX 获取最近成交，检测巨鲸交易
-    """
-    try:
-        url = f"https://www.okx.com/api/v5/market/trades?instId={inst}&limit=100"
-        data = safe_request(url)
-        if not data or "data" not in data:
-            return 0
-        whale_total = 0
-        for trade in data["data"]:
-            size = float(trade["sz"])
-            price = float(trade["px"])
-            value = size * price
-            if value > WHALE_THRESHOLD:
-                whale_total += value
-        return whale_total
-    except:
-        return 0
-
 def scan_hot_coins(limit=20):
     """
-    从 OKX 获取涨幅榜，返回热门币种列表（只包含以USDT计价的交易对）
+    从币安获取24h涨幅榜，返回列表 [(币种, 涨幅), ...]
+    币种格式如 'BTC-USDT'
     """
-    url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+    url = f"{BINANCE_BASE_URL}/api/v3/ticker/24hr"
     data = safe_request(url)
-    if not data or "data" not in data:
+    if not isinstance(data, list):
+        print("币安获取热门币种失败")
         return []
-    tickers = data["data"]
-    tickers.sort(key=lambda x: float(x.get("change24h", 0)), reverse=True)
+
+    # 过滤USDT交易对
+    usdt_pairs = [d for d in data if d["symbol"].endswith("USDT")]
+
+    # 按涨幅降序排序
+    usdt_pairs.sort(key=lambda x: float(x["priceChangePercent"]), reverse=True)
+
     hot = []
-    stable_coins = ["USDT", "USDC", "DAI", "BUSD", "TUSD", "USDJ", "PAX", "GUSD", "HUSD", "USDK", "EURS", "CEUR"]
-    for t in tickers[:limit]:
-        inst = t["instId"]
-        if "-" not in inst:
+    for item in usdt_pairs[:limit]:
+        symbol = item["symbol"]
+        change = float(item["priceChangePercent"])
+        volume = float(item["quoteVolume"])  # 24h成交额（USDT）
+        if volume < 100000:  # 成交量过滤
             continue
-        base, quote = inst.split("-")
-        if quote != "USDT":
-            continue
-        vol24h = float(t.get("vol24h", 0))
-        if vol24h < 100000:
-            continue
-        change24h = float(t.get("change24h", 0))
-        hot.append((inst, change24h))
+        formatted = symbol.replace("USDT", "-USDT")
+        hot.append((formatted, change))
+
     return hot
 
 def hot_coin_filter(coin_name):
@@ -554,13 +546,21 @@ def hot_coin_filter(coin_name):
         return False
     return True
 
+def detect_whale(inst):
+    """
+    从币安获取大额交易（巨鲸检测），可选实现
+    此处暂时返回0，保持与原有接口一致
+    """
+    # 如果需要，可以实现币安的成交接口聚合
+    return 0
+
 # =========================
 # 市场周期识别
 # =========================
 def detect_market_cycle():
     """基于BTC判断市场周期：牛市/熊市/震荡"""
     try:
-        df = get_kline("BTC-USDT", limit=300)
+        df = get_kline("BTC-USDT", interval="5m", limit=300)
         df["ma200"] = df["close"].rolling(200).mean()
         price = df["close"].iloc[-1]
         ma200 = df["ma200"].iloc[-1]
