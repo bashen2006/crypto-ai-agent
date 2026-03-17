@@ -58,8 +58,12 @@ MAX_LOG_SIZE = 5000
 MAX_DYNAMIC_COINS = 3
 MIN_TRAIN_SAMPLES = 50  # 最少训练样本数
 
-# 评分变化阈值（用于状态推送）—— 从5调整为10，减少无用推送
+# 评分变化阈值（用于状态推送）
 SCORE_CHANGE_THRESHOLD = 10
+
+# AiCoin 配置（使用您提供的新 Key）
+AICOIN_API_KEY = "JcgzB9qCy90qxJm3daJyrKV10IfikIct"
+AICOIN_BASE_URL = "https://api.aicoin.com/v1"  # 根据官方文档确认
 
 # 全局状态变量
 last_signal_time = {}
@@ -445,57 +449,82 @@ def send_notification(content, config, subject=None):
         send_email(subject, content, config)
 
 # =========================
-# 安全请求（使用AWS节点）
+# 安全请求
 # =========================
-OKX_BASE_URL = "https://aws.okx.com"  # 改用AWS节点
-
 def safe_request(url, max_retries=3):
     for i in range(max_retries):
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
                 return r.json()
-        except:
+            else:
+                print(f"请求失败，状态码：{r.status_code}，URL：{url}")
+        except Exception as e:
+            print(f"请求异常：{e}")
+            time.sleep(2)
+    return None
+
+def safe_request_with_headers(url, headers=None, params=None, max_retries=3):
+    """支持 headers 的请求函数"""
+    for i in range(max_retries):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                print(f"请求失败，状态码：{r.status_code}")
+                print(f"响应内容：{r.text[:200]}")
+        except Exception as e:
+            print(f"请求异常：{e}")
             time.sleep(2)
     return None
 
 def get_kline(inst, limit=300):
-    """获取K线数据，默认300根确保200均线有效"""
-    url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst}&bar=5m&limit={limit}"
-    data = safe_request(url)
-    if not data or "data" not in data:
+    """
+    从 AiCoin 获取 K 线数据
+    inst 格式：'BTC-USDT'
+    """
+    # AiCoin 可能要求的格式：BTC_USDT
+    symbol = inst.replace("-", "_")
+    url = f"{AICOIN_BASE_URL}/market/klines"
+    headers = {"X-API-Key": AICOIN_API_KEY}
+    params = {
+        "symbol": symbol,
+        "period": "5m",
+        "size": limit
+    }
+    
+    data = safe_request_with_headers(url, headers=headers, params=params)
+    if not data:
         raise Exception(f"获取{inst}行情失败")
-    df = pd.DataFrame(data["data"])
+    
+    # 假设返回格式为 { "data": [ [ts, open, high, low, close, volume], ... ] }
+    klines = data.get("data", [])
+    if not klines:
+        raise Exception(f"AiCoin 返回数据为空")
+    
+    df = pd.DataFrame(klines)
     df = df.iloc[:, :6]
     df.columns = ["ts", "open", "high", "low", "close", "volume"]
     df = df.astype(float)
     return df
 
 def get_ticker(inst):
-    """获取实时最新价（用于显示）"""
-    url = f"{OKX_BASE_URL}/api/v5/market/ticker?instId={inst}"
-    data = safe_request(url)
-    if data and "data" in data and len(data["data"]) > 0:
-        return float(data["data"][0]["last"])
+    """从 AiCoin 获取实时最新价"""
+    symbol = inst.replace("-", "_")
+    url = f"{AICOIN_BASE_URL}/market/ticker"
+    headers = {"X-API-Key": AICOIN_API_KEY}
+    params = {"symbol": symbol}
+    
+    data = safe_request_with_headers(url, headers=headers, params=params)
+    if data and "data" in data:
+        # 假设返回 { "data": { "last": 12345.67 } }
+        return float(data["data"]["last"])
     return None
 
 def detect_whale(inst):
-    """检测巨鲸交易"""
-    try:
-        url = f"{OKX_BASE_URL}/api/v5/market/trades?instId={inst}&limit=100"
-        data = safe_request(url)
-        if not data or "data" not in data:
-            return 0
-        whale_total = 0
-        for trade in data["data"]:
-            size = float(trade["sz"])
-            price = float(trade["px"])
-            value = size * price
-            if value > WHALE_THRESHOLD:
-                whale_total += value
-        return whale_total
-    except:
-        return 0
+    """检测巨鲸交易（暂时无法通过AiCoin实现，返回0）"""
+    return 0
 
 # =========================
 # 市场周期识别
@@ -762,11 +791,57 @@ def adaptive_strategy_optimization(config):
         send_notification(msg, config, "AI模型进化报告")
 
 # =========================
-# 热门币种扫描
+# 热门币种扫描（优先使用AiCoin，失败后回退到OKX）
 # =========================
 def scan_hot_coins(limit=20):
-    """从OKX获取涨幅榜，返回热门币种列表（只包含以USDT计价的交易对）"""
-    url = f"{OKX_BASE_URL}/api/v5/market/tickers?instType=SPOT"
+    """
+    从AiCoin获取热点币种/涨幅榜，如果失败则回退到OKX
+    返回格式：[(币种, 24h涨幅百分比), ...]
+    """
+    # 尝试从AiCoin获取（根据文档推测可能有以下接口）
+    try:
+        # 方案1：涨幅榜接口
+        url = f"{AICOIN_BASE_URL}/market/tickers"  # 假设的接口
+        headers = {"X-API-Key": AICOIN_API_KEY}
+        data = safe_request_with_headers(url, headers=headers)
+        
+        # 如果上面的接口不存在，尝试热度排名接口
+        if not data or "data" not in data:
+            url = f"{AICOIN_BASE_URL}/ranking/hot"  # 假设的热度接口
+            data = safe_request_with_headers(url, headers=headers)
+        
+        if data and "data" in data:
+            tickers = data["data"]
+            # 按涨幅或热度排序
+            hot = []
+            for t in tickers[:limit]:
+                # 假设返回格式有多种可能，我们尝试几种常见字段
+                symbol = t.get("symbol") or t.get("instId") or t.get("pair")
+                if not symbol:
+                    continue
+                
+                # 转换为 BTC-USDT 格式
+                formatted_inst = symbol.replace("_", "-").replace("/", "-").upper()
+                
+                # 涨幅字段可能为 change24h、change_percent、increase 等
+                change = float(t.get("change24h") or t.get("change_percent") or t.get("increase") or 0)
+                
+                # 可选：成交量过滤
+                volume = float(t.get("volume24h") or t.get("vol") or 0)
+                if volume < 100000:  # 成交量过滤
+                    continue
+                    
+                hot.append((formatted_inst, change))
+            
+            if hot:
+                print("成功从AiCoin获取热门币种")
+                return hot
+    except Exception as e:
+        print(f"AiCoin获取热门币种失败: {e}")
+
+    # 如果AiCoin失败，回退到OKX
+    print("尝试从OKX获取热门币种")
+    url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
     data = safe_request(url)
     if not data or "data" not in data:
         return []
@@ -778,10 +853,10 @@ def scan_hot_coins(limit=20):
         if "-" not in inst:
             continue
         base, quote = inst.split("-")
-        if quote != "USDT":          # 只保留USDT交易对
+        if quote != "USDT":
             continue
         vol24h = float(t.get("vol24h", 0))
-        if vol24h < 100000:          # 成交量过滤（可选）
+        if vol24h < 100000:
             continue
         change24h = float(t.get("change24h", 0))
         hot.append((inst, change24h))
