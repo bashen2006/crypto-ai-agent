@@ -58,7 +58,7 @@ MAX_LOG_SIZE = 5000
 MAX_DYNAMIC_COINS = 3
 MIN_TRAIN_SAMPLES = 50  # 最少训练样本数
 
-# 评分变化阈值（用于状态推送），增大到10减少无用推送
+# 评分变化阈值（用于状态推送）—— 从5调整为10，减少无用推送
 SCORE_CHANGE_THRESHOLD = 10
 
 # 全局状态变量
@@ -445,8 +445,10 @@ def send_notification(content, config, subject=None):
         send_email(subject, content, config)
 
 # =========================
-# 安全请求
+# 安全请求（使用AWS节点）
 # =========================
+OKX_BASE_URL = "https://aws.okx.com"  # 改用AWS节点
+
 def safe_request(url, max_retries=3):
     for i in range(max_retries):
         try:
@@ -457,17 +459,9 @@ def safe_request(url, max_retries=3):
             time.sleep(2)
     return None
 
-def get_ticker(inst):
-    """获取OKX实时最新价（使用AWS节点）"""
-    url = f"https://aws.okx.com/api/v5/market/ticker?instId={inst}"
-    data = safe_request(url)
-    if data and "data" in data and len(data["data"]) > 0:
-        return float(data["data"][0]["last"])
-    return None
-
 def get_kline(inst, limit=300):
-    """获取K线数据，使用AWS节点"""
-    url = f"https://aws.okx.com/api/v5/market/candles?instId={inst}&bar=5m&limit={limit}"
+    """获取K线数据，默认300根确保200均线有效"""
+    url = f"{OKX_BASE_URL}/api/v5/market/candles?instId={inst}&bar=5m&limit={limit}"
     data = safe_request(url)
     if not data or "data" not in data:
         raise Exception(f"获取{inst}行情失败")
@@ -477,10 +471,18 @@ def get_kline(inst, limit=300):
     df = df.astype(float)
     return df
 
+def get_ticker(inst):
+    """获取实时最新价（用于显示）"""
+    url = f"{OKX_BASE_URL}/api/v5/market/ticker?instId={inst}"
+    data = safe_request(url)
+    if data and "data" in data and len(data["data"]) > 0:
+        return float(data["data"][0]["last"])
+    return None
+
 def detect_whale(inst):
-    """检测巨鲸交易（使用AWS节点）"""
+    """检测巨鲸交易"""
     try:
-        url = f"https://aws.okx.com/api/v5/market/trades?instId={inst}&limit=100"
+        url = f"{OKX_BASE_URL}/api/v5/market/trades?instId={inst}&limit=100"
         data = safe_request(url)
         if not data or "data" not in data:
             return 0
@@ -496,7 +498,7 @@ def detect_whale(inst):
         return 0
 
 # =========================
-# 市场周期识别（使用AWS节点）
+# 市场周期识别
 # =========================
 def detect_market_cycle():
     """基于BTC判断市场周期：牛市/熊市/震荡"""
@@ -760,11 +762,11 @@ def adaptive_strategy_optimization(config):
         send_notification(msg, config, "AI模型进化报告")
 
 # =========================
-# 热门币种扫描（使用AWS节点）
+# 热门币种扫描
 # =========================
 def scan_hot_coins(limit=20):
     """从OKX获取涨幅榜，返回热门币种列表（只包含以USDT计价的交易对）"""
-    url = "https://aws.okx.com/api/v5/market/tickers?instType=SPOT"
+    url = f"{OKX_BASE_URL}/api/v5/market/tickers?instType=SPOT"
     data = safe_request(url)
     if not data or "data" not in data:
         return []
@@ -885,14 +887,14 @@ def main():
     global ai_model, last_scores
 
     config = load_config()
-    print("=" * 50)       
+    print("=" * 50)
     start_time = time.time()
     print("AI自主学习交易系统启动")
     print(f"模型状态: {'已训练' if ai_model.is_trained else '未训练'}")
     print(f"使用ML: {config.get('use_ml_model', True)}")
     print("=" * 50)
 
-    # 文件存在性检测（可选）
+    # ---------- 临时检测：检查日志文件是否存在 ----------
     try:
         if os.path.exists(LOG_PATH):
             file_size = os.path.getsize(LOG_PATH)
@@ -903,6 +905,7 @@ def main():
         print(msg)
     except Exception as e:
         print(f"检测日志文件时出错：{e}")
+    # --------------------------------------------------
 
     while True:
         try:
@@ -957,17 +960,14 @@ def main():
                         last_signal_time[coin] = now
 
                     if signal in ("买入", "卖出"):
-                        price = get_ticker(coin)  # 使用实时价格记录
-                        if price is None:
-                            price = df["close"].iloc[-1]  # 降级到K线价格
+                        price = df["close"].iloc[-1]
                         log_signal(coin, signal, score, price, whale, current_market_cycle, factors, features)
 
+                    # 获取实时最新价用于显示
+                    ticker_price = get_ticker(coin)
+                    display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
+
                     if signal in ("买入", "卖出"):
-                        # 获取实时价格用于显示
-                        display_price = get_ticker(coin)
-                        if display_price is None:
-                            display_price = df["close"].iloc[-1]
-                        
                         emoji = "🟢" if signal == "买入" else "🔴"
                         action = "买入" if signal == "买入" else "卖出"
                         
@@ -1003,7 +1003,7 @@ def main():
                         
                         send_notification(msg, config, f"{action}信号 {coin}")
 
-                    print(f"{coin} {signal} {score} (规则:{factors['rule_score']} ML:{factors['ml_score']:.1f}) {current_market_cycle}")
+                    print(f"{coin} {signal} {score} (规则:{factors['rule_score']} ML:{factors['ml_score']:.1f}) {current_market_cycle} (显示价:{display_price})")
 
                 except Exception as e:
                     print(f"处理{coin}时出错: {e}")
@@ -1013,20 +1013,19 @@ def main():
                 send_backtest_report(config)
                 last_backtest_time = now
 
-            # 7. 自适应优化（模型训练+阈值微调）
+            # 7. 自适应优化
             if now - last_adaptive_time > ADAPTIVE_OPTIMIZATION_INTERVAL:
                 adaptive_strategy_optimization(config)
                 last_adaptive_time = now
 
-            # 8. 状态推送（带评分变化检测，使用实时价格显示）
+            # 8. 状态推送
             if now - last_status_push > STATUS_PUSH_INTERVAL:
-                # 获取当前所有币种的评分
                 current_scores = {}
                 for coin in coins:
                     try:
                         df = get_kline(coin)
                         whale = detect_whale(coin)
-                        score, factors, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
+                        score, _, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
                         current_scores[coin] = score
                     except:
                         current_scores[coin] = None
@@ -1071,13 +1070,11 @@ def main():
                     coin_lines = []
                     for coin in coins:
                         try:
-                            display_price = get_ticker(coin)
-                            if display_price is None:
-                                # 降级到K线价格
-                                df = get_kline(coin)
-                                display_price = df["close"].iloc[-1]
-                            # 评分仍用之前计算的
-                            score = current_scores.get(coin, 0)
+                            df = get_kline(coin)
+                            whale = detect_whale(coin)
+                            score, factors, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
+                            ticker_price = get_ticker(coin)
+                            display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
                             if score >= config["buy_threshold"]:
                                 signal_icon = "🟢 买入"
                             elif score <= config["sell_threshold"]:
