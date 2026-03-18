@@ -178,8 +178,9 @@ def scan_hot_coins(limit=20):
         symbol = item["currency_pair"]
         change = float(item["change_percentage"])
         volume = float(item["quote_volume"])
-        if volume < 100000:
-            continue
+        # 临时放宽过滤
+        # if volume < 100000:
+        #     continue
         formatted = symbol.replace("_", "-")
         hot.append((formatted, change))
     return hot
@@ -613,9 +614,7 @@ def apply_cycle_strategy_adjustment(memory, cycle):
     熊市：降低买入阈值、降低卖出阈值（谨慎抄底，快速止损）
     震荡：放宽阈值，增加交易频率
     """
-    # ---------- 新增：模型未训练时只调权重，不调阈值 ----------
     if not ai_model.is_trained:
-        # 只调整权重
         if cycle == "牛市":
             memory["trend_weight"] = min(memory.get("trend_weight", 0.3) + 0.05, 1.0)
         elif cycle == "熊市":
@@ -625,7 +624,6 @@ def apply_cycle_strategy_adjustment(memory, cycle):
         save_memory(memory)
         print(f"周期调整: {cycle}, 模型未训练，仅调整权重")
         return memory
-    # --------------------------------------------------------
 
     memory = memory.copy()
     if cycle == "牛市":
@@ -842,19 +840,17 @@ def main():
     print(f"使用ML: {config.get('use_ml_model', True)}")
     print("=" * 50)
 
-    # ---------- 新增：强制设置初始阈值（仅当模型未训练时）----------
+    # 强制设置初始阈值（仅当模型未训练时）
     if not ai_model.is_trained:
         memory = load_memory()
         memory["buy_threshold"] = 50
         memory["sell_threshold"] = 35
         save_memory(memory)
         print("⚠️ 模型未训练，已强制设置买入阈值=50，卖出阈值=35")
-        # 立即更新当前配置
         config["buy_threshold"] = 50
         config["sell_threshold"] = 35
     else:
         print("✅ 模型已训练，使用动态阈值")
-    # -------------------------------------------------------------
 
     try:
         if os.path.exists(LOG_PATH):
@@ -923,27 +919,36 @@ def main():
                     ticker_price = get_ticker(coin)
                     display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
 
+                    # ---------- 统一详细信号消息（无论训练与否） ----------
                     if signal in ("买入", "卖出"):
                         emoji = "🟢" if signal == "买入" else "🔴"
                         action = signal
                         advice = "评分超过买入阈值，可考虑建仓。" if signal == "买入" else "评分低于卖出阈值，可考虑减仓。"
+
+                        # 格式化重要特征
                         feat_str = ""
                         if factors.get('feature_importance'):
                             top_feat = sorted(factors['feature_importance'].items(), key=lambda x: abs(x[1]), reverse=True)[:3]
                             feat_str = "\n重要特征: " + ", ".join([f"{f[:10]}:{v:.2f}" for f, v in top_feat])
-                        
-                        msg = (f"{emoji*3} {action}信号 {emoji*3}\n币种：{coin}\n价格：${display_price:.4f}\n"
+
+                        msg = (f"{emoji*3} {action}信号 {emoji*3}\n"
+                               f"币种：{coin}\n"
+                               f"价格：${display_price:.4f}\n"
                                f"综合评分：{score} ({'买入' if signal=='买入' else '卖出'}阈值 {config['buy_threshold'] if signal=='买入' else config['sell_threshold']})\n"
                                f"规则评分：{factors['rule_score']} | ML评分：{factors['ml_score']:.1f}")
                         if factors.get('ml_confidence', 0) > 0:
                             msg += f" (置信度 {factors['ml_confidence']:.2f})"
-                        msg += f"\n市场周期：{current_market_cycle}\n建议：{advice}{feat_str}\n时间：{datetime.now()}"
+                        msg += f"\n市场周期：{current_market_cycle}\n"
+                        msg += f"建议：{advice}{feat_str}\n"
+                        msg += f"时间：{datetime.now()}"
                         send_notification(msg, config, f"{action}信号 {coin}")
 
                     print(f"{coin} {signal} {score} (规则:{factors['rule_score']} ML:{factors['ml_score']:.1f}) {current_market_cycle} (显示价:{display_price})")
 
                 except Exception as e:
                     print(f"处理{coin}时出错: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             if now - last_backtest_time > BACKTEST_INTERVAL:
                 send_backtest_report(config)
