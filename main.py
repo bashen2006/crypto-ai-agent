@@ -613,21 +613,21 @@ def apply_cycle_strategy_adjustment(memory, cycle):
     熊市：降低买入阈值、降低卖出阈值（谨慎抄底，快速止损）
     震荡：放宽阈值，增加交易频率
     """
-    memory = memory.copy()
-    # 如果模型未训练，只调整权重，不调整阈值
+    # ---------- 新增：模型未训练时只调权重，不调阈值 ----------
     if not ai_model.is_trained:
+        # 只调整权重
         if cycle == "牛市":
             memory["trend_weight"] = min(memory.get("trend_weight", 0.3) + 0.05, 1.0)
         elif cycle == "熊市":
             memory["trend_weight"] = max(memory.get("trend_weight", 0.3) - 0.05, 0.0)
         elif cycle == "震荡":
             memory["volume_weight"] = min(memory.get("volume_weight", 0.2) + 0.05, 1.0)
-        # 不修改阈值
         save_memory(memory)
         print(f"周期调整: {cycle}, 模型未训练，仅调整权重")
         return memory
+    # --------------------------------------------------------
 
-    # 模型已训练，正常调整阈值
+    memory = memory.copy()
     if cycle == "牛市":
         memory["trend_weight"] = min(memory.get("trend_weight", 0.3) + 0.05, 1.0)
         memory["buy_threshold"] = min(memory.get("buy_threshold", 70) + 2, 85)
@@ -641,7 +641,6 @@ def apply_cycle_strategy_adjustment(memory, cycle):
         memory["buy_threshold"] = max(memory.get("buy_threshold", 70) - 3, 55)
         memory["sell_threshold"] = min(memory.get("sell_threshold", 35) + 3, 45)
 
-    # 确保买入阈值 > 卖出阈值，且在一定范围内
     memory["buy_threshold"] = max(memory["buy_threshold"], memory["sell_threshold"] + 5)
     memory["buy_threshold"] = min(memory["buy_threshold"], 85)
     memory["sell_threshold"] = max(memory["sell_threshold"], 15)
@@ -838,10 +837,24 @@ def main():
     config = load_config()
     print("=" * 50)
     start_time = time.time()
-    print("AI自主学习交易系统启动 (Gate.io 精简版)")
+    print("AI自主学习交易系统启动 (Gate.io 增强版)")
     print(f"模型状态: {'已训练' if ai_model.is_trained else '未训练'}")
     print(f"使用ML: {config.get('use_ml_model', True)}")
     print("=" * 50)
+
+    # ---------- 新增：强制设置初始阈值（仅当模型未训练时）----------
+    if not ai_model.is_trained:
+        memory = load_memory()
+        memory["buy_threshold"] = 50
+        memory["sell_threshold"] = 35
+        save_memory(memory)
+        print("⚠️ 模型未训练，已强制设置买入阈值=50，卖出阈值=35")
+        # 立即更新当前配置
+        config["buy_threshold"] = 50
+        config["sell_threshold"] = 35
+    else:
+        print("✅ 模型已训练，使用动态阈值")
+    # -------------------------------------------------------------
 
     try:
         if os.path.exists(LOG_PATH):
@@ -853,20 +866,7 @@ def main():
         print(msg)
     except Exception as e:
         print(f"检测日志文件时出错：{e}")
-# 强制设置初始阈值（仅当模型未训练时）
 
-if not ai_model.is_trained: #在加载配置和内存后，检查模型是否已训练，如果未训练，则强制将内存中的阈值改为较低值并保存
-    memory = load_memory()
-    # 设置较低阈值
-    memory["buy_threshold"] = 50
-    memory["sell_threshold"] = 35
-    save_memory(memory)
-    print("⚠️ 模型未训练，已强制设置买入阈值=50，卖出阈值=35")
-    # 重新加载内存到配置中
-    config["buy_threshold"] = 50
-    config["sell_threshold"] = 35
-else:
-    print("✅ 模型已训练，使用动态阈值")
     while True:
         try:
             now = time.time()
@@ -893,9 +893,7 @@ else:
             config["buy_threshold"] = memory.get("buy_threshold", config["buy_threshold"])
             config["sell_threshold"] = memory.get("sell_threshold", config["sell_threshold"])
 
-            memory = load_memory()
-            config["buy_threshold"] = memory.get("buy_threshold", config["buy_threshold"])
-            config["sell_threshold"] = memory.get("sell_threshold", config["sell_threshold"])
+            # 调试打印
             print(f"[DEBUG] 当前买入阈值: {config['buy_threshold']}, 卖出阈值: {config['sell_threshold']}")
 
             for coin in coins:
