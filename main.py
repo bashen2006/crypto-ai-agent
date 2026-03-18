@@ -15,6 +15,16 @@ from functools import wraps
 import threading
 
 # =========================
+# 自动适配 Railway Volume（关键修复）
+# =========================
+DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+if not os.path.exists(DATA_DIR):
+    print(f"⚠️ Volume路径不存在，fallback到本地data目录")
+    DATA_DIR = "./data"
+os.makedirs(DATA_DIR, exist_ok=True)
+print(f"📁 数据目录: {DATA_DIR}")
+
+# =========================
 # 机器学习库导入
 # =========================
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
@@ -37,16 +47,16 @@ except ImportError:
 # =========================
 # 配置常量（使用持久化路径）
 # =========================
-DATA_DIR = '/app/data'
-os.makedirs(DATA_DIR, exist_ok=True)
+CONFIG_FILE = "config.json"  # 配置文件保留在项目根目录
 
-CONFIG_FILE = "config.json"
+# 所有需要持久化的文件都放入 DATA_DIR
 MEMORY_FILE = "ai_memory.json"
 LOG_FILE = "prediction_log.json"
 MODEL_FILE = "ai_model.pkl"
 SCALER_FILE = "scaler.pkl"
 FEATURES_FILE = "feature_config.json"
 
+# 构建完整路径
 MEMORY_PATH = os.path.join(DATA_DIR, MEMORY_FILE)
 LOG_PATH = os.path.join(DATA_DIR, LOG_FILE)
 MODEL_PATH = os.path.join(DATA_DIR, MODEL_FILE)
