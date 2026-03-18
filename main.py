@@ -79,9 +79,15 @@ SCORE_CHANGE_THRESHOLD = 10
 GATEIO_BASE_URL = "https://api.gateio.ws/api/v4"
 
 # 过滤阈值
-VOLUME_RATIO_MIN = 2.0          # 成交量需大于平均的2倍
-VOLATILITY_MIN = 0.01            # 最小波动率 1%
-PROFIT_THRESHOLD = 0.01          # 未来收益阈值 1% (用于训练标签)
+VOLUME_RATIO_MIN = 2.0
+VOLATILITY_MIN = 0.01
+PROFIT_THRESHOLD = 0.01
+
+# 多档信号阈值（仅用于消息展示，不影响训练）
+SIGNAL_STRONG_BUY = 75
+SIGNAL_BUY = 60
+SIGNAL_STRONG_SELL = 25
+SIGNAL_SELL = 40
 
 # =========================
 # 缓存装饰器
@@ -377,7 +383,6 @@ class AITradingModel:
             if 'features' not in log:
                 continue
             X_list.append(log['features'])
-            # 训练标签：1为正确（未来收益达标），0为错误
             y_list.append(1 if log['result'] == 'correct' else 0)
         if len(X_list) < MIN_TRAIN_SAMPLES:
             return None, None
@@ -459,6 +464,7 @@ class AITradingModel:
                 feature_vector.append(0)
         feature_scaled = self.scaler.transform([feature_vector])
         proba = self.model.predict_proba(feature_scaled)[0]
+        # 类别1（正确）的概率作为上涨概率的基础，但实际是“信号正确”的概率，可作为参考
         score = proba[1] * 100 if len(proba) == 2 else 50
         confidence = np.max(proba)
         contribution = {}
@@ -514,7 +520,7 @@ def load_config():
         "email_pass": "",
         "email_receiver": "",
         "use_ml_model": True,
-        "ml_weight": 0.4  # 从0.7降至0.4，避免初期模型不稳定
+        "ml_weight": 0.4
     }
     try:
         with open(CONFIG_FILE) as f:
@@ -654,10 +660,23 @@ def apply_cycle_strategy_adjustment(memory, cycle):
     return memory
 
 def calculate_score(df, memory, whale, market_cycle, coin, config):
+    """
+    增强版评分，返回评分、因子字典和分析字典
+    """
     df = df.dropna().copy()
     if len(df) < 60:
         rule_score = 50
+        # 如果数据不足，分析字段默认值
+        analysis = {
+            'trend': '未知',
+            'momentum': '未知',
+            'volume': '未知',
+            'volatility': '未知',
+            'position': 0.5,
+            'position_desc': '中等'
+        }
     else:
+        # ---- 规则评分 ----
         df["ma20"] = df["close"].rolling(20).mean()
         df["ma60"] = df["close"].rolling(60).mean()
         ma20 = df["ma20"].iloc[-1]
@@ -675,7 +694,60 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
         if whale > 0:
             rule_score += 5
         rule_score = max(0, min(100, int(rule_score)))
+
+        # ---- 分析字段 ----
+        # 趋势
+        trend_desc = "多头" if ma20 > ma60 else "空头"
+        # 动量
+        if momentum > 0.03:
+            momentum_desc = "强"
+        elif momentum > 0.01:
+            momentum_desc = "中等"
+        else:
+            momentum_desc = "弱"
+        # 量能
+        volume_ratio = volume / avg_volume if avg_volume != 0 else 1
+        if volume_ratio > 2.0:
+            volume_desc = "放量"
+        elif volume_ratio > 1.5:
+            volume_desc = "温和放量"
+        elif volume_ratio < 0.5:
+            volume_desc = "缩量"
+        else:
+            volume_desc = "正常"
+        # 波动率
+        returns = np.diff(df['close'].values[-20:]) / df['close'].values[-21:-1]
+        vol = np.std(returns)
+        if vol > 0.03:
+            vol_desc = "高"
+        elif vol > 0.01:
+            vol_desc = "中"
+        else:
+            vol_desc = "低"
+        # 位置
+        high_20 = np.max(df['close'].values[-20:])
+        low_20 = np.min(df['close'].values[-20:])
+        if high_20 > low_20:
+            pos = (df['close'].iloc[-1] - low_20) / (high_20 - low_20)
+        else:
+            pos = 0.5
+        if pos > 0.8:
+            pos_desc = "高位（接近压力）"
+        elif pos < 0.2:
+            pos_desc = "低位（接近支撑）"
+        else:
+            pos_desc = "中等"
+
+        analysis = {
+            'trend': trend_desc,
+            'momentum': momentum_desc,
+            'volume': volume_desc,
+            'volatility': vol_desc,
+            'position': pos,
+            'position_desc': pos_desc
+        }
     
+    # ---- 机器学习评分 ----
     ml_score = 50
     ml_confidence = 0
     feature_importance = {}
@@ -694,14 +766,23 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
     
     ml_weight = config.get("ml_weight", 0.4) if ai_model.is_trained else 0
     combined_score = rule_score * (1 - ml_weight) + ml_score * ml_weight
+    # 上涨概率：当模型已训练时，使用ML模型的预测概率（即ml_score/100），否则使用综合评分/100
+    up_prob = ml_score / 100 if ai_model.is_trained else combined_score / 100
+    up_prob = max(0, min(1, up_prob))  # 限制在0-1
+
     factors = {
-        'rule_score': rule_score, 'ml_score': ml_score, 'ml_confidence': ml_confidence,
-        'combined_score': combined_score, 'feature_importance': feature_importance
+        'rule_score': rule_score,
+        'ml_score': ml_score,
+        'ml_confidence': ml_confidence,
+        'combined_score': combined_score,
+        'feature_importance': feature_importance,
+        'up_prob': up_prob,
+        'analysis': analysis
     }
     return int(combined_score), factors, features
 
 # =========================
-# 日志管理（修正标签逻辑）
+# 日志管理（基于未来收益）
 # =========================
 def load_log():
     try:
@@ -715,41 +796,29 @@ def save_log(log):
         json.dump(log, f, indent=4)
 
 def verify_past_signals(config):
-    """
-    验证历史信号：计算信号发出后未来5根K线的最大涨幅/跌幅，
-    若买入信号最大涨幅 > PROFIT_THRESHOLD 则为正确，
-    若卖出信号最大跌幅 > PROFIT_THRESHOLD 则为正确。
-    """
     log = load_log()
     updated = False
-    now = time.time()
     for entry in log:
         if not entry.get("verified", False):
             coin = entry["coin"]
             signal_time = entry["timestamp"]
-            # 获取信号时间之后5分钟开始的K线（即未来5根）
-            # 需要获取从信号时间开始往后的K线数据，但Gate.io接口通常按时间倒序，需要按时间范围查询
-            # 简化：获取最近10根K线，然后筛选时间大于信号时间的K线，取前5根
             try:
-                df = get_kline(coin, interval="5m", limit=10)  # 获取最近10根
-                # 将时间戳从毫秒转为秒
+                # 获取信号时间之后的5根K线
+                df = get_kline(coin, interval="5m", limit=10)
                 df['ts_sec'] = df['ts'] / 1000
-                # 筛选时间大于信号时间的K线
                 future_df = df[df['ts_sec'] > signal_time].sort_values('ts_sec')
                 if len(future_df) >= 5:
-                    # 买入信号：看未来5根K线的最高价
                     if entry["signal"] == "买入":
                         max_price = future_df['high'].iloc[:5].max()
                         profit = (max_price - entry["price"]) / entry["price"]
                         correct = profit > PROFIT_THRESHOLD
                     elif entry["signal"] == "卖出":
                         min_price = future_df['low'].iloc[:5].min()
-                        profit = (entry["price"] - min_price) / entry["price"]  # 跌幅为正表示下跌
+                        profit = (entry["price"] - min_price) / entry["price"]
                         correct = profit > PROFIT_THRESHOLD
                     else:
                         correct = False
                 else:
-                    # 数据不足，暂不验证
                     continue
                 entry["verified"] = True
                 entry["result"] = "correct" if correct else "wrong"
@@ -866,11 +935,6 @@ def send_backtest_report(config):
 # 新增：交易过滤函数
 # =========================
 def check_buy_filters(coin, df, memory):
-    """
-    买入前检查：BTC趋势、成交量、波动率
-    返回 (是否通过, 失败原因)
-    """
-    # 1. BTC趋势检查
     try:
         df_btc = get_kline("BTC-USDT", interval="5m", limit=60)
         btc_ma20 = df_btc['close'].rolling(20).mean().iloc[-1]
@@ -880,13 +944,11 @@ def check_buy_filters(coin, df, memory):
     except:
         return False, "BTC数据获取失败"
 
-    # 2. 成交量检查
     volume = df['volume'].iloc[-1]
     avg_volume = df['volume'].mean()
     if volume < avg_volume * VOLUME_RATIO_MIN:
         return False, f"成交量不足 (当前{volume:.0f}, 需>{avg_volume*VOLUME_RATIO_MIN:.0f})"
 
-    # 3. 波动率检查
     close = df['close'].values
     returns = np.diff(close[-20:]) / close[-21:-1]
     volatility = np.std(returns)
@@ -894,6 +956,41 @@ def check_buy_filters(coin, df, memory):
         return False, f"波动率过低 ({volatility:.4f} < {VOLATILITY_MIN})"
 
     return True, "通过"
+
+# =========================
+# 新增：生成风险提示
+# =========================
+def generate_risk_analysis(analysis, factors, config):
+    risks = []
+    risk_level = "低"
+
+    # 波动风险
+    if analysis['volatility'] == "高":
+        risks.append("波动过大")
+    # 成交量风险
+    if factors.get('volume_ratio', 0) < 1.5:
+        risks.append("成交量不足")
+    # 大盘风险（从BTC趋势判断）
+    try:
+        df_btc = get_kline("BTC-USDT", interval="5m", limit=60)
+        btc_ma20 = df_btc['close'].rolling(20).mean().iloc[-1]
+        btc_ma60 = df_btc['close'].rolling(60).mean().iloc[-1]
+        if btc_ma20 < btc_ma60:
+            risks.append("大盘走弱")
+    except:
+        pass
+    # 位置风险
+    if analysis['position'] > 0.8:
+        risks.append("接近压力位")
+    elif analysis['position'] < 0.2:
+        risks.append("接近支撑位（超卖）")
+    # 根据风险数量评定等级
+    if len(risks) >= 3:
+        risk_level = "高"
+    elif len(risks) >= 1:
+        risk_level = "中"
+
+    return risk_level, risks
 
 # =========================
 # 主程序
@@ -905,7 +1002,7 @@ def main():
     config = load_config()
     print("=" * 50)
     start_time = time.time()
-    print("AI自主学习交易系统启动 (Gate.io 优化版)")
+    print("AI自主学习交易系统启动 (Gate.io 决策辅助版)")
     print(f"模型状态: {'已训练' if ai_model.is_trained else '未训练'}")
     print(f"使用ML: {config.get('use_ml_model', True)}")
     print("=" * 50)
@@ -966,63 +1063,80 @@ def main():
                     df = get_kline(coin, interval="5m", limit=300)
                     whale = detect_whale(coin)
                     score, factors, features = calculate_score(df, memory, whale, current_market_cycle, coin, config)
+                    analysis = factors['analysis']
 
+                    # 基础信号判断（用于记录和训练）
                     if score >= config["buy_threshold"]:
-                        signal = "买入"
+                        base_signal = "买入"
                     elif score <= config["sell_threshold"]:
-                        signal = "卖出"
+                        base_signal = "卖出"
                     else:
-                        signal = "中性"
+                        base_signal = "中性"
 
-                    # ----- 信号冷却检查 -----
-                    if signal in ("买入", "卖出"):
+                    # 多档信号（用于消息展示）
+                    if score >= SIGNAL_STRONG_BUY:
+                        display_signal = "强看多"
+                    elif score >= SIGNAL_BUY:
+                        display_signal = "偏多"
+                    elif score <= SIGNAL_STRONG_SELL:
+                        display_signal = "强看空"
+                    elif score <= SIGNAL_SELL:
+                        display_signal = "偏空"
+                    else:
+                        display_signal = "震荡"
+
+                    # 信号冷却检查（仅对买入/卖出基础信号）
+                    if base_signal in ("买入", "卖出"):
                         last_time = last_signal_time.get(coin, 0)
                         if now - last_time < SIGNAL_COOLDOWN:
-                            print(f"{coin} 信号 {signal} 冷却中，跳过")
+                            print(f"{coin} 信号 {base_signal} 冷却中，跳过")
                             continue
                         last_signal_time[coin] = now
 
-                    # ----- 买入信号过滤（只对买入做严格过滤，卖出可考虑类似但暂不强制）-----
+                    # 买入过滤（只对买入信号）
                     filter_passed = True
                     filter_reason = ""
-                    if signal == "买入":
+                    if base_signal == "买入":
                         filter_passed, filter_reason = check_buy_filters(coin, df, memory)
 
-                    # ----- 如果通过过滤，才记录和发送信号 -----
-                    if signal in ("买入", "卖出") and filter_passed:
+                    # 如果通过过滤且为基础买入/卖出，则记录日志
+                    if base_signal in ("买入", "卖出") and filter_passed:
                         price = df["close"].iloc[-1]
-                        log_signal(coin, signal, score, price, whale, current_market_cycle, factors, features)
+                        log_signal(coin, base_signal, score, price, whale, current_market_cycle, factors, features)
 
-                        ticker_price = get_ticker(coin)
-                        display_price = ticker_price if ticker_price is not None else price
+                    # 获取实时价格用于显示
+                    ticker_price = get_ticker(coin)
+                    display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
 
-                        # 构造详细信号消息
-                        emoji = "🟢" if signal == "买入" else "🔴"
-                        action = signal
-                        advice = "评分超过买入阈值，可考虑建仓。" if signal == "买入" else "评分低于卖出阈值，可考虑减仓。"
-                        feat_str = ""
-                        if factors.get('feature_importance'):
-                            top_feat = sorted(factors['feature_importance'].items(), key=lambda x: abs(x[1]), reverse=True)[:3]
-                            feat_str = "\n重要特征: " + ", ".join([f"{f[:10]}:{v:.2f}" for f, v in top_feat])
+                    # 生成风险分析
+                    risk_level, risks = generate_risk_analysis(analysis, factors, config)
+                    risk_points = "、".join(risks) if risks else "无明显风险"
 
-                        # 加入止损止盈建议
-                        risk_advice = "\n建议止损: -1% | 建议止盈: +2%"
+                    # 上涨概率
+                    up_prob = factors['up_prob'] * 100
 
-                        msg = (f"{emoji*3} {action}信号 {emoji*3}\n"
-                               f"币种：{coin}\n"
+                    # 构造详细消息（只要基础信号是买入/卖出，或者多档信号为非中性，我们都发消息？可以调整为只要有分析价值就发，但为避免消息过频，可以设定只要基础信号非中性就发，或者只要多档信号非震荡就发。这里我们选择：只要基础信号为买入/卖出，并且通过了过滤，就发送；同时，如果基础信号中性但多档信号非中性，也发送？但可能过于频繁。我们简单处理：仅当基础信号为买入/卖出且通过过滤时发送。）
+                    if base_signal in ("买入", "卖出") and filter_passed:
+                        emoji = "🟢" if base_signal == "买入" else "🔴"
+                        advice = "评分超过买入阈值，可考虑建仓。" if base_signal == "买入" else "评分低于卖出阈值，可考虑减仓。"
+
+                        msg = (f"📊 {coin} 分析\n\n"
+                               f"上涨概率：{up_prob:.1f}%\n\n"
+                               f"趋势：{analysis['trend']}\n"
+                               f"动量：{analysis['momentum']}\n"
+                               f"成交量：{analysis['volume']}\n"
+                               f"波动：{analysis['volatility']}\n\n"
+                               f"位置：{analysis['position_desc']}\n\n"
+                               f"风险等级：{risk_level}\n"
+                               f"风险点：{risk_points}\n\n"
+                               f"建议：{advice}\n"
                                f"价格：${display_price:.4f}\n"
-                               f"综合评分：{score} ({'买入' if signal=='买入' else '卖出'}阈值 {config['buy_threshold'] if signal=='买入' else config['sell_threshold']})\n"
-                               f"规则评分：{factors['rule_score']} | ML评分：{factors['ml_score']:.1f}")
-                        if factors.get('ml_confidence', 0) > 0:
-                            msg += f" (置信度 {factors['ml_confidence']:.2f})"
-                        msg += f"\n市场周期：{current_market_cycle}\n"
-                        msg += f"建议：{advice}{feat_str}{risk_advice}\n"
-                        msg += f"时间：{datetime.now()}"
-                        send_notification(msg, config, f"{action}信号 {coin}")
+                               f"时间：{datetime.now()}")
+                        send_notification(msg, config, f"{coin} 分析")
 
-                        print(f"{coin} {signal} {score} (规则:{factors['rule_score']} ML:{factors['ml_score']:.1f}) {current_market_cycle} (显示价:{display_price})")
+                        print(f"{coin} {display_signal} {score:.1f} (上涨概率{up_prob:.1f}%) {current_market_cycle} 价格:{display_price}")
 
-                    elif signal == "买入" and not filter_passed:
+                    elif base_signal == "买入" and not filter_passed:
                         print(f"{coin} 买入信号被过滤: {filter_reason}")
 
                 except Exception as e:
@@ -1087,16 +1201,12 @@ def main():
                         try:
                             df = get_kline(coin, interval="5m", limit=300)
                             whale = detect_whale(coin)
-                            score, _, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
+                            score, factors, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
+                            analysis = factors['analysis']
+                            up_prob = factors['up_prob'] * 100
                             ticker_price = get_ticker(coin)
                             display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
-                            if score >= config["buy_threshold"]:
-                                icon = "🟢 买入"
-                            elif score <= config["sell_threshold"]:
-                                icon = "🔴 卖出"
-                            else:
-                                icon = "⚪ 中性"
-                            coin_lines.append(f"{coin}: ${display_price:.4f} {score} {icon}")
+                            coin_lines.append(f"{coin}: ${display_price:.4f} {score:.1f} ({analysis['trend']})")
                         except:
                             coin_lines.append(f"{coin}: 获取失败")
                     
