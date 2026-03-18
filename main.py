@@ -1060,6 +1060,7 @@ def main():
                     score, factors, features = calculate_score(df, memory, whale, current_market_cycle, coin, config)
                     analysis = factors['analysis']
 
+                    # 基础信号判断（用于记录）
                     if score >= config["buy_threshold"]:
                         base_signal = "买入"
                     elif score <= config["sell_threshold"]:
@@ -1067,6 +1068,7 @@ def main():
                     else:
                         base_signal = "中性"
 
+                    # 多档信号（用于显示）
                     if score >= SIGNAL_STRONG_BUY:
                         display_signal = "强看多"
                     elif score >= SIGNAL_BUY:
@@ -1078,29 +1080,36 @@ def main():
                     else:
                         display_signal = "震荡"
 
+                    # ---- 关键修改：先记录信号，再检查过滤 ----
                     if base_signal in ("买入", "卖出"):
+                        # 信号冷却检查（防止短时间内重复记录同一币种）
                         last_time = last_signal_time.get(coin, 0)
                         if now - last_time < SIGNAL_COOLDOWN:
-                            print(f"{coin} 信号 {base_signal} 冷却中，跳过")
+                            print(f"{coin} 信号 {base_signal} 冷却中，跳过记录")
                             continue
                         last_signal_time[coin] = now
 
+                        # 记录信号到日志（无论是否通过过滤，都要记录以积累训练样本）
+                        price = df["close"].iloc[-1]
+                        log_signal(coin, base_signal, score, price, whale, current_market_cycle, factors, features)
+                        print(f"📝 记录信号: {coin} {base_signal} 评分{score}")
+
+                    # ---- 过滤检查（仅对买入） ----
                     filter_passed = True
                     filter_reason = ""
                     if base_signal == "买入":
                         filter_passed, filter_reason = check_buy_filters(coin, df, memory)
 
-                    if base_signal in ("买入", "卖出") and filter_passed:
-                        price = df["close"].iloc[-1]
-                        log_signal(coin, base_signal, score, price, whale, current_market_cycle, factors, features)
-
+                    # 获取实时价格用于显示
                     ticker_price = get_ticker(coin)
                     display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
 
+                    # 生成风险分析
                     risk_level, risks = generate_risk_analysis(analysis, factors, config)
                     risk_points = "、".join(risks) if risks else "无明显风险"
                     up_prob = factors['up_prob'] * 100
 
+                    # ---- 只有当通过过滤时才发送通知 ----
                     if base_signal in ("买入", "卖出") and filter_passed:
                         emoji = "🟢" if base_signal == "买入" else "🔴"
                         advice = "评分超过买入阈值，可考虑建仓。" if base_signal == "买入" else "评分低于卖出阈值，可考虑减仓。"
@@ -1122,7 +1131,7 @@ def main():
                         print(f"{coin} {display_signal} {score:.1f} (上涨概率{up_prob:.1f}%) {current_market_cycle} 价格:{display_price}")
 
                     elif base_signal == "买入" and not filter_passed:
-                        print(f"{coin} 买入信号被过滤: {filter_reason}")
+                        print(f"{coin} 买入信号被过滤，但已记录日志: {filter_reason}")
 
                 except Exception as e:
                     print(f"处理{coin}时出错: {e}")
