@@ -7,8 +7,8 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
+import shutil  # ← 新增：用于原子替换文件
 from datetime import datetime, timedelta
-import pickle
 import warnings
 warnings.filterwarnings('ignore')
 from functools import wraps
@@ -48,7 +48,6 @@ except ImportError:
 # 配置常量
 # =========================
 CONFIG_FILE = "config.json"
-
 MEMORY_FILE = "ai_memory.json"
 LOG_FILE = "prediction_log.json"
 MODEL_FILE = "ai_model.pkl"
@@ -75,6 +74,43 @@ MAX_DYNAMIC_COINS = 3
 MIN_TRAIN_SAMPLES = 50
 SCORE_CHANGE_THRESHOLD = 10
 
+# =====================================================
+# 🔧 修复一：有限容量 LRU 缓存，防止内存无限增长
+# =====================================================
+def cache(ttl_seconds=60, max_size=256):
+    """
+    带最大容量限制的 TTL 缓存装饰器。
+    当缓存条目超过 max_size 时，自动清理最旧的条目。
+    """
+    def decorator(func):
+        cache_store = {}  # key -> {'value': ..., 'timestamp': ...}
+        lock = threading.Lock()
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            key = str(args) + str(kwargs)
+            now = time.time()
+            with lock:
+                entry = cache_store.get(key)
+                if entry and now - entry['timestamp'] < ttl_seconds:
+                    return entry['value']
+
+            result = func(*args, **kwargs)
+
+            with lock:
+                cache_store[key] = {'value': result, 'timestamp': now}
+
+                # 超出最大容量时，删除最旧的条目（类 LRU）
+                if len(cache_store) > max_size:
+                    oldest_key = min(
+                        cache_store, key=lambda k: cache_store[k]['timestamp']
+                    )
+                    del cache_store[oldest_key]
+
+            return result
+        return wrapper
+    return decorator
+
 # Gate.io 配置
 GATEIO_BASE_URL = "https://api.gateio.ws/api/v4"
 
@@ -88,27 +124,6 @@ SIGNAL_STRONG_BUY = 75
 SIGNAL_BUY = 60
 SIGNAL_STRONG_SELL = 25
 SIGNAL_SELL = 40
-
-# =========================
-# 缓存装饰器
-# =========================
-def cache(ttl_seconds=60):
-    cache_store = {}
-    lock = threading.Lock()
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            key = str(args) + str(kwargs)
-            now = time.time()
-            with lock:
-                if key in cache_store and now - cache_store[key]['timestamp'] < ttl_seconds:
-                    return cache_store[key]['value']
-            result = func(*args, **kwargs)
-            with lock:
-                cache_store[key] = {'value': result, 'timestamp': now}
-            return result
-        return wrapper
-    return decorator
 
 # =========================
 # 全局状态变量
@@ -134,7 +149,7 @@ def format_gateio_symbol(inst):
 # =========================
 # 安全请求（带缓存）
 # =========================
-@cache(ttl_seconds=2)
+@cache(ttl_seconds=2, max_size=64)
 def safe_request(url, params=None, max_retries=3):
     for i in range(max_retries):
         try:
@@ -153,7 +168,7 @@ def safe_request(url, params=None, max_retries=3):
 # =========================
 # Gate.io 数据获取函数
 # =========================
-@cache(ttl_seconds=5)
+@cache(ttl_seconds=5, max_size=32)
 def get_ticker(inst):
     symbol = format_gateio_symbol(inst)
     url = f"{GATEIO_BASE_URL}/spot/tickers"
@@ -163,7 +178,7 @@ def get_ticker(inst):
         return float(data[0]['last'])
     return None
 
-@cache(ttl_seconds=30)
+@cache(ttl_seconds=30, max_size=64)
 def get_kline(inst, interval="5m", limit=300):
     symbol = format_gateio_symbol(inst)
     url = f"{GATEIO_BASE_URL}/spot/candlesticks"
@@ -183,7 +198,7 @@ def get_kline(inst, interval="5m", limit=300):
     df["ts"] = df["ts"] * 1000
     return df
 
-@cache(ttl_seconds=60)
+@cache(ttl_seconds=60, max_size=8)
 def scan_hot_coins(limit=20):
     url = f"{GATEIO_BASE_URL}/spot/tickers"
     data = safe_request(url)
@@ -196,7 +211,6 @@ def scan_hot_coins(limit=20):
     for item in usdt_pairs[:limit]:
         symbol = item["currency_pair"]
         change = float(item["change_percentage"])
-        volume = float(item["quote_volume"])
         formatted = symbol.replace("_", "-")
         hot.append((formatted, change))
     return hot
@@ -210,7 +224,7 @@ def detect_whale(inst):
 # =========================
 # 市场情绪指标
 # =========================
-@cache(ttl_seconds=300)
+@cache(ttl_seconds=300, max_size=4)
 def get_market_sentiment():
     url = f"{GATEIO_BASE_URL}/spot/tickers"
     data = safe_request(url)
@@ -233,7 +247,7 @@ def get_market_sentiment():
 # =========================
 # 资金费率（仅主流币）
 # =========================
-@cache(ttl_seconds=3600)
+@cache(ttl_seconds=3600, max_size=16)
 def get_funding_rate(inst):
     WHITELIST = {"BTC", "ETH", "OKB", "BNB", "SOL", "XRP", "ADA", "DOGE", "DOT", "LINK"}
     base = inst.split("-")[0].upper()
@@ -251,49 +265,48 @@ def get_funding_rate(inst):
 # =========================
 class AITradingModel:
     def __init__(self):
-        self.models = {}
+        self.model = None
         self.scaler = StandardScaler()
         self.feature_importance = {}
         self.training_history = []
         self.label_encoder = LabelEncoder()
         self.is_trained = False
         self.feature_names = []
-        
+
     def extract_features(self, df, whale, market_cycle, coin_name):
         features = {}
         if len(df) < 100:
             return None
-            
+
         close = df['close'].values
         high = df['high'].values
         low = df['low'].values
         volume = df['volume'].values
-        
-        # ---- 1. 5分钟技术指标 ----
+
         for period in [5, 10, 20, 30, 50, 60, 100]:
             if len(df) >= period:
                 ma = df['close'].rolling(period).mean().iloc[-1]
                 features[f'ma_{period}'] = ma
                 features[f'price_ma_{period}_ratio'] = close[-1] / ma if ma != 0 else 1
-        
+
         for period in [5, 10, 20, 30]:
             if len(df) >= period:
                 momentum = (close[-1] - close[-period]) / close[-period]
                 features[f'momentum_{period}'] = momentum
-        
+
         for period in [10, 20, 30]:
             if len(df) >= period:
                 returns = np.diff(close[-period:]) / close[-period:-1]
                 features[f'volatility_{period}'] = np.std(returns)
-        
+
         volume_ma = pd.Series(volume).rolling(20).mean().iloc[-1]
         features['volume_ratio'] = volume[-1] / volume_ma if volume_ma != 0 else 1
         features['volume_trend'] = (volume[-1] - volume[-5]) / volume[-5] if volume[-5] != 0 else 0
-        
+
         high_20 = np.max(close[-20:])
         low_20 = np.min(close[-20:])
         features['price_position_20'] = (close[-1] - low_20) / (high_20 - low_20) if high_20 > low_20 else 0.5
-        
+
         delta = np.diff(close)
         gain = np.where(delta > 0, delta, 0)
         loss = np.where(delta < 0, -delta, 0)
@@ -304,7 +317,7 @@ class AITradingModel:
             features['rsi'] = 100 - (100 / (1 + rs))
         else:
             features['rsi'] = 50
-            
+
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         macd = exp1 - exp2
@@ -312,19 +325,18 @@ class AITradingModel:
         features['macd'] = macd.iloc[-1]
         features['macd_signal'] = signal.iloc[-1]
         features['macd_histogram'] = macd.iloc[-1] - signal.iloc[-1]
-        
+
         sma = df['close'].rolling(20).mean()
         std = df['close'].rolling(20).std()
         bb_upper = sma + (std * 2)
         bb_lower = sma - (std * 2)
         features['bb_position'] = (close[-1] - bb_lower.iloc[-1]) / (bb_upper.iloc[-1] - bb_lower.iloc[-1]) if bb_upper.iloc[-1] > bb_lower.iloc[-1] else 0.5
-        
+
         features['whale_value'] = whale / 10000
         features['market_cycle'] = 2 if market_cycle == "牛市" else (1 if market_cycle == "震荡" else 0)
         coin_hash = abs(hash(coin_name)) % 100 / 100
         features['coin_id'] = coin_hash
-        
-        # ---- 2. 1小时周期特征 ----
+
         try:
             df_h1 = get_kline(coin_name, interval="1h", limit=100)
             if df_h1 is not None and len(df_h1) >= 60:
@@ -333,10 +345,9 @@ class AITradingModel:
                 features['h1_price_ma20_ratio'] = close[-1] / ma20_h1 if ma20_h1 != 0 else 1
                 momentum_h1 = (df_h1['close'].iloc[-1] - df_h1['close'].iloc[-10]) / df_h1['close'].iloc[-10]
                 features['h1_momentum_10'] = momentum_h1
-        except Exception as e:
+        except Exception:
             pass
-        
-        # ---- 3. 大盘（BTC）特征 ----
+
         global btc_features_cache
         now = time.time()
         if now - btc_features_cache['timestamp'] > 60:
@@ -351,29 +362,26 @@ class AITradingModel:
                     btc_feat['btc_momentum_10'] = momentum_btc
                     btc_features_cache['features'] = btc_feat
                     btc_features_cache['timestamp'] = now
-            except Exception as e:
+            except Exception:
                 pass
         if btc_features_cache['features']:
             features.update(btc_features_cache['features'])
-        
-        # ---- 4. 时间特征 ----
+
         dt = datetime.now()
         features['hour'] = dt.hour
         features['weekday'] = dt.weekday()
         features['is_weekend'] = 1 if dt.weekday() >= 5 else 0
-        
-        # ---- 5. 市场情绪指标 ----
+
         sentiment = get_market_sentiment()
         if sentiment:
             features.update(sentiment)
-        
-        # ---- 6. 资金费率 ----
+
         funding = get_funding_rate(coin_name)
         if funding is not None:
             features['funding_rate'] = funding
-        
+
         return features
-    
+
     def prepare_training_data(self, logs):
         X_list = []
         y_list = []
@@ -389,13 +397,12 @@ class AITradingModel:
         X_df = pd.DataFrame(X_list)
         self.feature_names = X_df.columns.tolist()
         return X_df, np.array(y_list)
-    
+
     def train(self, X, y):
         if X is None or len(X) < MIN_TRAIN_SAMPLES:
             print(f"训练样本不足: {len(X) if X is not None else 0}/{MIN_TRAIN_SAMPLES}")
             return False
 
-        # ---------- 清洗 NaN 数据 ----------
         if isinstance(X, pd.DataFrame):
             original_len = len(X)
             valid_idx = X.dropna().index
@@ -406,7 +413,6 @@ class AITradingModel:
             if len(X) < MIN_TRAIN_SAMPLES:
                 print(f"清洗后样本不足 {MIN_TRAIN_SAMPLES}，无法训练")
                 return False
-        # -----------------------------------
 
         X_scaled = self.scaler.fit_transform(X)
 
@@ -465,20 +471,17 @@ class AITradingModel:
             print(f"Top 5重要特征: {top5}")
 
         return True
-    
+
     def predict(self, features):
         if not self.is_trained or self.model is None:
             return 50, {}
         feature_vector = []
         for name in self.feature_names:
-            if name in features:
-                feature_vector.append(features[name])
-            else:
-                feature_vector.append(0)
+            feature_vector.append(features.get(name, 0))
         feature_scaled = self.scaler.transform([feature_vector])
         proba = self.model.predict_proba(feature_scaled)[0]
         score = proba[1] * 100 if len(proba) == 2 else 50
-        confidence = np.max(proba)
+        confidence = float(np.max(proba))
         contribution = {}
         if hasattr(self.model, 'estimators_') and len(self.model.estimators_) > 0:
             first_est = self.model.estimators_[0]
@@ -486,34 +489,100 @@ class AITradingModel:
                 for i, name in enumerate(self.feature_names):
                     contribution[name] = first_est.feature_importances_[i] * feature_scaled[0][i]
         return score, {'confidence': confidence, 'contribution': contribution}
-    
+
+    # =====================================================
+    # 🔧 修复二：原子化保存，防止写到一半进程崩溃导致文件损坏
+    # =====================================================
     def save(self):
-        if self.model:
-            joblib.dump(self.model, MODEL_PATH)
-            joblib.dump(self.scaler, SCALER_PATH)
-            with open(FEATURES_PATH, 'w') as f:
+        """
+        使用"先写临时文件，再原子替换"的策略，确保文件完整性。
+        即使进程在写入过程中崩溃，旧文件也不会被损坏。
+        """
+        if not self.model:
+            print("⚠️ 模型为空，跳过保存")
+            return False
+
+        tmp_model   = MODEL_PATH   + ".tmp"
+        tmp_scaler  = SCALER_PATH  + ".tmp"
+        tmp_features = FEATURES_PATH + ".tmp"
+
+        try:
+            # Step 1: 写入临时文件
+            joblib.dump(self.model, tmp_model)
+            joblib.dump(self.scaler, tmp_scaler)
+            with open(tmp_features, 'w', encoding='utf-8') as f:
                 json.dump({
                     'feature_names': self.feature_names,
                     'training_history': self.training_history,
                     'feature_importance': self.feature_importance
                 }, f, indent=4)
-    
-    def load(self):
-        try:
-            self.model = joblib.load(MODEL_PATH)
-            self.scaler = joblib.load(SCALER_PATH)
-            with open(FEATURES_PATH, 'r') as f:
-                data = json.load(f)
-                self.feature_names = data['feature_names']
-                self.training_history = data['training_history']
-                self.feature_importance = data['feature_importance']
-            self.is_trained = True
-            print("模型加载成功")
+
+            # Step 2: 原子替换（所有文件都写完后再替换）
+            shutil.move(tmp_model,    MODEL_PATH)
+            shutil.move(tmp_scaler,   SCALER_PATH)
+            shutil.move(tmp_features, FEATURES_PATH)
+
+            print(f"✅ 模型原子保存成功: {MODEL_PATH}")
             return True
-        except:
-            print("未找到已训练模型")
+
+        except Exception as e:
+            print(f"❌ 模型保存失败: {e}")
+            # 清理可能存在的临时文件
+            for tmp in [tmp_model, tmp_scaler, tmp_features]:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
             return False
 
+    # =====================================================
+    # 🔧 修复三：加载时打印详细错误，便于排查
+    # =====================================================
+    def load(self):
+        """
+        逐步加载模型文件，明确报告哪个文件加载失败。
+        """
+        # 检查所有文件是否存在
+        missing = [p for p in [MODEL_PATH, SCALER_PATH, FEATURES_PATH] if not os.path.exists(p)]
+        if missing:
+            print(f"⚠️ 模型文件缺失: {missing}")
+            return False
+
+        try:
+            self.model = joblib.load(MODEL_PATH)
+            print(f"  ✔ 加载 {MODEL_PATH} 成功")
+        except Exception as e:
+            print(f"  ✘ 加载 {MODEL_PATH} 失败: {e}")
+            return False
+
+        try:
+            self.scaler = joblib.load(SCALER_PATH)
+            print(f"  ✔ 加载 {SCALER_PATH} 成功")
+        except Exception as e:
+            print(f"  ✘ 加载 {SCALER_PATH} 失败: {e}")
+            return False
+
+        try:
+            with open(FEATURES_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.feature_names    = data.get('feature_names', [])
+            self.training_history = data.get('training_history', [])
+            self.feature_importance = data.get('feature_importance', {})
+            print(f"  ✔ 加载 {FEATURES_PATH} 成功")
+        except Exception as e:
+            print(f"  ✘ 加载 {FEATURES_PATH} 失败: {e}")
+            return False
+
+        self.is_trained = True
+        last_session = self.training_history[-1] if self.training_history else {}
+        print(f"✅ 模型加载成功 | 样本: {last_session.get('samples', '?')} | "
+              f"准确率: {last_session.get('accuracy', 0):.4f} | "
+              f"特征数: {len(self.feature_names)}")
+        return True
+
+
+# 模块级单例，启动时尝试加载
 ai_model = AITradingModel()
 ai_model.load()
 
@@ -559,13 +628,18 @@ def load_memory():
             if key not in memory:
                 memory[key] = default_memory[key]
         return memory
-    except:
+    except Exception:
         save_memory(default_memory)
         return default_memory
 
 def save_memory(memory):
-    with open(MEMORY_PATH, "w") as f:
-        json.dump(memory, f, indent=4)
+    tmp_path = MEMORY_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding='utf-8') as f:
+            json.dump(memory, f, indent=4)
+        shutil.move(tmp_path, MEMORY_PATH)
+    except Exception as e:
+        print(f"⚠️ save_memory 失败: {e}")
 
 # =========================
 # 通知功能
@@ -672,22 +746,14 @@ def apply_cycle_strategy_adjustment(memory, cycle):
     return memory
 
 def calculate_score(df, memory, whale, market_cycle, coin, config):
-    """
-    增强版评分，返回评分、因子字典和分析字典
-    """
     df = df.dropna().copy()
     if len(df) < 60:
         rule_score = 50
         analysis = {
-            'trend': '未知',
-            'momentum': '未知',
-            'volume': '未知',
-            'volatility': '未知',
-            'position': 0.5,
-            'position_desc': '中等'
+            'trend': '未知', 'momentum': '未知', 'volume': '未知',
+            'volatility': '未知', 'position': 0.5, 'position_desc': '中等'
         }
     else:
-        # ---- 规则评分 ----
         df["ma20"] = df["close"].rolling(20).mean()
         df["ma60"] = df["close"].rolling(60).mean()
         ma20 = df["ma20"].iloc[-1]
@@ -706,17 +772,13 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
             rule_score += 5
         rule_score = max(0, min(100, int(rule_score)))
 
-        # ---- 分析字段 ----
-        # 趋势
         trend_desc = "多头" if ma20 > ma60 else "空头"
-        # 动量
         if momentum > 0.03:
             momentum_desc = "强"
         elif momentum > 0.01:
             momentum_desc = "中等"
         else:
             momentum_desc = "弱"
-        # 量能
         volume_ratio = volume / avg_volume if avg_volume != 0 else 1
         if volume_ratio > 2.0:
             volume_desc = "放量"
@@ -726,7 +788,6 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
             volume_desc = "缩量"
         else:
             volume_desc = "正常"
-        # 波动率（修复部分）
         close_vals = df['close'].values
         if len(close_vals) >= 21:
             close_slice = close_vals[-21:]
@@ -740,7 +801,6 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
             vol_desc = "中"
         else:
             vol_desc = "低"
-        # 位置
         high_20 = np.max(close_vals[-20:])
         low_20 = np.min(close_vals[-20:])
         if high_20 > low_20:
@@ -755,15 +815,11 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
             pos_desc = "中等"
 
         analysis = {
-            'trend': trend_desc,
-            'momentum': momentum_desc,
-            'volume': volume_desc,
-            'volatility': vol_desc,
-            'position': pos,
-            'position_desc': pos_desc
+            'trend': trend_desc, 'momentum': momentum_desc,
+            'volume': volume_desc, 'volatility': vol_desc,
+            'position': pos, 'position_desc': pos_desc
         }
-    
-    # ---- 机器学习评分 ----
+
     ml_score = 50
     ml_confidence = 0
     feature_importance = {}
@@ -779,36 +835,38 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
             print(f"ML预测失败: {e}")
     else:
         features = ai_model.extract_features(df, whale, market_cycle, coin)
-    
+
     ml_weight = config.get("ml_weight", 0.4) if ai_model.is_trained else 0
     combined_score = rule_score * (1 - ml_weight) + ml_score * ml_weight
     up_prob = ml_score / 100 if ai_model.is_trained else combined_score / 100
     up_prob = max(0, min(1, up_prob))
 
     factors = {
-        'rule_score': rule_score,
-        'ml_score': ml_score,
-        'ml_confidence': ml_confidence,
-        'combined_score': combined_score,
+        'rule_score': rule_score, 'ml_score': ml_score,
+        'ml_confidence': ml_confidence, 'combined_score': combined_score,
         'feature_importance': feature_importance,
-        'up_prob': up_prob,
-        'analysis': analysis
+        'up_prob': up_prob, 'analysis': analysis
     }
     return int(combined_score), factors, features
 
 # =========================
-# 日志管理（基于未来收益）
+# 日志管理
 # =========================
 def load_log():
     try:
-        with open(LOG_PATH) as f:
+        with open(LOG_PATH, encoding='utf-8') as f:
             return json.load(f)
-    except:
+    except Exception:
         return []
 
 def save_log(log):
-    with open(LOG_PATH, "w") as f:
-        json.dump(log, f, indent=4)
+    tmp_path = LOG_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding='utf-8') as f:
+            json.dump(log, f, indent=4)
+        shutil.move(tmp_path, LOG_PATH)
+    except Exception as e:
+        print(f"⚠️ save_log 失败: {e}")
 
 def verify_past_signals(config):
     log = load_log()
@@ -864,10 +922,7 @@ def log_signal(coin, signal, score, price, whale, market_cycle, factors, feature
         unverified = [e for e in log if not e.get("verified", False)]
         verified = [e for e in log if e.get("verified", False)]
         keep = MAX_LOG_SIZE - len(unverified)
-        if keep > 0:
-            verified = verified[-keep:]
-        else:
-            verified = []
+        verified = verified[-keep:] if keep > 0 else []
         log = unverified + verified
     save_log(log)
 
@@ -887,7 +942,9 @@ def adaptive_strategy_optimization(config):
         return
     success = ai_model.train(X_df, y)
     if success:
-        ai_model.save()
+        save_ok = ai_model.save()
+        if not save_ok:
+            print("⚠️ 模型保存失败，但 is_trained 已为 True，本轮内存中可用")
         memory = load_memory()
         memory['feature_importance'] = ai_model.feature_importance
         memory['ml_weight'] = min(0.9, memory.get('ml_weight', 0.4) + 0.05)
@@ -955,7 +1012,7 @@ def check_buy_filters(coin, df, memory):
         btc_ma60 = df_btc['close'].rolling(60).mean().iloc[-1]
         if btc_ma20 < btc_ma60:
             return False, "BTC处于下跌趋势"
-    except:
+    except Exception:
         return False, "BTC数据获取失败"
 
     volume = df['volume'].iloc[-1]
@@ -977,7 +1034,6 @@ def check_buy_filters(coin, df, memory):
 def generate_risk_analysis(analysis, factors, config):
     risks = []
     risk_level = "低"
-
     if analysis['volatility'] == "高":
         risks.append("波动过大")
     if factors.get('volume_ratio', 0) < 1.5:
@@ -988,7 +1044,7 @@ def generate_risk_analysis(analysis, factors, config):
         btc_ma60 = df_btc['close'].rolling(60).mean().iloc[-1]
         if btc_ma20 < btc_ma60:
             risks.append("大盘走弱")
-    except:
+    except Exception:
         pass
     if analysis['position'] > 0.8:
         risks.append("接近压力位")
@@ -998,7 +1054,6 @@ def generate_risk_analysis(analysis, factors, config):
         risk_level = "高"
     elif len(risks) >= 1:
         risk_level = "中"
-
     return risk_level, risks
 
 # =========================
@@ -1073,7 +1128,6 @@ def main():
                     score, factors, features = calculate_score(df, memory, whale, current_market_cycle, coin, config)
                     analysis = factors['analysis']
 
-                    # 基础信号判断（用于记录）
                     if score >= config["buy_threshold"]:
                         base_signal = "买入"
                     elif score <= config["sell_threshold"]:
@@ -1081,7 +1135,6 @@ def main():
                     else:
                         base_signal = "中性"
 
-                    # 多档信号（用于显示）
                     if score >= SIGNAL_STRONG_BUY:
                         display_signal = "强看多"
                     elif score >= SIGNAL_BUY:
@@ -1093,7 +1146,6 @@ def main():
                     else:
                         display_signal = "震荡"
 
-                    # ---- 信号记录（只记录自定义币种） ----
                     if base_signal in ("买入", "卖出"):
                         last_time = last_signal_time.get(coin, 0)
                         if now - last_time < SIGNAL_COOLDOWN:
@@ -1102,33 +1154,26 @@ def main():
                         last_signal_time[coin] = now
 
                         price = df["close"].iloc[-1]
-                        # 只记录配置中的自定义币种（排除热门币）
                         if coin in config["coins"]:
                             log_signal(coin, base_signal, score, price, whale, current_market_cycle, factors, features)
                             print(f"📝 记录信号: {coin} {base_signal} 评分{score}")
                         else:
                             print(f"📝 热门币 {coin} 信号不记录训练日志")
 
-                    # ---- 过滤检查（仅对买入） ----
                     filter_passed = True
                     filter_reason = ""
                     if base_signal == "买入":
                         filter_passed, filter_reason = check_buy_filters(coin, df, memory)
 
-                    # 获取实时价格用于显示
                     ticker_price = get_ticker(coin)
                     display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
 
-                    # 生成风险分析
                     risk_level, risks = generate_risk_analysis(analysis, factors, config)
                     risk_points = "、".join(risks) if risks else "无明显风险"
                     up_prob = factors['up_prob'] * 100
 
-                    # ---- 只有当通过过滤时才发送通知（所有币种都发） ----
                     if base_signal in ("买入", "卖出") and filter_passed:
-                        emoji = "🟢" if base_signal == "买入" else "🔴"
                         advice = "评分超过买入阈值，可考虑建仓。" if base_signal == "买入" else "评分低于卖出阈值，可考虑减仓。"
-
                         msg = (f"📊 {coin} 分析\n\n"
                                f"上涨概率：{up_prob:.1f}%\n\n"
                                f"趋势：{analysis['trend']}\n"
@@ -1142,9 +1187,7 @@ def main():
                                f"价格：${display_price:.4f}\n"
                                f"时间：{datetime.now()}")
                         send_notification(msg, config, f"{coin} 分析")
-
                         print(f"{coin} {display_signal} {score:.1f} (上涨概率{up_prob:.1f}%) {current_market_cycle} 价格:{display_price}")
-
                     elif base_signal == "买入" and not filter_passed:
                         print(f"{coin} 买入信号被过滤，但已记录日志: {filter_reason}")
 
@@ -1169,21 +1212,14 @@ def main():
                         whale = detect_whale(coin)
                         score, _, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
                         current_scores[coin] = score
-                    except:
+                    except Exception:
                         current_scores[coin] = None
-                
-                need_push = False
-                if not last_scores:
-                    need_push = True
-                else:
-                    for coin, score in current_scores.items():
-                        if score is None:
-                            continue
-                        last_score = last_scores.get(coin)
-                        if last_score is None or abs(score - last_score) >= SCORE_CHANGE_THRESHOLD:
-                            need_push = True
-                            break
-                
+
+                need_push = not last_scores or any(
+                    last_scores.get(c) is None or (s is not None and abs(s - last_scores.get(c, 0)) >= SCORE_CHANGE_THRESHOLD)
+                    for c, s in current_scores.items()
+                )
+
                 recent_signals = get_recent_signals(1)
                 new_signal_line = ""
                 if recent_signals:
@@ -1196,15 +1232,20 @@ def main():
                             minutes_ago = int((now - latest_ts) / 60)
                             time_str = f"{minutes_ago}分钟前" if minutes_ago < 60 else f"{minutes_ago//60}小时前"
                             new_signal_line = f"🔥 新信号：{time_str} {latest['coin']} {latest['signal']} ({latest['score']})\n\n"
-                
+
                 if need_push or new_signal_line:
                     uptime = int(now - start_time)
-                    hours, minutes = uptime // 3600, (uptime % 3600) // 60
-                    if ai_model.is_trained:
-                        model_info = f"✅ 已训练 (准确率: {ai_model.training_history[-1]['accuracy']:.2%}, 样本: {ai_model.training_history[-1]['samples']})"
+                    hours_up, minutes_up = uptime // 3600, (uptime % 3600) // 60
+
+                    # ✅ 修复：model_info 在即将发送时读取，确保状态最新
+                    if ai_model.is_trained and ai_model.training_history:
+                        last_train = ai_model.training_history[-1]
+                        model_info = (f"✅ 已训练 "
+                                      f"(准确率: {last_train['accuracy']:.2%}, "
+                                      f"样本: {last_train['samples']})")
                     else:
                         model_info = "❌ 未训练"
-                    
+
                     coin_lines = []
                     for coin in coins:
                         try:
@@ -1212,13 +1253,12 @@ def main():
                             whale = detect_whale(coin)
                             score, factors, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
                             analysis = factors['analysis']
-                            up_prob = factors['up_prob'] * 100
                             ticker_price = get_ticker(coin)
                             display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
                             coin_lines.append(f"{coin}: ${display_price:.4f} {score:.1f} ({analysis['trend']})")
-                        except:
+                        except Exception:
                             coin_lines.append(f"{coin}: 获取失败")
-                    
+
                     recent = get_recent_signals(3)
                     recent_str = "\n".join(recent) if recent else "暂无"
                     hot = scan_hot_coins()[:3]
@@ -1227,14 +1267,19 @@ def main():
                     today_winrate = today_correct / today_total if today_total > 0 else 0
                     sixh_total, sixh_correct = get_signal_stats_since(6)
                     sixh_winrate = sixh_correct / sixh_total if sixh_total > 0 else 0
-                    
-                    status = f"🔥 AI超级信号\n\n{new_signal_line}📈 当前监控币种:\n" + "\n".join(coin_lines) + \
-                             f"\n\n⏱️ 最近信号:\n{recent_str}\n\n📊 市场热点:\n{hot_str}\n\n" \
-                             f"🤖 模型表现: {model_info}\n📆 今日信号: {today_total}次 (胜率: {today_winrate:.2%})\n\n" \
-                             f"📊 AI复盘报告:\n6小时: {sixh_total}次, 胜率 {sixh_winrate:.2%}\n24小时: {today_total}次, 胜率 {today_winrate:.2%}\n" \
-                             f"当前阈值: 买入{config['buy_threshold']} / 卖出{config['sell_threshold']}\n" \
-                             f"运行时间: {hours}小时{minutes}分钟 | 周期: {current_market_cycle}"
-                    
+
+                    status = (f"🔥 AI超级信号\n\n{new_signal_line}"
+                              f"📈 当前监控币种:\n" + "\n".join(coin_lines) +
+                              f"\n\n⏱️ 最近信号:\n{recent_str}\n\n"
+                              f"📊 市场热点:\n{hot_str}\n\n"
+                              f"🤖 模型表现: {model_info}\n"
+                              f"📆 今日信号: {today_total}次 (胜率: {today_winrate:.2%})\n\n"
+                              f"📊 AI复盘报告:\n"
+                              f"6小时: {sixh_total}次, 胜率 {sixh_winrate:.2%}\n"
+                              f"24小时: {today_total}次, 胜率 {today_winrate:.2%}\n"
+                              f"当前阈值: 买入{config['buy_threshold']} / 卖出{config['sell_threshold']}\n"
+                              f"运行时间: {hours_up}小时{minutes_up}分钟 | 周期: {current_market_cycle}")
+
                     current_interval = int(now / STATUS_PUSH_INTERVAL)
                     last_interval = int(last_status_push / STATUS_PUSH_INTERVAL) if last_status_push > 0 else -1
                     if current_interval != last_interval:
@@ -1256,6 +1301,7 @@ def main():
             traceback.print_exc()
 
         time.sleep(config["check_interval"])
+
 
 if __name__ == "__main__":
     main()
