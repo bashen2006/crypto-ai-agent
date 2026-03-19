@@ -391,67 +391,81 @@ class AITradingModel:
         return X_df, np.array(y_list)
     
     def train(self, X, y):
-        if X is None or len(X) < MIN_TRAIN_SAMPLES:
-            print(f"训练样本不足: {len(X) if X is not None else 0}/{MIN_TRAIN_SAMPLES}")
+    if X is None or len(X) < MIN_TRAIN_SAMPLES:
+        print(f"训练样本不足: {len(X) if X is not None else 0}/{MIN_TRAIN_SAMPLES}")
+        return False
+
+    # ---------- 新增：清洗 NaN 数据 ----------
+    if isinstance(X, pd.DataFrame):
+        original_len = len(X)
+        # 找出没有 NaN 的行
+        valid_idx = X.dropna().index
+        if len(valid_idx) < original_len:
+            X = X.loc[valid_idx]
+            y = y[valid_idx]  # 同步删除对应的标签
+            print(f"删除了 {original_len - len(valid_idx)} 行包含 NaN 的样本")
+        if len(X) < MIN_TRAIN_SAMPLES:
+            print(f"清洗后样本不足 {MIN_TRAIN_SAMPLES}，无法训练")
             return False
-        
-        X_scaled = self.scaler.fit_transform(X)
-        
-        base_models = [
-            ('gb', GradientBoostingClassifier(
-                n_estimators=100, max_depth=5, learning_rate=0.1,
-                subsample=0.8, random_state=42
-            )),
-            ('rf', RandomForestClassifier(
-                n_estimators=100, max_depth=5, random_state=42
-            ))
-        ]
-        
-        if BAYES_OPT_AVAILABLE and len(X) > MIN_TRAIN_SAMPLES * 2:
-            print("开始贝叶斯优化超参数...")
-            opt = BayesSearchCV(
-                GradientBoostingClassifier(),
-                {
-                    'n_estimators': Integer(50, 200),
-                    'max_depth': Integer(3, 8),
-                    'learning_rate': Real(0.01, 0.3, prior='log-uniform'),
-                },
-                n_iter=10,
-                cv=3,
-                random_state=42
-            )
-            opt.fit(X_scaled, y)
-            print(f"最优参数: {opt.best_params_}")
-            base_models.append(('gb_opt', opt.best_estimator_))
-        
-        self.model = VotingClassifier(estimators=base_models, voting='soft')
-        self.model.fit(X_scaled, y)
-        
-        if hasattr(self.model, 'estimators_'):
-            importances = []
-            for name, est in base_models:
-                if hasattr(est, 'feature_importances_'):
-                    importances.append(est.feature_importances_)
-            if importances:
-                self.feature_importance = dict(zip(self.feature_names, np.mean(importances, axis=0)))
-        
-        y_pred = self.model.predict(X_scaled)
-        accuracy = accuracy_score(y, y_pred)
-        
-        self.is_trained = True
-        self.training_history.append({
-            'timestamp': time.time(),
-            'samples': len(X),
-            'accuracy': accuracy,
-            'features': len(self.feature_names)
-        })
-        
-        print(f"模型训练完成: 样本数={len(X)}, 准确率={accuracy:.4f}")
-        if self.feature_importance:
-            top5 = sorted(self.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
-            print(f"Top 5重要特征: {top5}")
-        
-        return True
+    # ----------------------------------------
+
+    X_scaled = self.scaler.fit_transform(X)
+
+    base_models = [
+        ('gb', GradientBoostingClassifier(
+            n_estimators=100, max_depth=5, learning_rate=0.1,
+            subsample=0.8, random_state=42
+        )),
+        ('rf', RandomForestClassifier(
+            n_estimators=100, max_depth=5, random_state=42
+        ))
+    ]
+
+    if BAYES_OPT_AVAILABLE and len(X) > MIN_TRAIN_SAMPLES * 2:
+        print("开始贝叶斯优化超参数...")
+        opt = BayesSearchCV(
+            GradientBoostingClassifier(),
+            {
+                'n_estimators': Integer(50, 200),
+                'max_depth': Integer(3, 8),
+                'learning_rate': Real(0.01, 0.3, prior='log-uniform'),
+            },
+            n_iter=10,
+            cv=3,
+            random_state=42
+        )
+        opt.fit(X_scaled, y)
+        print(f"最优参数: {opt.best_params_}")
+        base_models.append(('gb_opt', opt.best_estimator_))
+
+    self.model = VotingClassifier(estimators=base_models, voting='soft')
+    self.model.fit(X_scaled, y)
+
+    if hasattr(self.model, 'estimators_'):
+        importances = []
+        for name, est in base_models:
+            if hasattr(est, 'feature_importances_'):
+                importances.append(est.feature_importances_)
+        if importances:
+            self.feature_importance = dict(zip(self.feature_names, np.mean(importances, axis=0)))
+
+    y_pred = self.model.predict(X_scaled)
+    accuracy = accuracy_score(y, y_pred)
+
+    self.is_trained = True
+    self.training_history.append({
+        'timestamp': time.time(),
+        'samples': len(X),
+        'accuracy': accuracy,
+        'features': len(self.feature_names)
+    })
+
+    print(f"模型训练完成: 样本数={len(X)}, 准确率={accuracy:.4f}")
+    if self.feature_importance:
+        top5 = sorted(self.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
+        print(f"Top 5重要特征: {top5}")
+
+    return True
     
     def predict(self, features):
         if not self.is_trained or self.model is None:
