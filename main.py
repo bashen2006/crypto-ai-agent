@@ -525,7 +525,10 @@ class AITradingModel:
         if len(X_list) < MIN_TRAIN_SAMPLES:
             return None, None
         X_df = pd.DataFrame(X_list)
-        self.feature_names = X_df.columns.tolist()
+        # ⚠️ 不在此处更新 feature_names！
+        # feature_names 只能在 train() 成功完成后才更新。
+        # 若训练因样本不足被跳过，旧 feature_names 与旧 scaler 还能正常配合预测。
+        # 若在这里更新，训练跳过后 feature_names 变成新数量，但 scaler 还是旧的，预测报错。
         return X_df, np.array(y_list)
 
     def train(self, X, y):
@@ -534,14 +537,22 @@ class AITradingModel:
             return False
 
         if isinstance(X, pd.DataFrame):
-            orig = len(X)
-            X    = X.dropna()
-            y    = y[X.index] if hasattr(y, '__getitem__') else y[:len(X)]
+            orig   = len(X)
+            X      = X.dropna()
+            # dropna后index不连续，需先对齐y再重置index
+            y      = np.array(y)[X.index.tolist()]
+            X      = X.reset_index(drop=True)
             if len(X) < MIN_TRAIN_SAMPLES:
                 print(f"清洗后样本不足{MIN_TRAIN_SAMPLES}，跳过训练")
                 return False
             if len(X) < orig:
                 print(f"删除了{orig - len(X)}行NaN样本")
+
+        # ✅ 到这里才真正开始训练，此时同步更新 feature_names
+        # scaler 也会在下面 fit_transform 中重新拟合，保证两者始终匹配
+        if isinstance(X, pd.DataFrame):
+            self.feature_names = X.columns.tolist()
+        print(f"开始训练，特征数: {len(self.feature_names)}")
 
         X_scaled = self.scaler.fit_transform(X)
 
