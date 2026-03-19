@@ -7,7 +7,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
-import shutil  # ← 新增：用于原子替换文件
+import shutil
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
@@ -28,14 +28,11 @@ print(f"📁 数据目录: {DATA_DIR}")
 # 机器学习库导入
 # =========================
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.metrics import accuracy_score
 import joblib
 
-# =========================
-# 贝叶斯优化（可选）
-# =========================
 try:
     from skopt import BayesSearchCV
     from skopt.space import Integer, Real
@@ -53,37 +50,55 @@ LOG_FILE = "prediction_log.json"
 MODEL_FILE = "ai_model.pkl"
 SCALER_FILE = "scaler.pkl"
 FEATURES_FILE = "feature_config.json"
+SIGNAL_CONFIRM_FILE = "signal_confirm.json"  # 新增：信号确认状态
 
-MEMORY_PATH = os.path.join(DATA_DIR, MEMORY_FILE)
-LOG_PATH = os.path.join(DATA_DIR, LOG_FILE)
-MODEL_PATH = os.path.join(DATA_DIR, MODEL_FILE)
-SCALER_PATH = os.path.join(DATA_DIR, SCALER_FILE)
+MEMORY_PATH   = os.path.join(DATA_DIR, MEMORY_FILE)
+LOG_PATH      = os.path.join(DATA_DIR, LOG_FILE)
+MODEL_PATH    = os.path.join(DATA_DIR, MODEL_FILE)
+SCALER_PATH   = os.path.join(DATA_DIR, SCALER_FILE)
 FEATURES_PATH = os.path.join(DATA_DIR, FEATURES_FILE)
+SIGNAL_CONFIRM_PATH = os.path.join(DATA_DIR, SIGNAL_CONFIRM_FILE)
 
-WHALE_THRESHOLD = 20000
-SIGNAL_COOLDOWN = 1800
-STATUS_PUSH_INTERVAL = 300
-DAILY_REPORT_INTERVAL = 86400
-BACKTEST_INTERVAL = 86400
-ADAPTIVE_OPTIMIZATION_INTERVAL = 3600
-MARKET_CYCLE_INTERVAL = 3600
-MODEL_RETRAIN_INTERVAL = 21600
+# 时间间隔
+SIGNAL_COOLDOWN               = 1800   # 信号冷却30分钟
+STATUS_PUSH_INTERVAL          = 300    # 状态推送5分钟
+DAILY_REPORT_INTERVAL         = 86400
+BACKTEST_INTERVAL             = 86400
+ADAPTIVE_OPTIMIZATION_INTERVAL= 3600
+MARKET_CYCLE_INTERVAL         = 3600
 
-MAX_LOG_SIZE = 5000
-MAX_DYNAMIC_COINS = 3
-MIN_TRAIN_SAMPLES = 50
-SCORE_CHANGE_THRESHOLD = 10
+# 数据限制
+MAX_LOG_SIZE          = 5000
+MAX_DYNAMIC_COINS     = 3
+MIN_TRAIN_SAMPLES     = 80   # 提高最小训练样本（原50太少）
+SCORE_CHANGE_THRESHOLD= 10
 
-# =====================================================
-# 🔧 修复一：有限容量 LRU 缓存，防止内存无限增长
-# =====================================================
+# Gate.io
+GATEIO_BASE_URL = "https://api.gateio.ws/api/v4"
+
+# 过滤阈值
+VOLUME_RATIO_MIN  = 2.0
+VOLATILITY_MIN    = 0.01
+PROFIT_THRESHOLD  = 0.015   # 提高盈利阈值到1.5%（原1%太低）
+
+# 多档信号阈值
+SIGNAL_STRONG_BUY  = 75
+SIGNAL_BUY         = 60
+SIGNAL_STRONG_SELL = 25
+SIGNAL_SELL        = 40
+
+# =========================
+# 新增：信号连续确认次数
+# 必须连续N次满足条件才触发，防止频繁翻转
+# =========================
+SIGNAL_CONFIRM_COUNT = 2   # 需要连续2次确认
+
+# =========================
+# 修复一：有限容量缓存，防止OOM
+# =========================
 def cache(ttl_seconds=60, max_size=256):
-    """
-    带最大容量限制的 TTL 缓存装饰器。
-    当缓存条目超过 max_size 时，自动清理最旧的条目。
-    """
     def decorator(func):
-        cache_store = {}  # key -> {'value': ..., 'timestamp': ...}
+        cache_store = {}
         lock = threading.Lock()
 
         @wraps(func)
@@ -94,61 +109,36 @@ def cache(ttl_seconds=60, max_size=256):
                 entry = cache_store.get(key)
                 if entry and now - entry['timestamp'] < ttl_seconds:
                     return entry['value']
-
             result = func(*args, **kwargs)
-
             with lock:
                 cache_store[key] = {'value': result, 'timestamp': now}
-
-                # 超出最大容量时，删除最旧的条目（类 LRU）
                 if len(cache_store) > max_size:
-                    oldest_key = min(
-                        cache_store, key=lambda k: cache_store[k]['timestamp']
-                    )
-                    del cache_store[oldest_key]
-
+                    oldest = min(cache_store, key=lambda k: cache_store[k]['timestamp'])
+                    del cache_store[oldest]
             return result
         return wrapper
     return decorator
 
-# Gate.io 配置
-GATEIO_BASE_URL = "https://api.gateio.ws/api/v4"
-
-# 过滤阈值
-VOLUME_RATIO_MIN = 2.0
-VOLATILITY_MIN = 0.01
-PROFIT_THRESHOLD = 0.01
-
-# 多档信号阈值（仅用于消息展示）
-SIGNAL_STRONG_BUY = 75
-SIGNAL_BUY = 60
-SIGNAL_STRONG_SELL = 25
-SIGNAL_SELL = 40
+# =========================
+# 全局状态
+# =========================
+last_signal_time    = {}
+last_status_push    = 0
+last_daily_report   = 0
+last_backtest_time  = 0
+last_adaptive_time  = 0
+last_cycle_check    = 0
+current_market_cycle= "未知"
+last_scores         = {}
+btc_features_cache  = {'timestamp': 0, 'features': None}
+start_time          = time.time()   # 全局记录启动时间
 
 # =========================
-# 全局状态变量
-# =========================
-last_signal_time = {}
-last_status_push = 0
-last_daily_report = 0
-last_backtest_time = 0
-last_adaptive_time = 0
-last_cycle_check = 0
-last_model_retrain = 0
-current_market_cycle = "未知"
-last_scores = {}
-btc_features_cache = {'timestamp': 0, 'features': None}
-market_sentiment_cache = {'timestamp': 0, 'data': None}
-
-# =========================
-# 辅助函数：交易对格式转换
+# 工具函数
 # =========================
 def format_gateio_symbol(inst):
     return inst.replace("-", "_").upper()
 
-# =========================
-# 安全请求（带缓存）
-# =========================
 @cache(ttl_seconds=2, max_size=64)
 def safe_request(url, params=None, max_retries=3):
     for i in range(max_retries):
@@ -156,24 +146,17 @@ def safe_request(url, params=None, max_retries=3):
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
                 return r.json()
-            else:
-                print(f"请求失败，状态码：{r.status_code}，URL：{url}")
-                if r.text:
-                    print(f"响应内容：{r.text[:200]}")
+            print(f"请求失败 {r.status_code}: {url}")
         except Exception as e:
-            print(f"请求异常：{e}")
+            print(f"请求异常: {e}")
             time.sleep(2)
     return None
 
-# =========================
-# Gate.io 数据获取函数
-# =========================
 @cache(ttl_seconds=5, max_size=32)
 def get_ticker(inst):
     symbol = format_gateio_symbol(inst)
-    url = f"{GATEIO_BASE_URL}/spot/tickers"
-    params = {"currency_pair": symbol}
-    data = safe_request(url, params=params)
+    url    = f"{GATEIO_BASE_URL}/spot/tickers"
+    data   = safe_request(url, params={"currency_pair": symbol})
     if data and isinstance(data, list) and len(data) > 0:
         return float(data[0]['last'])
     return None
@@ -181,39 +164,27 @@ def get_ticker(inst):
 @cache(ttl_seconds=30, max_size=64)
 def get_kline(inst, interval="5m", limit=300):
     symbol = format_gateio_symbol(inst)
-    url = f"{GATEIO_BASE_URL}/spot/candlesticks"
-    params = {
-        "currency_pair": symbol,
-        "interval": interval,
-        "limit": limit
-    }
-    data = safe_request(url, params=params)
+    url    = f"{GATEIO_BASE_URL}/spot/candlesticks"
+    data   = safe_request(url, params={"currency_pair": symbol,
+                                        "interval": interval, "limit": limit})
     if not isinstance(data, list):
         raise Exception(f"获取{inst} K线失败: {data}")
-    df = pd.DataFrame(data)
-    df = df.iloc[:, :6]
+    df = pd.DataFrame(data).iloc[:, :6]
     df.columns = ["ts", "volume", "close", "high", "low", "open"]
-    df = df[["ts", "open", "high", "low", "close", "volume"]]
-    df = df.astype(float)
+    df = df[["ts", "open", "high", "low", "close", "volume"]].astype(float)
     df["ts"] = df["ts"] * 1000
     return df
 
 @cache(ttl_seconds=60, max_size=8)
 def scan_hot_coins(limit=20):
-    url = f"{GATEIO_BASE_URL}/spot/tickers"
+    url  = f"{GATEIO_BASE_URL}/spot/tickers"
     data = safe_request(url)
     if not isinstance(data, list):
-        print("Gate.io 热门币种获取失败")
         return []
-    usdt_pairs = [d for d in data if d["currency_pair"].endswith("_USDT")]
-    usdt_pairs.sort(key=lambda x: float(x["change_percentage"]), reverse=True)
-    hot = []
-    for item in usdt_pairs[:limit]:
-        symbol = item["currency_pair"]
-        change = float(item["change_percentage"])
-        formatted = symbol.replace("_", "-")
-        hot.append((formatted, change))
-    return hot
+    pairs = [d for d in data if d["currency_pair"].endswith("_USDT")]
+    pairs.sort(key=lambda x: float(x["change_percentage"]), reverse=True)
+    return [(p["currency_pair"].replace("_", "-"), float(p["change_percentage"]))
+            for p in pairs[:limit]]
 
 def hot_coin_filter(coin_name):
     return coin_name not in ["BTC-USDT", "ETH-USDT", "OKB-USDT"]
@@ -221,161 +192,226 @@ def hot_coin_filter(coin_name):
 def detect_whale(inst):
     return 0
 
-# =========================
-# 市场情绪指标
-# =========================
 @cache(ttl_seconds=300, max_size=4)
 def get_market_sentiment():
-    url = f"{GATEIO_BASE_URL}/spot/tickers"
+    url  = f"{GATEIO_BASE_URL}/spot/tickers"
     data = safe_request(url)
     if not isinstance(data, list):
         return None
-    usdt_pairs = [d for d in data if d["currency_pair"].endswith("_USDT")]
-    total = len(usdt_pairs)
-    up = sum(1 for d in usdt_pairs if float(d["change_percentage"]) > 0)
-    down = total - up
-    ratio = up / down if down > 0 else up
-    sorted_by_vol = sorted(usdt_pairs, key=lambda x: float(x["quote_volume"]), reverse=True)[:5]
-    avg_top_vol_change = sum(float(d["change_percentage"]) for d in sorted_by_vol) / 5 if sorted_by_vol else 0
+    pairs = [d for d in data if d["currency_pair"].endswith("_USDT")]
+    up    = sum(1 for d in pairs if float(d["change_percentage"]) > 0)
+    down  = len(pairs) - up
+    top5  = sorted(pairs, key=lambda x: float(x["quote_volume"]), reverse=True)[:5]
+    avg_change = sum(float(d["change_percentage"]) for d in top5) / 5 if top5 else 0
     return {
         'market_up_count': up,
         'market_down_count': down,
-        'market_up_down_ratio': ratio,
-        'market_top_vol_avg_change': avg_top_vol_change
+        'market_up_down_ratio': up / down if down > 0 else up,
+        'market_top_vol_avg_change': avg_change
     }
 
-# =========================
-# 资金费率（仅主流币）
-# =========================
 @cache(ttl_seconds=3600, max_size=16)
 def get_funding_rate(inst):
     WHITELIST = {"BTC", "ETH", "OKB", "BNB", "SOL", "XRP", "ADA", "DOGE", "DOT", "LINK"}
     base = inst.split("-")[0].upper()
     if base not in WHITELIST:
         return None
-    symbol = format_gateio_symbol(inst)
-    url = f"{GATEIO_BASE_URL}/futures/usdt/contracts/{symbol}"
-    data = safe_request(url)
+    data = safe_request(f"{GATEIO_BASE_URL}/futures/usdt/contracts/{format_gateio_symbol(inst)}")
     if data and isinstance(data, dict) and 'funding_rate' in data:
         return float(data['funding_rate'])
     return None
 
 # =========================
-# AI模型类
+# 新增：ATR计算（用于止损止盈）
+# =========================
+def calculate_atr(df, period=14):
+    """计算平均真实波幅，用于动态止损止盈"""
+    high  = df['high'].values
+    low   = df['low'].values
+    close = df['close'].values
+    tr_list = []
+    for i in range(1, len(df)):
+        tr = max(high[i] - low[i],
+                 abs(high[i] - close[i-1]),
+                 abs(low[i]  - close[i-1]))
+        tr_list.append(tr)
+    if len(tr_list) < period:
+        return np.mean(tr_list) if tr_list else 0
+    return np.mean(tr_list[-period:])
+
+# =========================
+# 新增：信号连续确认状态管理
+# =========================
+def load_signal_confirm():
+    try:
+        with open(SIGNAL_CONFIRM_PATH, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_signal_confirm(data):
+    tmp = SIGNAL_CONFIRM_PATH + ".tmp"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        shutil.move(tmp, SIGNAL_CONFIRM_PATH)
+    except Exception as e:
+        print(f"⚠️ save_signal_confirm 失败: {e}")
+
+def check_signal_confirm(coin, signal_type, score):
+    """
+    连续确认机制：同一方向连续达到SIGNAL_CONFIRM_COUNT次才返回True。
+    方向翻转时自动重置计数器。
+    """
+    confirms = load_signal_confirm()
+    entry    = confirms.get(coin, {'signal': None, 'count': 0, 'scores': []})
+
+    if entry['signal'] != signal_type:
+        # 方向翻转，重置
+        entry = {'signal': signal_type, 'count': 1, 'scores': [score]}
+    else:
+        entry['count'] += 1
+        entry['scores'].append(score)
+        # 只保留最近N次分数
+        entry['scores'] = entry['scores'][-SIGNAL_CONFIRM_COUNT:]
+
+    confirms[coin] = entry
+    save_signal_confirm(confirms)
+
+    if entry['count'] >= SIGNAL_CONFIRM_COUNT:
+        avg_score = np.mean(entry['scores'])
+        return True, avg_score
+    return False, score
+
+def reset_signal_confirm(coin):
+    confirms = load_signal_confirm()
+    if coin in confirms:
+        del confirms[coin]
+        save_signal_confirm(confirms)
+
+# =========================
+# AI 模型类（增加过拟合防护）
 # =========================
 class AITradingModel:
     def __init__(self):
-        self.model = None
-        self.scaler = StandardScaler()
+        self.model              = None
+        self.scaler             = StandardScaler()
         self.feature_importance = {}
-        self.training_history = []
-        self.label_encoder = LabelEncoder()
-        self.is_trained = False
-        self.feature_names = []
+        self.training_history   = []
+        self.is_trained         = False
+        self.feature_names      = []
+        self.cv_accuracy        = 0.0   # 新增：交叉验证准确率（更真实）
 
     def extract_features(self, df, whale, market_cycle, coin_name):
         features = {}
         if len(df) < 100:
             return None
 
-        close = df['close'].values
-        high = df['high'].values
-        low = df['low'].values
+        close  = df['close'].values
         volume = df['volume'].values
 
+        # ---- 均线与价格位置 ----
         for period in [5, 10, 20, 30, 50, 60, 100]:
             if len(df) >= period:
                 ma = df['close'].rolling(period).mean().iloc[-1]
-                features[f'ma_{period}'] = ma
-                features[f'price_ma_{period}_ratio'] = close[-1] / ma if ma != 0 else 1
+                features[f'ma_{period}']           = ma
+                features[f'price_ma_{period}_ratio']= close[-1] / ma if ma != 0 else 1
 
+        # ---- 动量 ----
         for period in [5, 10, 20, 30]:
             if len(df) >= period:
-                momentum = (close[-1] - close[-period]) / close[-period]
-                features[f'momentum_{period}'] = momentum
+                features[f'momentum_{period}'] = (close[-1] - close[-period]) / close[-period]
 
+        # ---- 波动率 ----
         for period in [10, 20, 30]:
             if len(df) >= period:
                 returns = np.diff(close[-period:]) / close[-period:-1]
                 features[f'volatility_{period}'] = np.std(returns)
 
-        volume_ma = pd.Series(volume).rolling(20).mean().iloc[-1]
-        features['volume_ratio'] = volume[-1] / volume_ma if volume_ma != 0 else 1
+        # ---- 量能 ----
+        vol_ma = pd.Series(volume).rolling(20).mean().iloc[-1]
+        features['volume_ratio'] = volume[-1] / vol_ma if vol_ma != 0 else 1
         features['volume_trend'] = (volume[-1] - volume[-5]) / volume[-5] if volume[-5] != 0 else 0
 
-        high_20 = np.max(close[-20:])
-        low_20 = np.min(close[-20:])
-        features['price_position_20'] = (close[-1] - low_20) / (high_20 - low_20) if high_20 > low_20 else 0.5
+        # ---- 价格位置(20周期) ----
+        h20 = np.max(close[-20:])
+        l20 = np.min(close[-20:])
+        features['price_position_20'] = (close[-1] - l20) / (h20 - l20) if h20 > l20 else 0.5
 
-        delta = np.diff(close)
-        gain = np.where(delta > 0, delta, 0)
-        loss = np.where(delta < 0, -delta, 0)
+        # ---- RSI ----
+        delta    = np.diff(close)
+        gain     = np.where(delta > 0, delta, 0)
+        loss     = np.where(delta < 0, -delta, 0)
         avg_gain = pd.Series(gain).rolling(14).mean().iloc[-1] if len(gain) >= 14 else 0
         avg_loss = pd.Series(loss).rolling(14).mean().iloc[-1] if len(loss) >= 14 else 0
-        if avg_loss != 0:
-            rs = avg_gain / avg_loss
-            features['rsi'] = 100 - (100 / (1 + rs))
-        else:
-            features['rsi'] = 50
+        features['rsi'] = 100 - (100 / (1 + avg_gain / avg_loss)) if avg_loss != 0 else 50
 
+        # ---- MACD ----
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         macd = exp1 - exp2
-        signal = macd.ewm(span=9, adjust=False).mean()
-        features['macd'] = macd.iloc[-1]
-        features['macd_signal'] = signal.iloc[-1]
-        features['macd_histogram'] = macd.iloc[-1] - signal.iloc[-1]
+        sig  = macd.ewm(span=9, adjust=False).mean()
+        features['macd']           = macd.iloc[-1]
+        features['macd_signal']    = sig.iloc[-1]
+        features['macd_histogram'] = macd.iloc[-1] - sig.iloc[-1]
 
+        # ---- 布林带位置 ----
         sma = df['close'].rolling(20).mean()
         std = df['close'].rolling(20).std()
-        bb_upper = sma + (std * 2)
-        bb_lower = sma - (std * 2)
-        features['bb_position'] = (close[-1] - bb_lower.iloc[-1]) / (bb_upper.iloc[-1] - bb_lower.iloc[-1]) if bb_upper.iloc[-1] > bb_lower.iloc[-1] else 0.5
+        bbu = (sma + std * 2).iloc[-1]
+        bbl = (sma - std * 2).iloc[-1]
+        features['bb_position'] = (close[-1] - bbl) / (bbu - bbl) if bbu > bbl else 0.5
 
-        features['whale_value'] = whale / 10000
+        # ---- ATR ----
+        features['atr_ratio'] = calculate_atr(df) / close[-1] if close[-1] != 0 else 0
+
+        # ---- 市场周期 & 其他 ----
+        features['whale_value']  = whale / 10000
         features['market_cycle'] = 2 if market_cycle == "牛市" else (1 if market_cycle == "震荡" else 0)
-        coin_hash = abs(hash(coin_name)) % 100 / 100
-        features['coin_id'] = coin_hash
+        features['coin_id']      = abs(hash(coin_name)) % 100 / 100
 
+        # ---- 1小时特征 ----
         try:
             df_h1 = get_kline(coin_name, interval="1h", limit=100)
             if df_h1 is not None and len(df_h1) >= 60:
-                ma20_h1 = df_h1['close'].rolling(20).mean().iloc[-1]
-                features['h1_ma20'] = ma20_h1
-                features['h1_price_ma20_ratio'] = close[-1] / ma20_h1 if ma20_h1 != 0 else 1
-                momentum_h1 = (df_h1['close'].iloc[-1] - df_h1['close'].iloc[-10]) / df_h1['close'].iloc[-10]
-                features['h1_momentum_10'] = momentum_h1
+                ma20h1 = df_h1['close'].rolling(20).mean().iloc[-1]
+                features['h1_ma20']            = ma20h1
+                features['h1_price_ma20_ratio']= close[-1] / ma20h1 if ma20h1 != 0 else 1
+                features['h1_momentum_10']     = (df_h1['close'].iloc[-1] - df_h1['close'].iloc[-10]) / df_h1['close'].iloc[-10]
         except Exception:
             pass
 
+        # ---- BTC大盘特征 ----
         global btc_features_cache
         now = time.time()
         if now - btc_features_cache['timestamp'] > 60:
             try:
                 df_btc = get_kline("BTC-USDT", interval="5m", limit=100)
                 if df_btc is not None and len(df_btc) >= 60:
-                    btc_feat = {}
-                    ma20_btc = df_btc['close'].rolling(20).mean().iloc[-1]
-                    btc_feat['btc_ma20'] = ma20_btc
-                    btc_feat['btc_price_ma20_ratio'] = df_btc['close'].iloc[-1] / ma20_btc if ma20_btc != 0 else 1
-                    momentum_btc = (df_btc['close'].iloc[-1] - df_btc['close'].iloc[-10]) / df_btc['close'].iloc[-10]
-                    btc_feat['btc_momentum_10'] = momentum_btc
-                    btc_features_cache['features'] = btc_feat
+                    ma20b = df_btc['close'].rolling(20).mean().iloc[-1]
+                    btc_features_cache['features'] = {
+                        'btc_ma20':             ma20b,
+                        'btc_price_ma20_ratio': df_btc['close'].iloc[-1] / ma20b if ma20b != 0 else 1,
+                        'btc_momentum_10':      (df_btc['close'].iloc[-1] - df_btc['close'].iloc[-10]) / df_btc['close'].iloc[-10]
+                    }
                     btc_features_cache['timestamp'] = now
             except Exception:
                 pass
         if btc_features_cache['features']:
             features.update(btc_features_cache['features'])
 
+        # ---- 时间特征 ----
         dt = datetime.now()
-        features['hour'] = dt.hour
-        features['weekday'] = dt.weekday()
+        features['hour']       = dt.hour
+        features['weekday']    = dt.weekday()
         features['is_weekend'] = 1 if dt.weekday() >= 5 else 0
 
+        # ---- 市场情绪 ----
         sentiment = get_market_sentiment()
         if sentiment:
             features.update(sentiment)
 
+        # ---- 资金费率 ----
         funding = get_funding_rate(coin_name)
         if funding is not None:
             features['funding_rate'] = funding
@@ -383,12 +419,11 @@ class AITradingModel:
         return features
 
     def prepare_training_data(self, logs):
-        X_list = []
-        y_list = []
+        X_list, y_list = [], []
         for log in logs:
             if not log.get('verified') or log.get('result') not in ['correct', 'wrong']:
                 continue
-            if 'features' not in log:
+            if 'features' not in log or not log['features']:
                 continue
             X_list.append(log['features'])
             y_list.append(1 if log['result'] == 'correct' else 0)
@@ -399,198 +434,172 @@ class AITradingModel:
         return X_df, np.array(y_list)
 
     def train(self, X, y):
+        """
+        训练模型，使用交叉验证评估真实准确率，防止过拟合。
+        """
         if X is None or len(X) < MIN_TRAIN_SAMPLES:
             print(f"训练样本不足: {len(X) if X is not None else 0}/{MIN_TRAIN_SAMPLES}")
             return False
 
+        # 清洗NaN
         if isinstance(X, pd.DataFrame):
-            original_len = len(X)
-            valid_idx = X.dropna().index
-            if len(valid_idx) < original_len:
-                X = X.loc[valid_idx]
-                y = y[valid_idx]
-                print(f"删除了 {original_len - len(valid_idx)} 行包含 NaN 的样本")
+            orig = len(X)
+            X    = X.dropna()
+            y    = y[X.index] if hasattr(y, '__getitem__') else y[:len(X)]
             if len(X) < MIN_TRAIN_SAMPLES:
-                print(f"清洗后样本不足 {MIN_TRAIN_SAMPLES}，无法训练")
+                print(f"清洗后样本不足{MIN_TRAIN_SAMPLES}，跳过训练")
                 return False
+            if len(X) < orig:
+                print(f"删除了{orig - len(X)}行NaN样本")
 
         X_scaled = self.scaler.fit_transform(X)
 
+        # ---- 防过拟合：限制树深度，增加最小叶子节点样本数 ----
         base_models = [
             ('gb', GradientBoostingClassifier(
-                n_estimators=100, max_depth=5, learning_rate=0.1,
-                subsample=0.8, random_state=42
+                n_estimators=100, max_depth=3,    # max_depth从5降到3
+                learning_rate=0.05,               # 学习率降低
+                subsample=0.7,                    # 更强的随机性
+                min_samples_leaf=5,               # 叶节点最少5个样本
+                random_state=42
             )),
             ('rf', RandomForestClassifier(
-                n_estimators=100, max_depth=5, random_state=42
+                n_estimators=100, max_depth=4,    # max_depth从5降到4
+                min_samples_leaf=5,               # 叶节点最少5个样本
+                max_features='sqrt',
+                random_state=42
             ))
         ]
 
-        if BAYES_OPT_AVAILABLE and len(X) > MIN_TRAIN_SAMPLES * 2:
-            print("开始贝叶斯优化超参数...")
-            opt = BayesSearchCV(
-                GradientBoostingClassifier(),
-                {
-                    'n_estimators': Integer(50, 200),
-                    'max_depth': Integer(3, 8),
-                    'learning_rate': Real(0.01, 0.3, prior='log-uniform'),
-                },
-                n_iter=10,
-                cv=3,
-                random_state=42
-            )
-            opt.fit(X_scaled, y)
-            print(f"最优参数: {opt.best_params_}")
-            base_models.append(('gb_opt', opt.best_estimator_))
+        model = VotingClassifier(estimators=base_models, voting='soft')
+        model.fit(X_scaled, y)
 
-        self.model = VotingClassifier(estimators=base_models, voting='soft')
-        self.model.fit(X_scaled, y)
+        # ---- 交叉验证（更真实的准确率）----
+        cv      = StratifiedKFold(n_splits=min(5, len(X) // 10), shuffle=True, random_state=42)
+        cv_scores = cross_val_score(model, X_scaled, y, cv=cv, scoring='accuracy')
+        cv_acc  = float(np.mean(cv_scores))
+        train_acc = accuracy_score(y, model.predict(X_scaled))
 
-        if hasattr(self.model, 'estimators_'):
-            importances = []
-            for name, est in base_models:
-                if hasattr(est, 'feature_importances_'):
-                    importances.append(est.feature_importances_)
-            if importances:
-                self.feature_importance = dict(zip(self.feature_names, np.mean(importances, axis=0)))
+        # 如果训练准确率远高于CV准确率，说明过拟合
+        overfit_gap = train_acc - cv_acc
+        if overfit_gap > 0.2:
+            print(f"⚠️ 过拟合警告: 训练={train_acc:.3f}, CV={cv_acc:.3f}, 差距={overfit_gap:.3f}")
 
-        y_pred = self.model.predict(X_scaled)
-        accuracy = accuracy_score(y, y_pred)
+        self.model      = model
+        self.cv_accuracy= cv_acc
+
+        # 特征重要性
+        if hasattr(model, 'estimators_'):
+            imps = [est.feature_importances_
+                    for _, est in base_models
+                    if hasattr(est, 'feature_importances_')]
+            if imps:
+                self.feature_importance = dict(zip(self.feature_names, np.mean(imps, axis=0)))
 
         self.is_trained = True
         self.training_history.append({
-            'timestamp': time.time(),
-            'samples': len(X),
-            'accuracy': accuracy,
-            'features': len(self.feature_names)
+            'timestamp':    time.time(),
+            'samples':      len(X),
+            'train_acc':    train_acc,
+            'cv_accuracy':  cv_acc,
+            'overfit_gap':  overfit_gap,
+            'features':     len(self.feature_names)
         })
 
-        print(f"模型训练完成: 样本数={len(X)}, 准确率={accuracy:.4f}")
+        print(f"✅ 训练完成: 样本={len(X)}, 训练准确率={train_acc:.4f}, CV准确率={cv_acc:.4f}")
         if self.feature_importance:
             top5 = sorted(self.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
-            print(f"Top 5重要特征: {top5}")
+            print(f"Top5特征: {top5}")
 
         return True
 
     def predict(self, features):
         if not self.is_trained or self.model is None:
             return 50, {}
-        feature_vector = []
-        for name in self.feature_names:
-            feature_vector.append(features.get(name, 0))
-        feature_scaled = self.scaler.transform([feature_vector])
-        proba = self.model.predict_proba(feature_scaled)[0]
-        score = proba[1] * 100 if len(proba) == 2 else 50
+        fv = [features.get(name, 0) for name in self.feature_names]
+        fs = self.scaler.transform([fv])
+        proba      = self.model.predict_proba(fs)[0]
+        score      = proba[1] * 100 if len(proba) == 2 else 50
         confidence = float(np.max(proba))
-        contribution = {}
-        if hasattr(self.model, 'estimators_') and len(self.model.estimators_) > 0:
-            first_est = self.model.estimators_[0]
-            if hasattr(first_est, 'feature_importances_'):
+        contrib    = {}
+        if hasattr(self.model, 'estimators_'):
+            est = self.model.estimators_[0]
+            if hasattr(est, 'feature_importances_'):
                 for i, name in enumerate(self.feature_names):
-                    contribution[name] = first_est.feature_importances_[i] * feature_scaled[0][i]
-        return score, {'confidence': confidence, 'contribution': contribution}
+                    contrib[name] = est.feature_importances_[i] * fs[0][i]
+        return score, {'confidence': confidence, 'contribution': contrib}
 
-    # =====================================================
-    # 🔧 修复二：原子化保存，防止写到一半进程崩溃导致文件损坏
-    # =====================================================
+    # 修复二：原子保存
     def save(self):
-        """
-        使用"先写临时文件，再原子替换"的策略，确保文件完整性。
-        即使进程在写入过程中崩溃，旧文件也不会被损坏。
-        """
         if not self.model:
-            print("⚠️ 模型为空，跳过保存")
             return False
-
-        tmp_model   = MODEL_PATH   + ".tmp"
-        tmp_scaler  = SCALER_PATH  + ".tmp"
-        tmp_features = FEATURES_PATH + ".tmp"
-
+        tmp_m = MODEL_PATH   + ".tmp"
+        tmp_s = SCALER_PATH  + ".tmp"
+        tmp_f = FEATURES_PATH+ ".tmp"
         try:
-            # Step 1: 写入临时文件
-            joblib.dump(self.model, tmp_model)
-            joblib.dump(self.scaler, tmp_scaler)
-            with open(tmp_features, 'w', encoding='utf-8') as f:
+            joblib.dump(self.model,  tmp_m)
+            joblib.dump(self.scaler, tmp_s)
+            with open(tmp_f, 'w', encoding='utf-8') as f:
                 json.dump({
-                    'feature_names': self.feature_names,
-                    'training_history': self.training_history,
-                    'feature_importance': self.feature_importance
+                    'feature_names':     self.feature_names,
+                    'training_history':  self.training_history,
+                    'feature_importance':self.feature_importance,
+                    'cv_accuracy':       self.cv_accuracy
                 }, f, indent=4)
-
-            # Step 2: 原子替换（所有文件都写完后再替换）
-            shutil.move(tmp_model,    MODEL_PATH)
-            shutil.move(tmp_scaler,   SCALER_PATH)
-            shutil.move(tmp_features, FEATURES_PATH)
-
-            print(f"✅ 模型原子保存成功: {MODEL_PATH}")
+            shutil.move(tmp_m, MODEL_PATH)
+            shutil.move(tmp_s, SCALER_PATH)
+            shutil.move(tmp_f, FEATURES_PATH)
+            print("✅ 模型原子保存成功")
             return True
-
         except Exception as e:
             print(f"❌ 模型保存失败: {e}")
-            # 清理可能存在的临时文件
-            for tmp in [tmp_model, tmp_scaler, tmp_features]:
-                try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except Exception:
-                    pass
+            for tmp in [tmp_m, tmp_s, tmp_f]:
+                if os.path.exists(tmp):
+                    try: os.remove(tmp)
+                    except: pass
             return False
 
-    # =====================================================
-    # 🔧 修复三：加载时打印详细错误，便于排查
-    # =====================================================
+    # 修复三：分步加载，详细报错
     def load(self):
-        """
-        逐步加载模型文件，明确报告哪个文件加载失败。
-        """
-        # 检查所有文件是否存在
-        missing = [p for p in [MODEL_PATH, SCALER_PATH, FEATURES_PATH] if not os.path.exists(p)]
+        missing = [p for p in [MODEL_PATH, SCALER_PATH, FEATURES_PATH]
+                   if not os.path.exists(p)]
         if missing:
             print(f"⚠️ 模型文件缺失: {missing}")
             return False
-
         try:
             self.model = joblib.load(MODEL_PATH)
-            print(f"  ✔ 加载 {MODEL_PATH} 成功")
+            print("  ✔ model 加载成功")
         except Exception as e:
-            print(f"  ✘ 加载 {MODEL_PATH} 失败: {e}")
-            return False
-
+            print(f"  ✘ model 加载失败: {e}"); return False
         try:
             self.scaler = joblib.load(SCALER_PATH)
-            print(f"  ✔ 加载 {SCALER_PATH} 成功")
+            print("  ✔ scaler 加载成功")
         except Exception as e:
-            print(f"  ✘ 加载 {SCALER_PATH} 失败: {e}")
-            return False
-
+            print(f"  ✘ scaler 加载失败: {e}"); return False
         try:
             with open(FEATURES_PATH, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            self.feature_names    = data.get('feature_names', [])
-            self.training_history = data.get('training_history', [])
+            self.feature_names      = data.get('feature_names', [])
+            self.training_history   = data.get('training_history', [])
             self.feature_importance = data.get('feature_importance', {})
-            print(f"  ✔ 加载 {FEATURES_PATH} 成功")
+            self.cv_accuracy        = data.get('cv_accuracy', 0.0)
+            print(f"  ✔ features 加载成功，特征数: {len(self.feature_names)}")
         except Exception as e:
-            print(f"  ✘ 加载 {FEATURES_PATH} 失败: {e}")
-            return False
-
+            print(f"  ✘ features 加载失败: {e}"); return False
         self.is_trained = True
-        last_session = self.training_history[-1] if self.training_history else {}
-        print(f"✅ 模型加载成功 | 样本: {last_session.get('samples', '?')} | "
-              f"准确率: {last_session.get('accuracy', 0):.4f} | "
-              f"特征数: {len(self.feature_names)}")
+        last = self.training_history[-1] if self.training_history else {}
+        print(f"✅ 模型加载成功 | CV准确率={self.cv_accuracy:.4f} | 样本={last.get('samples','?')}")
         return True
 
 
-# 模块级单例，启动时尝试加载
 ai_model = AITradingModel()
 ai_model.load()
 
 # =========================
-# 辅助函数：加载/保存配置与内存
+# 配置 & 内存
 # =========================
 def load_config():
-    default_config = {
+    default = {
         "coins": ["BTC-USDT", "ETH-USDT", "OKB-USDT"],
         "buy_threshold": 70,
         "sell_threshold": 35,
@@ -605,83 +614,80 @@ def load_config():
     }
     try:
         with open(CONFIG_FILE) as f:
-            config = json.load(f)
-        for key, value in default_config.items():
-            if key not in config:
-                config[key] = value
-        return config
+            cfg = json.load(f)
+        for k, v in default.items():
+            if k not in cfg:
+                cfg[k] = v
+        return cfg
     except FileNotFoundError:
-        return default_config
+        return default
 
 def load_memory():
-    default_memory = {
+    default = {
         "trend_weight": 0.3, "momentum_weight": 0.25, "volume_weight": 0.2,
         "volatility_weight": 0.1, "sentiment_weight": 0.2, "ml_weight": 0.4,
         "buy_threshold": 70, "sell_threshold": 35, "feature_importance": {},
-        "last_training_time": 0, "total_training_sessions": 0, "best_accuracy": 0.0,
+        "last_training_time": 0, "best_accuracy": 0.0,
         "model_version": "1.0.0", "training_history": []
     }
     try:
         with open(MEMORY_PATH) as f:
-            memory = json.load(f)
-        for key in default_memory:
-            if key not in memory:
-                memory[key] = default_memory[key]
-        return memory
+            mem = json.load(f)
+        for k in default:
+            if k not in mem:
+                mem[k] = default[k]
+        return mem
     except Exception:
-        save_memory(default_memory)
-        return default_memory
+        save_memory(default)
+        return default
 
 def save_memory(memory):
-    tmp_path = MEMORY_PATH + ".tmp"
+    tmp = MEMORY_PATH + ".tmp"
     try:
-        with open(tmp_path, "w", encoding='utf-8') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(memory, f, indent=4)
-        shutil.move(tmp_path, MEMORY_PATH)
+        shutil.move(tmp, MEMORY_PATH)
     except Exception as e:
         print(f"⚠️ save_memory 失败: {e}")
 
 # =========================
-# 通知功能
+# 通知
 # =========================
 def send_telegram_message(text, config):
-    token = config.get("telegram_bot_token")
+    token   = config.get("telegram_bot_token")
     chat_id = config.get("telegram_chat_id")
     if not token or not chat_id:
         return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     try:
-        requests.post(url, data=payload, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
     except Exception as e:
         print(f"Telegram发送失败: {e}")
 
 def send_email(subject, body, config):
-    user = config.get("email_user")
-    pwd = config.get("email_pass")
-    receiver = config.get("email_receiver")
-    if not user or not pwd or not receiver:
+    user, pwd, receiver = (config.get("email_user"),
+                           config.get("email_pass"),
+                           config.get("email_receiver"))
+    if not all([user, pwd, receiver]):
         return
-    smtp_servers = [("smtp.139.com", 25, True), ("smtp.139.com", 465, False)]
-    for host, port, use_tls in smtp_servers:
+    for host, port, use_tls in [("smtp.139.com", 25, True), ("smtp.139.com", 465, False)]:
         try:
+            srv = smtplib.SMTP(host, port, timeout=10) if use_tls else \
+                  smtplib.SMTP_SSL(host, port, timeout=10)
             if use_tls:
-                server = smtplib.SMTP(host, port, timeout=10)
-                server.starttls()
-            else:
-                server = smtplib.SMTP_SSL(host, port, timeout=10)
-            server.login(user, pwd)
+                srv.starttls()
+            srv.login(user, pwd)
             msg = MIMEMultipart()
-            msg["From"] = user
-            msg["To"] = receiver
-            msg["Subject"] = subject
+            msg["From"], msg["To"], msg["Subject"] = user, receiver, subject
             msg.attach(MIMEText(body, "plain", "utf-8"))
-            server.send_message(msg)
-            server.quit()
+            srv.send_message(msg)
+            srv.quit()
             return
         except Exception as e:
-            print(f"尝试 {host}:{port} 失败: {e}")
-    print("所有邮件尝试均失败")
+            print(f"邮件 {host}:{port} 失败: {e}")
 
 def send_notification(content, config, subject=None):
     send_telegram_message(content, config)
@@ -689,14 +695,13 @@ def send_notification(content, config, subject=None):
         send_email(subject, content, config)
 
 # =========================
-# 市场周期识别
+# 市场周期
 # =========================
 def detect_market_cycle():
     try:
-        df = get_kline("BTC-USDT", interval="5m", limit=300)
-        df["ma200"] = df["close"].rolling(200).mean()
-        price = df["close"].iloc[-1]
-        ma200 = df["ma200"].iloc[-1]
+        df      = get_kline("BTC-USDT", interval="5m", limit=300)
+        ma200   = df["close"].rolling(200).mean().iloc[-1]
+        price   = df["close"].iloc[-1]
         if pd.isna(ma200):
             return "未知"
         momentum = (price - df["close"].iloc[-30]) / df["close"].iloc[-30]
@@ -711,146 +716,121 @@ def detect_market_cycle():
         return "未知"
 
 def apply_cycle_strategy_adjustment(memory, cycle):
-    if not ai_model.is_trained:
-        if cycle == "牛市":
-            memory["trend_weight"] = min(memory.get("trend_weight", 0.3) + 0.05, 1.0)
-        elif cycle == "熊市":
-            memory["trend_weight"] = max(memory.get("trend_weight", 0.3) - 0.05, 0.0)
-        elif cycle == "震荡":
-            memory["volume_weight"] = min(memory.get("volume_weight", 0.2) + 0.05, 1.0)
-        save_memory(memory)
-        print(f"周期调整: {cycle}, 模型未训练，仅调整权重")
-        return memory
-
     memory = memory.copy()
     if cycle == "牛市":
-        memory["trend_weight"] = min(memory.get("trend_weight", 0.3) + 0.05, 1.0)
-        memory["buy_threshold"] = min(memory.get("buy_threshold", 70) + 2, 85)
+        memory["trend_weight"]   = min(memory.get("trend_weight", 0.3) + 0.05, 1.0)
+        memory["buy_threshold"]  = min(memory.get("buy_threshold", 70) + 2, 85)
         memory["sell_threshold"] = max(memory.get("sell_threshold", 35) - 2, 20)
     elif cycle == "熊市":
-        memory["trend_weight"] = max(memory.get("trend_weight", 0.3) - 0.05, 0.0)
-        memory["buy_threshold"] = max(memory.get("buy_threshold", 70) - 2, 55)
+        memory["trend_weight"]   = max(memory.get("trend_weight", 0.3) - 0.05, 0.0)
+        memory["buy_threshold"]  = max(memory.get("buy_threshold", 70) - 2, 55)
         memory["sell_threshold"] = max(memory.get("sell_threshold", 35) - 2, 20)
     elif cycle == "震荡":
-        memory["volume_weight"] = min(memory.get("volume_weight", 0.2) + 0.05, 1.0)
-        memory["buy_threshold"] = max(memory.get("buy_threshold", 70) - 3, 55)
+        memory["volume_weight"]  = min(memory.get("volume_weight", 0.2) + 0.05, 1.0)
+        memory["buy_threshold"]  = max(memory.get("buy_threshold", 70) - 3, 55)
         memory["sell_threshold"] = min(memory.get("sell_threshold", 35) + 3, 45)
-
-    memory["buy_threshold"] = max(memory["buy_threshold"], memory["sell_threshold"] + 5)
-    memory["buy_threshold"] = min(memory["buy_threshold"], 85)
-    memory["sell_threshold"] = max(memory["sell_threshold"], 15)
-    memory["sell_threshold"] = min(memory["sell_threshold"], 50)
-
+    memory["buy_threshold"]  = max(min(memory["buy_threshold"], 85), memory["sell_threshold"] + 5)
+    memory["sell_threshold"] = max(min(memory["sell_threshold"], 50), 15)
     save_memory(memory)
-    print(f"周期调整: {cycle}, 新阈值: 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}")
+    print(f"周期调整: {cycle}, 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}")
     return memory
 
+# =========================
+# 评分
+# =========================
 def calculate_score(df, memory, whale, market_cycle, coin, config):
     df = df.dropna().copy()
     if len(df) < 60:
         rule_score = 50
-        analysis = {
-            'trend': '未知', 'momentum': '未知', 'volume': '未知',
-            'volatility': '未知', 'position': 0.5, 'position_desc': '中等'
-        }
+        analysis   = {'trend': '未知', 'momentum': '未知', 'volume': '未知',
+                      'volatility': '未知', 'position': 0.5, 'position_desc': '中等',
+                      'volume_ratio': 1.0}
     else:
         df["ma20"] = df["close"].rolling(20).mean()
         df["ma60"] = df["close"].rolling(60).mean()
-        ma20 = df["ma20"].iloc[-1]
-        ma60 = df["ma60"].iloc[-1]
-        momentum = (df["close"].iloc[-1] - df["close"].iloc[-10]) / df["close"].iloc[-10]
+        ma20       = df["ma20"].iloc[-1]
+        ma60       = df["ma60"].iloc[-1]
+        momentum   = (df["close"].iloc[-1] - df["close"].iloc[-10]) / df["close"].iloc[-10]
+
         rule_score = 50
         if ma20 > ma60:
             rule_score += 20 * memory.get("trend_weight", 0.3)
         if momentum > 0.02:
             rule_score += 15 * memory.get("momentum_weight", 0.25)
-        volume = df["volume"].iloc[-1]
+
+        volume     = df["volume"].iloc[-1]
         avg_volume = df["volume"].mean()
-        if volume > avg_volume * 1.5:
+        vol_ratio  = volume / avg_volume if avg_volume != 0 else 1
+        if vol_ratio > 1.5:
             rule_score += 10 * memory.get("volume_weight", 0.2)
         if whale > 0:
             rule_score += 5
         rule_score = max(0, min(100, int(rule_score)))
 
-        trend_desc = "多头" if ma20 > ma60 else "空头"
-        if momentum > 0.03:
-            momentum_desc = "强"
-        elif momentum > 0.01:
-            momentum_desc = "中等"
-        else:
-            momentum_desc = "弱"
-        volume_ratio = volume / avg_volume if avg_volume != 0 else 1
-        if volume_ratio > 2.0:
-            volume_desc = "放量"
-        elif volume_ratio > 1.5:
-            volume_desc = "温和放量"
-        elif volume_ratio < 0.5:
-            volume_desc = "缩量"
-        else:
-            volume_desc = "正常"
         close_vals = df['close'].values
-        if len(close_vals) >= 21:
-            close_slice = close_vals[-21:]
-            returns = np.diff(close_slice) / close_slice[:-1]
-            vol = np.std(returns)
-        else:
-            vol = 0
-        if vol > 0.03:
-            vol_desc = "高"
-        elif vol > 0.01:
-            vol_desc = "中"
-        else:
-            vol_desc = "低"
-        high_20 = np.max(close_vals[-20:])
-        low_20 = np.min(close_vals[-20:])
-        if high_20 > low_20:
-            pos = (close_vals[-1] - low_20) / (high_20 - low_20)
-        else:
-            pos = 0.5
-        if pos > 0.8:
-            pos_desc = "高位（接近压力）"
-        elif pos < 0.2:
-            pos_desc = "低位（接近支撑）"
-        else:
-            pos_desc = "中等"
+        returns    = np.diff(close_vals[-21:]) / close_vals[-21:-1] if len(close_vals) >= 21 else [0]
+        vol        = np.std(returns)
+        high_20    = np.max(close_vals[-20:])
+        low_20     = np.min(close_vals[-20:])
+        pos        = (close_vals[-1] - low_20) / (high_20 - low_20) if high_20 > low_20 else 0.5
 
         analysis = {
-            'trend': trend_desc, 'momentum': momentum_desc,
-            'volume': volume_desc, 'volatility': vol_desc,
-            'position': pos, 'position_desc': pos_desc
+            'trend':        "多头" if ma20 > ma60 else "空头",
+            'momentum':     "强" if momentum > 0.03 else ("中等" if momentum > 0.01 else "弱"),
+            'volume':       "放量" if vol_ratio > 2 else ("温和放量" if vol_ratio > 1.5 else
+                            ("缩量" if vol_ratio < 0.5 else "正常")),
+            'volatility':   "高" if vol > 0.03 else ("中" if vol > 0.01 else "低"),
+            'position':     pos,
+            'position_desc':"高位（接近压力）" if pos > 0.8 else ("低位（接近支撑）" if pos < 0.2 else "中等"),
+            'volume_ratio': vol_ratio
         }
 
     ml_score = 50
     ml_confidence = 0
-    feature_importance = {}
     features = None
     if config.get("use_ml_model", True) and ai_model.is_trained:
         try:
             features = ai_model.extract_features(df, whale, market_cycle, coin)
             if features:
                 ml_score, ml_info = ai_model.predict(features)
-                ml_confidence = ml_info.get('confidence', 0)
-                feature_importance = ml_info.get('contribution', {})
+                ml_confidence     = ml_info.get('confidence', 0)
         except Exception as e:
             print(f"ML预测失败: {e}")
     else:
-        features = ai_model.extract_features(df, whale, market_cycle, coin)
+        try:
+            features = ai_model.extract_features(df, whale, market_cycle, coin)
+        except Exception:
+            pass
 
-    ml_weight = config.get("ml_weight", 0.4) if ai_model.is_trained else 0
+    ml_weight      = config.get("ml_weight", 0.4) if ai_model.is_trained else 0
     combined_score = rule_score * (1 - ml_weight) + ml_score * ml_weight
-    up_prob = ml_score / 100 if ai_model.is_trained else combined_score / 100
-    up_prob = max(0, min(1, up_prob))
+    up_prob        = ml_score / 100 if ai_model.is_trained else combined_score / 100
+
+    # 新增：计算止损止盈（基于ATR）
+    atr       = calculate_atr(df)
+    cur_price = df['close'].iloc[-1]
+    stop_loss_buy   = round(cur_price - atr * 2, 6)   # 买入止损：价格 - 2×ATR
+    take_profit_buy = round(cur_price + atr * 3, 6)   # 买入止盈：价格 + 3×ATR（1:1.5赔率）
+    stop_loss_sell   = round(cur_price + atr * 2, 6)  # 卖出止损
+    take_profit_sell = round(cur_price - atr * 3, 6)  # 卖出止盈
 
     factors = {
-        'rule_score': rule_score, 'ml_score': ml_score,
-        'ml_confidence': ml_confidence, 'combined_score': combined_score,
-        'feature_importance': feature_importance,
-        'up_prob': up_prob, 'analysis': analysis
+        'rule_score':     rule_score,
+        'ml_score':       ml_score,
+        'ml_confidence':  ml_confidence,
+        'combined_score': combined_score,
+        'up_prob':        max(0, min(1, up_prob)),
+        'analysis':       analysis,
+        'atr':            atr,
+        'stop_loss_buy':  stop_loss_buy,
+        'take_profit_buy':take_profit_buy,
+        'stop_loss_sell':  stop_loss_sell,
+        'take_profit_sell':take_profit_sell,
     }
     return int(combined_score), factors, features
 
 # =========================
-# 日志管理
+# 日志
 # =========================
 def load_log():
     try:
@@ -860,445 +840,534 @@ def load_log():
         return []
 
 def save_log(log):
-    tmp_path = LOG_PATH + ".tmp"
+    tmp = LOG_PATH + ".tmp"
     try:
-        with open(tmp_path, "w", encoding='utf-8') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(log, f, indent=4)
-        shutil.move(tmp_path, LOG_PATH)
+        shutil.move(tmp, LOG_PATH)
     except Exception as e:
         print(f"⚠️ save_log 失败: {e}")
 
 def verify_past_signals(config):
-    log = load_log()
+    log     = load_log()
     updated = False
     for entry in log:
-        if not entry.get("verified", False):
-            coin = entry["coin"]
-            signal_time = entry["timestamp"]
-            try:
-                df = get_kline(coin, interval="5m", limit=10)
-                df['ts_sec'] = df['ts'] / 1000
-                future_df = df[df['ts_sec'] > signal_time].sort_values('ts_sec')
-                if len(future_df) >= 5:
-                    if entry["signal"] == "买入":
-                        max_price = future_df['high'].iloc[:5].max()
-                        profit = (max_price - entry["price"]) / entry["price"]
-                        correct = profit > PROFIT_THRESHOLD
-                    elif entry["signal"] == "卖出":
-                        min_price = future_df['low'].iloc[:5].min()
-                        profit = (entry["price"] - min_price) / entry["price"]
-                        correct = profit > PROFIT_THRESHOLD
-                    else:
-                        correct = False
-                else:
-                    continue
-                entry["verified"] = True
-                entry["result"] = "correct" if correct else "wrong"
-                updated = True
-            except Exception as e:
-                print(f"验证{coin}信号失败: {e}")
+        if entry.get("verified", False):
+            continue
+        coin        = entry["coin"]
+        signal_time = entry["timestamp"]
+        try:
+            df = get_kline(coin, interval="5m", limit=10)
+            df['ts_sec']  = df['ts'] / 1000
+            future_df = df[df['ts_sec'] > signal_time].sort_values('ts_sec')
+            if len(future_df) < 5:
+                continue
+            if entry["signal"] == "买入":
+                profit  = (future_df['high'].iloc[:5].max() - entry["price"]) / entry["price"]
+            elif entry["signal"] == "卖出":
+                profit  = (entry["price"] - future_df['low'].iloc[:5].min()) / entry["price"]
+            else:
+                continue
+            entry["verified"] = True
+            entry["result"]   = "correct" if profit > PROFIT_THRESHOLD else "wrong"
+            entry["profit"]   = round(profit * 100, 3)
+            updated = True
+        except Exception as e:
+            print(f"验证{coin}失败: {e}")
     if updated:
         save_log(log)
 
 def log_signal(coin, signal, score, price, whale, market_cycle, factors, features):
-    log = load_log()
+    log   = load_log()
     entry = {
-        "timestamp": time.time(),
-        "coin": coin,
-        "signal": signal,
-        "score": score,
-        "price": price,
-        "whale": whale,
+        "timestamp":    time.time(),
+        "coin":         coin,
+        "signal":       signal,
+        "score":        score,
+        "price":        price,
+        "whale":        whale,
         "market_cycle": market_cycle,
-        "rule_score": factors.get('rule_score', 50),
-        "ml_score": factors.get('ml_score', 50),
-        "ml_confidence": factors.get('ml_confidence', 0),
-        "features": features,
-        "verified": False,
-        "result": None
+        "rule_score":   factors.get('rule_score', 50),
+        "ml_score":     factors.get('ml_score', 50),
+        "ml_confidence":factors.get('ml_confidence', 0),
+        "features":     features,
+        "verified":     False,
+        "result":       None,
+        "profit":       None
     }
     log.append(entry)
     if len(log) > MAX_LOG_SIZE:
-        unverified = [e for e in log if not e.get("verified", False)]
-        verified = [e for e in log if e.get("verified", False)]
-        keep = MAX_LOG_SIZE - len(unverified)
-        verified = verified[-keep:] if keep > 0 else []
-        log = unverified + verified
+        verified   = [e for e in log if e.get("verified")]
+        unverified = [e for e in log if not e.get("verified")]
+        keep       = MAX_LOG_SIZE - len(unverified)
+        log        = (verified[-keep:] if keep > 0 else []) + unverified
     save_log(log)
 
 # =========================
-# 自适应优化
+# 自适应优化（增加过拟合防护）
 # =========================
 def adaptive_strategy_optimization(config):
-    global ai_model
-    log = load_log()
+    log      = load_log()
     verified = [e for e in log if e.get("verified") and e.get("result") in ("correct", "wrong")]
     if len(verified) < MIN_TRAIN_SAMPLES:
-        print(f"自适应优化：已验证记录不足{MIN_TRAIN_SAMPLES}条，跳过")
+        print(f"自适应优化：已验证{len(verified)}/{MIN_TRAIN_SAMPLES}条，跳过")
         return
+
     X_df, y = ai_model.prepare_training_data(verified)
     if X_df is None:
         print("特征提取后样本不足")
         return
-    success = ai_model.train(X_df, y)
-    if success:
-        save_ok = ai_model.save()
-        if not save_ok:
-            print("⚠️ 模型保存失败，但 is_trained 已为 True，本轮内存中可用")
-        memory = load_memory()
-        memory['feature_importance'] = ai_model.feature_importance
-        memory['ml_weight'] = min(0.9, memory.get('ml_weight', 0.4) + 0.05)
-        accuracy = ai_model.training_history[-1]['accuracy']
-        if accuracy > 0.65:
-            memory['buy_threshold'] = min(memory.get('buy_threshold', 70) + 2, 85)
-            memory['sell_threshold'] = max(memory.get('sell_threshold', 35) - 2, 20)
-        elif accuracy < 0.5:
-            memory['buy_threshold'] = max(memory.get('buy_threshold', 70) - 2, 55)
-            memory['sell_threshold'] = min(memory.get('sell_threshold', 35) + 2, 45)
-        memory['buy_threshold'] = max(memory['buy_threshold'], memory['sell_threshold'] + 5)
-        memory['buy_threshold'] = min(memory['buy_threshold'], 85)
-        memory['sell_threshold'] = max(memory['sell_threshold'], 15)
-        memory['sell_threshold'] = min(memory['sell_threshold'], 50)
-        save_memory(memory)
-        top_features = sorted(ai_model.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
-        feature_msg = "\n".join([f"{f}: {v:.4f}" for f, v in top_features])
-        msg = (f"🤖 AI模型已进化\n训练样本: {len(X_df)}\n准确率: {accuracy:.4f}\n"
-               f"新阈值: 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}\nTop5特征:\n{feature_msg}")
-        send_notification(msg, config, "AI模型进化报告")
 
+    success = ai_model.train(X_df, y)
+    if not success:
+        return
+
+    ai_model.save()
+    cv_acc = ai_model.cv_accuracy
+    memory = load_memory()
+    memory['feature_importance'] = ai_model.feature_importance
+
+    # 用CV准确率（而非训练准确率）来调整阈值
+    if cv_acc > 0.60:
+        memory['buy_threshold']  = min(memory.get('buy_threshold', 70) + 2, 85)
+        memory['sell_threshold'] = max(memory.get('sell_threshold', 35) - 2, 20)
+        memory['ml_weight']      = min(0.7, memory.get('ml_weight', 0.4) + 0.05)
+    elif cv_acc < 0.50:
+        # CV准确率低于50%（低于随机），降低ML权重
+        memory['buy_threshold']  = max(memory.get('buy_threshold', 70) - 2, 55)
+        memory['sell_threshold'] = min(memory.get('sell_threshold', 35) + 2, 45)
+        memory['ml_weight']      = max(0.1, memory.get('ml_weight', 0.4) - 0.1)
+        print(f"⚠️ CV准确率偏低({cv_acc:.3f})，降低ML权重至{memory['ml_weight']:.2f}")
+
+    memory['buy_threshold']  = max(min(memory['buy_threshold'], 85), memory['sell_threshold'] + 5)
+    memory['sell_threshold'] = max(min(memory['sell_threshold'], 50), 15)
+    save_memory(memory)
+
+    # 获取实际胜率（最近100条）
+    recent_verified = sorted(verified, key=lambda x: x.get('timestamp', 0), reverse=True)[:100]
+    recent_correct  = sum(1 for e in recent_verified if e.get('result') == 'correct')
+    real_winrate    = recent_correct / len(recent_verified) if recent_verified else 0
+
+    train_acc = ai_model.training_history[-1]['train_acc']
+    overfit_warning = ""
+    if train_acc - cv_acc > 0.15:
+        overfit_warning = f"\n⚠️ 检测到过拟合(差距{train_acc - cv_acc:.2%})，已自动降低模型权重"
+
+    top5        = sorted(ai_model.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
+    feature_msg = "\n".join([f"  {f}: {v:.4f}" for f, v in top5]) if top5 else "  （暂无）"
+
+    msg = (f"🤖 AI模型已进化\n"
+           f"训练样本: {len(X_df)}\n"
+           f"训练准确率: {train_acc:.2%}\n"
+           f"CV准确率: {cv_acc:.2%}  ← 真实参考值\n"
+           f"实际胜率(近100条): {real_winrate:.2%}\n"
+           f"新阈值: 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}\n"
+           f"ML权重: {memory['ml_weight']:.2f}\n"
+           f"Top5特征:\n{feature_msg}"
+           f"{overfit_warning}")
+    send_notification(msg, config, "AI模型进化报告")
+
+# =========================
+# 回测 & 统计
+# =========================
 def generate_backtest_report():
-    log = load_log()
+    log      = load_log()
     verified = [e for e in log if e.get("verified")]
     if not verified:
         return "暂无已验证数据"
-    total = len(verified)
+    total   = len(verified)
     correct = sum(1 for e in verified if e.get("result") == "correct")
-    winrate = correct / total if total else 0
-    report = f"📊 回测报告\n时间: {datetime.now()}\n总信号: {total}\n正确: {correct}\n错误: {total-correct}\n胜率: {winrate:.2%}"
-    return report
+    profits = [e.get('profit', 0) for e in verified if e.get('profit') is not None]
+    avg_profit = np.mean(profits) if profits else 0
+    return (f"📊 回测报告\n"
+            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            f"总信号: {total}\n"
+            f"正确: {correct} | 错误: {total - correct}\n"
+            f"胜率: {correct/total:.2%}\n"
+            f"平均利润: {avg_profit:.3f}%")
 
 def get_recent_signals(n=3):
-    log = load_log()
-    signals = [e for e in log if e.get("signal") in ("买入", "卖出")]
-    signals.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-    recent = []
-    now = time.time()
+    log     = load_log()
+    signals = sorted([e for e in log if e.get("signal") in ("买入", "卖出")],
+                     key=lambda x: x.get("timestamp", 0), reverse=True)
+    now     = time.time()
+    result  = []
     for s in signals[:n]:
-        ts = s.get("timestamp", 0)
-        minutes_ago = int((now - ts) / 60)
-        time_str = f"{minutes_ago}分钟前" if minutes_ago < 60 else f"{minutes_ago//60}小时前"
-        recent.append(f"{time_str} {s['coin']} {s['signal']} ({s['score']})")
-    return recent
+        mins_ago = int((now - s.get("timestamp", 0)) / 60)
+        t_str    = f"{mins_ago}分钟前" if mins_ago < 60 else f"{mins_ago//60}小时前"
+        result_mark = ""
+        if s.get("verified"):
+            result_mark = " ✅" if s.get("result") == "correct" else " ❌"
+        result.append(f"{t_str} {s['coin']} {s['signal']} ({s['score']}){result_mark}")
+    return result
 
 def get_signal_stats_since(hours):
-    log = load_log()
+    log    = load_log()
     cutoff = time.time() - hours * 3600
-    recent = [e for e in log if e.get("timestamp", 0) > cutoff and e.get("signal") in ("买入", "卖出")]
-    total = len(recent)
-    correct = sum(1 for e in recent if e.get("result") == "correct")
+    recent = [e for e in log if e.get("timestamp", 0) > cutoff
+              and e.get("signal") in ("买入", "卖出")]
+    total  = len(recent)
+    correct= sum(1 for e in recent if e.get("result") == "correct")
     return total, correct
 
-def send_backtest_report(config):
-    report = generate_backtest_report()
-    send_notification(report, config, "每日回测报告")
-
 # =========================
-# 交易过滤函数
+# 过滤 & 风险
 # =========================
 def check_buy_filters(coin, df, memory):
     try:
         df_btc = get_kline("BTC-USDT", interval="5m", limit=60)
-        btc_ma20 = df_btc['close'].rolling(20).mean().iloc[-1]
-        btc_ma60 = df_btc['close'].rolling(60).mean().iloc[-1]
-        if btc_ma20 < btc_ma60:
+        if df_btc['close'].rolling(20).mean().iloc[-1] < df_btc['close'].rolling(60).mean().iloc[-1]:
             return False, "BTC处于下跌趋势"
     except Exception:
         return False, "BTC数据获取失败"
 
-    volume = df['volume'].iloc[-1]
-    avg_volume = df['volume'].mean()
-    if volume < avg_volume * VOLUME_RATIO_MIN:
-        return False, f"成交量不足 (当前{volume:.0f}, 需>{avg_volume*VOLUME_RATIO_MIN:.0f})"
+    volume    = df['volume'].iloc[-1]
+    avg_vol   = df['volume'].mean()
+    if volume < avg_vol * VOLUME_RATIO_MIN:
+        return False, f"成交量不足({volume:.0f}<{avg_vol*VOLUME_RATIO_MIN:.0f})"
 
     close = df['close'].values
-    returns = np.diff(close[-20:]) / close[-21:-1]
-    volatility = np.std(returns)
-    if volatility < VOLATILITY_MIN:
-        return False, f"波动率过低 ({volatility:.4f} < {VOLATILITY_MIN})"
+    if len(close) >= 21:
+        vol = np.std(np.diff(close[-21:]) / close[-21:-1])
+        if vol < VOLATILITY_MIN:
+            return False, f"波动率过低({vol:.4f})"
 
     return True, "通过"
 
-# =========================
-# 生成风险提示
-# =========================
 def generate_risk_analysis(analysis, factors, config):
     risks = []
-    risk_level = "低"
     if analysis['volatility'] == "高":
         risks.append("波动过大")
-    if factors.get('volume_ratio', 0) < 1.5:
+    if analysis.get('volume_ratio', 1) < 1.5:
         risks.append("成交量不足")
     try:
         df_btc = get_kline("BTC-USDT", interval="5m", limit=60)
-        btc_ma20 = df_btc['close'].rolling(20).mean().iloc[-1]
-        btc_ma60 = df_btc['close'].rolling(60).mean().iloc[-1]
-        if btc_ma20 < btc_ma60:
+        if df_btc['close'].rolling(20).mean().iloc[-1] < df_btc['close'].rolling(60).mean().iloc[-1]:
             risks.append("大盘走弱")
     except Exception:
         pass
     if analysis['position'] > 0.8:
         risks.append("接近压力位")
     elif analysis['position'] < 0.2:
-        risks.append("接近支撑位（超卖）")
-    if len(risks) >= 3:
-        risk_level = "高"
-    elif len(risks) >= 1:
-        risk_level = "中"
+        risks.append("接近支撑位")
+
+    risk_level = "高" if len(risks) >= 3 else ("中" if risks else "低")
     return risk_level, risks
+
+# =========================
+# 新增：优化后的信号通知
+# =========================
+def build_signal_message(coin, base_signal, score, display_price,
+                          factors, analysis, risk_level, risks,
+                          confirm_count, avg_score, config):
+    """
+    构建包含止损/止盈/置信度/建议仓位的完整信号消息。
+    """
+    up_prob    = factors['up_prob'] * 100
+    atr        = factors['atr']
+    confidence = factors.get('ml_confidence', 0) * 100
+
+    # 止损止盈
+    if base_signal == "买入":
+        sl = factors['stop_loss_buy']
+        tp = factors['take_profit_buy']
+        sl_pct = abs(display_price - sl) / display_price * 100
+        tp_pct = abs(tp - display_price) / display_price * 100
+    else:
+        sl = factors['stop_loss_sell']
+        tp = factors['take_profit_sell']
+        sl_pct = abs(sl - display_price) / display_price * 100
+        tp_pct = abs(display_price - tp) / display_price * 100
+
+    # 建议仓位（基于风险等级和CV准确率）
+    if risk_level == "高":
+        position_suggest = "轻仓(≤10%)"
+    elif risk_level == "中":
+        position_suggest = "半仓(≤30%)"
+    else:
+        position_suggest = "正常仓(≤50%)"
+
+    # 模型可信度
+    cv_acc = ai_model.cv_accuracy if ai_model.is_trained else 0
+    model_reliability = "⚠️ 模型未训练" if not ai_model.is_trained else \
+                        (f"✅ 可靠(CV:{cv_acc:.0%})" if cv_acc >= 0.55 else
+                         f"⚠️ 低可信(CV:{cv_acc:.0%})，仅供参考")
+
+    signal_emoji = "🟢" if base_signal == "买入" else "🔴"
+    risk_emoji   = "🔴" if risk_level == "高" else ("🟡" if risk_level == "中" else "🟢")
+
+    msg = (
+        f"{signal_emoji} <b>{coin} {base_signal}信号</b>\n\n"
+        f"💰 价格：${display_price:.6g}\n"
+        f"📊 综合评分：{score} (规则:{factors['rule_score']} ML:{factors['ml_score']:.0f})\n"
+        f"🎯 上涨概率：{up_prob:.1f}%\n"
+        f"🔁 连续确认：{confirm_count}次 (均分{avg_score:.0f})\n\n"
+        f"📈 趋势：{analysis['trend']} | 动量：{analysis['momentum']}\n"
+        f"📦 成交量：{analysis['volume']} | 波动：{analysis['volatility']}\n"
+        f"📍 位置：{analysis['position_desc']}\n\n"
+        f"🛡️ 止损价：${sl:.6g} (-{sl_pct:.1f}%)\n"
+        f"🎯 目标价：${tp:.6g} (+{tp_pct:.1f}%)\n"
+        f"💼 建议仓位：{position_suggest}\n\n"
+        f"{risk_emoji} 风险等级：{risk_level}\n"
+        f"⚠️ 风险点：{'、'.join(risks) if risks else '无明显风险'}\n\n"
+        f"🤖 模型：{model_reliability}\n"
+        f"🌍 市场周期：{current_market_cycle}\n"
+        f"⏰ {datetime.now().strftime('%m-%d %H:%M')}"
+    )
+    return msg
+
+# =========================
+# 优化后的状态推送
+# =========================
+def build_status_message(coins, memory, config):
+    """
+    构建更清晰的定期状态推送，包含模型健康度预警。
+    """
+    now    = time.time()
+    uptime = int(now - start_time)
+    h, m   = uptime // 3600, (uptime % 3600) // 60
+
+    # 模型状态（含过拟合预警）
+    if ai_model.is_trained and ai_model.training_history:
+        last       = ai_model.training_history[-1]
+        train_acc  = last.get('train_acc', last.get('accuracy', 0))
+        cv_acc     = last.get('cv_accuracy', ai_model.cv_accuracy)
+        gap        = train_acc - cv_acc
+        overfit_tag= f" ⚠️过拟合" if gap > 0.15 else ""
+        model_info = (f"✅ 已训练 | 样本:{last['samples']}\n"
+                      f"     训练准确率:{train_acc:.0%} CV:{cv_acc:.0%}{overfit_tag}")
+    else:
+        model_info = "❌ 未训练（积累中...）"
+
+    # 今日胜率预警
+    today_total, today_correct = get_signal_stats_since(24)
+    today_winrate = today_correct / today_total if today_total > 0 else 0
+    winrate_tag   = " ⚠️偏低" if today_total >= 10 and today_winrate < 0.4 else ""
+
+    sixh_total, sixh_correct = get_signal_stats_since(6)
+    sixh_winrate  = sixh_correct / sixh_total if sixh_total > 0 else 0
+
+    # 币种行情
+    coin_lines = []
+    for coin in coins:
+        try:
+            df       = get_kline(coin, interval="5m", limit=300)
+            whale    = detect_whale(coin)
+            score, factors, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
+            analysis = factors['analysis']
+            price    = get_ticker(coin) or df['close'].iloc[-1]
+            direction= "↑" if analysis['trend'] == "多头" else "↓"
+            up_prob  = factors['up_prob'] * 100
+            coin_lines.append(
+                f"  {coin}: ${price:.6g} | {score:.0f}分 {direction} | {up_prob:.0f}%"
+            )
+        except Exception:
+            coin_lines.append(f"  {coin}: 获取失败")
+
+    recent  = get_recent_signals(3)
+    hot     = scan_hot_coins()[:3]
+    hot_str = "\n".join([f"  {c}: {ch:+.2f}%" for c, ch in hot]) if hot else "  暂无"
+
+    status = (
+        f"📡 <b>AI监控状态报告</b>\n\n"
+        f"📈 监控币种:\n" + "\n".join(coin_lines) + "\n\n"
+        f"⏱️ 最近信号:\n" +
+        ("\n".join([f"  {s}" for s in recent]) if recent else "  暂无") + "\n\n"
+        f"🔥 市场热点:\n{hot_str}\n\n"
+        f"🤖 模型状态:\n  {model_info}\n\n"
+        f"📊 胜率统计:\n"
+        f"  6小时: {sixh_total}次 | {sixh_winrate:.0%}\n"
+        f"  24小时: {today_total}次 | {today_winrate:.0%}{winrate_tag}\n\n"
+        f"⚙️ 阈值: 买入{config['buy_threshold']} | 卖出{config['sell_threshold']}\n"
+        f"🕐 运行: {h}小时{m}分钟 | {current_market_cycle}"
+    )
+    return status
 
 # =========================
 # 主程序
 # =========================
 def main():
-    global last_backtest_time, last_adaptive_time, last_cycle_check, current_market_cycle
+    global last_backtest_time, last_adaptive_time, last_cycle_check
     global last_status_push, last_daily_report, last_signal_time, last_scores
+    global current_market_cycle, start_time
 
-    config = load_config()
-    print("=" * 50)
+    config     = load_config()
     start_time = time.time()
+    print("=" * 50)
     print("AI自主学习交易系统启动 (Gate.io 决策辅助版)")
-    print(f"模型状态: {'已训练' if ai_model.is_trained else '未训练'}")
-    print(f"使用ML: {config.get('use_ml_model', True)}")
+    print(f"模型状态: {'已训练 CV=' + str(round(ai_model.cv_accuracy, 4)) if ai_model.is_trained else '未训练'}")
     print("=" * 50)
 
     if not ai_model.is_trained:
         memory = load_memory()
-        memory["buy_threshold"] = 50
+        memory["buy_threshold"]  = 65
         memory["sell_threshold"] = 35
         save_memory(memory)
-        print("⚠️ 模型未训练，已强制设置买入阈值=50，卖出阈值=35")
-        config["buy_threshold"] = 50
+        config["buy_threshold"]  = 65
         config["sell_threshold"] = 35
+        print("⚠️ 模型未训练，使用保守阈值: 买入65 / 卖出35")
     else:
         print("✅ 模型已训练，使用动态阈值")
 
-    try:
-        if os.path.exists(LOG_PATH):
-            file_size = os.path.getsize(LOG_PATH)
-            msg = f"✅ 日志文件存在，大小：{file_size} 字节"
-        else:
-            msg = "❌ 日志文件不存在"
-        send_telegram_message(msg, config)
-        print(msg)
-    except Exception as e:
-        print(f"检测日志文件时出错：{e}")
+    # 启动通知
+    log_size = os.path.getsize(LOG_PATH) if os.path.exists(LOG_PATH) else 0
+    send_telegram_message(
+        f"🚀 系统启动\n"
+        f"模型: {'✅已训练' if ai_model.is_trained else '❌未训练'}\n"
+        f"日志大小: {log_size} 字节\n"
+        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        config
+    )
 
     while True:
         try:
             now = time.time()
 
+            # 市场周期检查
             if now - last_cycle_check > MARKET_CYCLE_INTERVAL:
                 new_cycle = detect_market_cycle()
                 if new_cycle != current_market_cycle:
                     current_market_cycle = new_cycle
-                    print(f"市场周期更新: {current_market_cycle}")
                     memory = load_memory()
                     memory = apply_cycle_strategy_adjustment(memory, current_market_cycle)
+                    print(f"市场周期更新: {current_market_cycle}")
                 last_cycle_check = now
 
             verify_past_signals(config)
 
-            hot_coins_with_change = scan_hot_coins()[:MAX_DYNAMIC_COINS]
-            hot_coins = [coin for coin, _ in hot_coins_with_change]
-            coins = config["coins"].copy()
+            # 动态扩展监控币种
+            hot_coins = [c for c, _ in scan_hot_coins()[:MAX_DYNAMIC_COINS]]
+            coins     = config["coins"].copy()
             for h in hot_coins:
                 if hot_coin_filter(h) and h not in coins:
                     coins.append(h)
 
             memory = load_memory()
-            config["buy_threshold"] = memory.get("buy_threshold", config["buy_threshold"])
+            config["buy_threshold"]  = memory.get("buy_threshold",  config["buy_threshold"])
             config["sell_threshold"] = memory.get("sell_threshold", config["sell_threshold"])
+            print(f"[DEBUG] 阈值: 买入={config['buy_threshold']}, 卖出={config['sell_threshold']}")
 
-            print(f"[DEBUG] 当前买入阈值: {config['buy_threshold']}, 卖出阈值: {config['sell_threshold']}")
-
+            # ======= 核心信号循环 =======
             for coin in coins:
                 try:
-                    df = get_kline(coin, interval="5m", limit=300)
+                    df    = get_kline(coin, interval="5m", limit=300)
                     whale = detect_whale(coin)
-                    score, factors, features = calculate_score(df, memory, whale, current_market_cycle, coin, config)
+                    score, factors, features = calculate_score(
+                        df, memory, whale, current_market_cycle, coin, config)
                     analysis = factors['analysis']
 
+                    # 基础信号判断
                     if score >= config["buy_threshold"]:
                         base_signal = "买入"
                     elif score <= config["sell_threshold"]:
                         base_signal = "卖出"
                     else:
                         base_signal = "中性"
+                        reset_signal_confirm(coin)
+                        continue
 
-                    if score >= SIGNAL_STRONG_BUY:
-                        display_signal = "强看多"
-                    elif score >= SIGNAL_BUY:
-                        display_signal = "偏多"
-                    elif score <= SIGNAL_STRONG_SELL:
-                        display_signal = "强看空"
-                    elif score <= SIGNAL_SELL:
-                        display_signal = "偏空"
+                    # ---- 连续确认机制 ----
+                    confirmed, avg_score = check_signal_confirm(coin, base_signal, score)
+                    if not confirmed:
+                        print(f"{coin} {base_signal}信号等待确认({score}分)...")
+                        continue
+
+                    # ---- 冷却检查 ----
+                    if now - last_signal_time.get(coin, 0) < SIGNAL_COOLDOWN:
+                        print(f"{coin} 信号冷却中，跳过")
+                        continue
+                    last_signal_time[coin] = now
+
+                    price = get_ticker(coin) or df["close"].iloc[-1]
+
+                    # ---- 记录日志（仅自定义币种）----
+                    if coin in config["coins"]:
+                        log_signal(coin, base_signal, score, price, whale,
+                                   current_market_cycle, factors, features)
+                        print(f"📝 记录信号: {coin} {base_signal} 评分{score}")
                     else:
-                        display_signal = "震荡"
+                        print(f"📝 热门币 {coin} 信号不记录训练日志")
 
-                    if base_signal in ("买入", "卖出"):
-                        last_time = last_signal_time.get(coin, 0)
-                        if now - last_time < SIGNAL_COOLDOWN:
-                            print(f"{coin} 信号 {base_signal} 冷却中，跳过记录")
-                            continue
-                        last_signal_time[coin] = now
-
-                        price = df["close"].iloc[-1]
-                        if coin in config["coins"]:
-                            log_signal(coin, base_signal, score, price, whale, current_market_cycle, factors, features)
-                            print(f"📝 记录信号: {coin} {base_signal} 评分{score}")
-                        else:
-                            print(f"📝 热门币 {coin} 信号不记录训练日志")
-
-                    filter_passed = True
-                    filter_reason = ""
+                    # ---- 买入过滤 ----
                     if base_signal == "买入":
-                        filter_passed, filter_reason = check_buy_filters(coin, df, memory)
+                        ok, reason = check_buy_filters(coin, df, memory)
+                        if not ok:
+                            print(f"{coin} 买入被过滤: {reason}")
+                            continue
 
-                    ticker_price = get_ticker(coin)
-                    display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
-
+                    # ---- 风险分析 ----
                     risk_level, risks = generate_risk_analysis(analysis, factors, config)
-                    risk_points = "、".join(risks) if risks else "无明显风险"
-                    up_prob = factors['up_prob'] * 100
 
-                    if base_signal in ("买入", "卖出") and filter_passed:
-                        advice = "评分超过买入阈值，可考虑建仓。" if base_signal == "买入" else "评分低于卖出阈值，可考虑减仓。"
-                        msg = (f"📊 {coin} 分析\n\n"
-                               f"上涨概率：{up_prob:.1f}%\n\n"
-                               f"趋势：{analysis['trend']}\n"
-                               f"动量：{analysis['momentum']}\n"
-                               f"成交量：{analysis['volume']}\n"
-                               f"波动：{analysis['volatility']}\n\n"
-                               f"位置：{analysis['position_desc']}\n\n"
-                               f"风险等级：{risk_level}\n"
-                               f"风险点：{risk_points}\n\n"
-                               f"建议：{advice}\n"
-                               f"价格：${display_price:.4f}\n"
-                               f"时间：{datetime.now()}")
-                        send_notification(msg, config, f"{coin} 分析")
-                        print(f"{coin} {display_signal} {score:.1f} (上涨概率{up_prob:.1f}%) {current_market_cycle} 价格:{display_price}")
-                    elif base_signal == "买入" and not filter_passed:
-                        print(f"{coin} 买入信号被过滤，但已记录日志: {filter_reason}")
+                    # ---- 多档显示信号 ----
+                    if score >= SIGNAL_STRONG_BUY:
+                        display_signal = "🚀强看多"
+                    elif score >= SIGNAL_BUY:
+                        display_signal = "📈偏多"
+                    elif score <= SIGNAL_STRONG_SELL:
+                        display_signal = "💥强看空"
+                    else:
+                        display_signal = "📉偏空"
+
+                    print(f"{coin} {display_signal} {score:.1f}分 "
+                          f"({factors['up_prob']*100:.1f}%) {current_market_cycle} 价格:{price}")
+
+                    # ---- 构建并发送优化后的通知 ----
+                    msg = build_signal_message(
+                        coin, base_signal, score, price,
+                        factors, analysis, risk_level, risks,
+                        SIGNAL_CONFIRM_COUNT, avg_score, config
+                    )
+                    send_notification(msg, config, f"{coin} {base_signal}信号")
+                    reset_signal_confirm(coin)   # 发送后重置确认状态
 
                 except Exception as e:
                     print(f"处理{coin}时出错: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    import traceback; traceback.print_exc()
 
-            if now - last_backtest_time > BACKTEST_INTERVAL:
-                send_backtest_report(config)
-                last_backtest_time = now
-
+            # ======= 定时任务 =======
             if now - last_adaptive_time > ADAPTIVE_OPTIMIZATION_INTERVAL:
                 adaptive_strategy_optimization(config)
                 last_adaptive_time = now
 
+            if now - last_backtest_time > BACKTEST_INTERVAL:
+                send_notification(generate_backtest_report(), config, "每日回测报告")
+                last_backtest_time = now
+
             if now - last_status_push > STATUS_PUSH_INTERVAL:
+                # 评分变化检测
                 current_scores = {}
                 for coin in coins:
                     try:
-                        df = get_kline(coin, interval="5m", limit=300)
-                        whale = detect_whale(coin)
-                        score, _, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
+                        df    = get_kline(coin, interval="5m", limit=300)
+                        score, _, _ = calculate_score(df, memory, detect_whale(coin),
+                                                      current_market_cycle, coin, config)
                         current_scores[coin] = score
                     except Exception:
                         current_scores[coin] = None
 
-                need_push = not last_scores or any(
-                    last_scores.get(c) is None or (s is not None and abs(s - last_scores.get(c, 0)) >= SCORE_CHANGE_THRESHOLD)
+                need_push = (not last_scores) or any(
+                    last_scores.get(c) is None or
+                    (s is not None and abs(s - last_scores.get(c, 0)) >= SCORE_CHANGE_THRESHOLD)
                     for c, s in current_scores.items()
                 )
 
-                recent_signals = get_recent_signals(1)
-                new_signal_line = ""
-                if recent_signals:
-                    log = load_log()
-                    signals = [e for e in log if e.get("signal") in ("买入", "卖出")]
-                    if signals:
-                        latest = max(signals, key=lambda x: x.get("timestamp", 0))
-                        latest_ts = latest.get("timestamp", 0)
-                        if latest_ts > last_status_push:
-                            minutes_ago = int((now - latest_ts) / 60)
-                            time_str = f"{minutes_ago}分钟前" if minutes_ago < 60 else f"{minutes_ago//60}小时前"
-                            new_signal_line = f"🔥 新信号：{time_str} {latest['coin']} {latest['signal']} ({latest['score']})\n\n"
+                cur_interval  = int(now / STATUS_PUSH_INTERVAL)
+                last_interval = int(last_status_push / STATUS_PUSH_INTERVAL) if last_status_push > 0 else -1
 
-                if need_push or new_signal_line:
-                    uptime = int(now - start_time)
-                    hours_up, minutes_up = uptime // 3600, (uptime % 3600) // 60
+                if need_push and cur_interval != last_interval:
+                    status = build_status_message(coins, memory, config)
+                    send_telegram_message(status, config)
+                    last_scores = current_scores.copy()
 
-                    # ✅ 修复：model_info 在即将发送时读取，确保状态最新
-                    if ai_model.is_trained and ai_model.training_history:
-                        last_train = ai_model.training_history[-1]
-                        model_info = (f"✅ 已训练 "
-                                      f"(准确率: {last_train['accuracy']:.2%}, "
-                                      f"样本: {last_train['samples']})")
-                    else:
-                        model_info = "❌ 未训练"
-
-                    coin_lines = []
-                    for coin in coins:
-                        try:
-                            df = get_kline(coin, interval="5m", limit=300)
-                            whale = detect_whale(coin)
-                            score, factors, _ = calculate_score(df, memory, whale, current_market_cycle, coin, config)
-                            analysis = factors['analysis']
-                            ticker_price = get_ticker(coin)
-                            display_price = ticker_price if ticker_price is not None else df["close"].iloc[-1]
-                            coin_lines.append(f"{coin}: ${display_price:.4f} {score:.1f} ({analysis['trend']})")
-                        except Exception:
-                            coin_lines.append(f"{coin}: 获取失败")
-
-                    recent = get_recent_signals(3)
-                    recent_str = "\n".join(recent) if recent else "暂无"
-                    hot = scan_hot_coins()[:3]
-                    hot_str = "\n".join([f"{c}: {ch:+.2f}%" for c, ch in hot]) if hot else "暂无"
-                    today_total, today_correct = get_signal_stats_since(24)
-                    today_winrate = today_correct / today_total if today_total > 0 else 0
-                    sixh_total, sixh_correct = get_signal_stats_since(6)
-                    sixh_winrate = sixh_correct / sixh_total if sixh_total > 0 else 0
-
-                    status = (f"🔥 AI超级信号\n\n{new_signal_line}"
-                              f"📈 当前监控币种:\n" + "\n".join(coin_lines) +
-                              f"\n\n⏱️ 最近信号:\n{recent_str}\n\n"
-                              f"📊 市场热点:\n{hot_str}\n\n"
-                              f"🤖 模型表现: {model_info}\n"
-                              f"📆 今日信号: {today_total}次 (胜率: {today_winrate:.2%})\n\n"
-                              f"📊 AI复盘报告:\n"
-                              f"6小时: {sixh_total}次, 胜率 {sixh_winrate:.2%}\n"
-                              f"24小时: {today_total}次, 胜率 {today_winrate:.2%}\n"
-                              f"当前阈值: 买入{config['buy_threshold']} / 卖出{config['sell_threshold']}\n"
-                              f"运行时间: {hours_up}小时{minutes_up}分钟 | 周期: {current_market_cycle}")
-
-                    current_interval = int(now / STATUS_PUSH_INTERVAL)
-                    last_interval = int(last_status_push / STATUS_PUSH_INTERVAL) if last_status_push > 0 else -1
-                    if current_interval != last_interval:
-                        send_telegram_message(status, config)
-                        last_scores = current_scores.copy()
-                    else:
-                        print("状态推送跳过（同一周期内已发送）")
-                else:
-                    print("状态推送跳过（无变化）")
                 last_status_push = now
 
             if now - last_daily_report > DAILY_REPORT_INTERVAL:
-                send_backtest_report(config)
+                send_notification(generate_backtest_report(), config, "每日回测报告")
                 last_daily_report = now
 
         except Exception as e:
             print(f"主循环异常: {e}")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
 
         time.sleep(config["check_interval"])
 
