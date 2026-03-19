@@ -933,7 +933,7 @@ def send_backtest_report(config):
     send_notification(report, config, "每日回测报告")
 
 # =========================
-# 新增：交易过滤函数
+# 交易过滤函数
 # =========================
 def check_buy_filters(coin, df, memory):
     try:
@@ -959,7 +959,7 @@ def check_buy_filters(coin, df, memory):
     return True, "通过"
 
 # =========================
-# 新增：生成风险提示
+# 生成风险提示
 # =========================
 def generate_risk_analysis(analysis, factors, config):
     risks = []
@@ -1080,19 +1080,21 @@ def main():
                     else:
                         display_signal = "震荡"
 
-                    # ---- 关键修改：先记录信号，再检查过滤 ----
+                    # ---- 信号记录（只记录自定义币种） ----
                     if base_signal in ("买入", "卖出"):
-                        # 信号冷却检查（防止短时间内重复记录同一币种）
                         last_time = last_signal_time.get(coin, 0)
                         if now - last_time < SIGNAL_COOLDOWN:
                             print(f"{coin} 信号 {base_signal} 冷却中，跳过记录")
                             continue
                         last_signal_time[coin] = now
 
-                        # 记录信号到日志（无论是否通过过滤，都要记录以积累训练样本）
                         price = df["close"].iloc[-1]
-                        log_signal(coin, base_signal, score, price, whale, current_market_cycle, factors, features)
-                        print(f"📝 记录信号: {coin} {base_signal} 评分{score}")
+                        # 只记录配置中的自定义币种（排除热门币）
+                        if coin in config["coins"]:
+                            log_signal(coin, base_signal, score, price, whale, current_market_cycle, factors, features)
+                            print(f"📝 记录信号: {coin} {base_signal} 评分{score}")
+                        else:
+                            print(f"📝 热门币 {coin} 信号不记录训练日志")
 
                     # ---- 过滤检查（仅对买入） ----
                     filter_passed = True
@@ -1109,7 +1111,7 @@ def main():
                     risk_points = "、".join(risks) if risks else "无明显风险"
                     up_prob = factors['up_prob'] * 100
 
-                    # ---- 只有当通过过滤时才发送通知 ----
+                    # ---- 只有当通过过滤时才发送通知（所有币种都发） ----
                     if base_signal in ("买入", "卖出") and filter_passed:
                         emoji = "🟢" if base_signal == "买入" else "🔴"
                         advice = "评分超过买入阈值，可考虑建仓。" if base_signal == "买入" else "评分低于卖出阈值，可考虑减仓。"
