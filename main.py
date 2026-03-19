@@ -195,7 +195,8 @@ def load_timing_state():
     except Exception:
         return {
             'last_backtest_time': 0,
-            'last_daily_report':  0
+            'last_daily_report':  0,
+            'last_status_push':   0
         }
 
 def save_timing_state(state):
@@ -1358,10 +1359,13 @@ def main():
     timing_state       = load_timing_state()
     last_backtest_time = timing_state.get('last_backtest_time', 0)
     last_daily_report  = timing_state.get('last_daily_report',  0)
+    last_status_push   = timing_state.get('last_status_push',   0)
     print(f"📅 上次回测推送: "
           f"{datetime.fromtimestamp(last_backtest_time).strftime('%Y-%m-%d %H:%M') if last_backtest_time > 0 else '从未'}")
     print(f"📅 上次日报推送: "
           f"{datetime.fromtimestamp(last_daily_report).strftime('%Y-%m-%d %H:%M') if last_daily_report > 0 else '从未'}")
+    print(f"📅 上次状态推送: "
+          f"{datetime.fromtimestamp(last_status_push).strftime('%Y-%m-%d %H:%M') if last_status_push > 0 else '从未'}")
 
     if not ai_model.is_trained:
         memory = load_memory()
@@ -1504,7 +1508,8 @@ def main():
                 last_backtest_time = now
                 save_timing_state({
                     'last_backtest_time': last_backtest_time,
-                    'last_daily_report':  last_daily_report
+                    'last_daily_report':  last_daily_report,
+                    'last_status_push':   last_status_push
                 })
 
             if now - last_status_push > STATUS_PUSH_INTERVAL:
@@ -1534,6 +1539,12 @@ def main():
                     last_scores = current_scores.copy()
 
                 last_status_push = now
+                # 状态推送时间也持久化，重启后不重复推送
+                save_timing_state({
+                    'last_backtest_time': last_backtest_time,
+                    'last_daily_report':  last_daily_report,
+                    'last_status_push':   last_status_push
+                })
 
             # 修改二：日报发送后持久化时间戳
             if now - last_daily_report > DAILY_REPORT_INTERVAL:
@@ -1541,7 +1552,8 @@ def main():
                 last_daily_report = now
                 save_timing_state({
                     'last_backtest_time': last_backtest_time,
-                    'last_daily_report':  last_daily_report
+                    'last_daily_report':  last_daily_report,
+                    'last_status_push':   last_status_push
                 })
 
         except Exception as e:
