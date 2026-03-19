@@ -15,12 +15,49 @@ from functools import wraps
 import threading
 
 # =========================
-# 自动适配 Railway Volume
+# Railway Volume 挂载等待
+# 解决：代码启动比Volume挂载快，导致读不到持久化目录
 # =========================
-DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
-if not os.path.exists(DATA_DIR):
-    print(f"⚠️ Volume路径不存在，fallback到本地data目录")
+def wait_for_volume(path, max_wait=60):
+    """
+    等待Railway Volume挂载完成并验证可读写。
+    Railway挂载Volume需要几秒，代码启动太快会读不到。
+    max_wait=60：最多等60秒，足够覆盖任何正常挂载延迟。
+    """
+    print(f"⏳ 等待Volume挂载: {path}")
+    for i in range(max_wait):
+        if os.path.exists(path):
+            # 不只检查目录存在，还要验证真正可写
+            test_file = os.path.join(path, ".mount_test")
+            try:
+                with open(test_file, 'w') as f:
+                    f.write("ok")
+                os.remove(test_file)
+                print(f"✅ Volume挂载成功（等待了 {i} 秒）: {path}")
+                return True
+            except Exception as e:
+                print(f"  第{i+1}秒: 目录存在但不可写 ({e})")
+        else:
+            if i % 10 == 0:
+                print(f"  第{i+1}秒: 等待中...")
+        time.sleep(1)
+    print(f"❌ Volume挂载超时（{max_wait}秒），将使用本地临时目录")
+    return False
+
+# =========================
+# 确定数据目录
+# =========================
+_RAILWAY_VOLUME = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/app/data")
+_volume_ok      = wait_for_volume(_RAILWAY_VOLUME, max_wait=60)
+
+if _volume_ok:
+    DATA_DIR = _RAILWAY_VOLUME
+else:
+    # Volume不可用时使用本地目录，但明确告警
     DATA_DIR = "./data"
+    print("⚠️ 警告：使用本地临时目录，重启后数据将丢失！")
+    print("⚠️ 请检查Railway Volume是否正确挂载到 /app/data")
+
 os.makedirs(DATA_DIR, exist_ok=True)
 print(f"📁 数据目录: {DATA_DIR}")
 
@@ -1225,6 +1262,68 @@ def build_status_message(coins, memory, config):
     return status
 
 # =========================
+# 启动锁：防止Railway滚动部署时新旧容器同时运行
+# =========================
+LOCK_FILE    = os.path.join(DATA_DIR, ".process_lock")
+LOCK_TIMEOUT = 60  # 锁超时60秒，超过则认为旧进程已死
+
+def acquire_startup_lock():
+    """
+    获取启动锁，防止新旧容器同时写文件互相覆盖。
+    若发现有效锁（旧进程存活），等待其超时后再继续。
+    """
+    now = time.time()
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, 'r') as f:
+                data = json.load(f)
+            age = now - data.get('timestamp', 0)
+            pid = data.get('pid', 0)
+            if age < LOCK_TIMEOUT:
+                print(f"⏳ 检测到旧进程锁 (PID:{pid}, {age:.0f}秒前)，等待旧进程退出...")
+                wait_start = time.time()
+                while time.time() - wait_start < LOCK_TIMEOUT:
+                    time.sleep(2)
+                    try:
+                        with open(LOCK_FILE, 'r') as f:
+                            d = json.load(f)
+                        if time.time() - d.get('timestamp', 0) >= LOCK_TIMEOUT:
+                            break
+                    except Exception:
+                        break
+                print("✅ 旧进程已退出，继续启动")
+            else:
+                print(f"⚠️ 发现过期锁({age:.0f}秒前)，直接覆盖")
+        except Exception as e:
+            print(f"⚠️ 读取锁文件异常({e})，直接覆盖")
+    try:
+        with open(LOCK_FILE, 'w') as f:
+            json.dump({'timestamp': now, 'pid': os.getpid()}, f)
+        print(f"🔒 启动锁已获取 (PID:{os.getpid()})")
+    except Exception as e:
+        print(f"⚠️ 无法写入启动锁: {e}")
+
+def release_startup_lock():
+    """进程退出时释放启动锁"""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            print("🔓 启动锁已释放")
+    except Exception:
+        pass
+
+def update_lock_heartbeat():
+    """
+    主循环每轮调用，更新锁文件时间戳（心跳）。
+    让其他进程知道当前进程仍然存活。
+    """
+    try:
+        with open(LOCK_FILE, 'w') as f:
+            json.dump({'timestamp': time.time(), 'pid': os.getpid()}, f)
+    except Exception:
+        pass
+
+# =========================
 # 主程序
 # =========================
 def main():
@@ -1236,11 +1335,16 @@ def main():
     start_time = time.time()
     print("=" * 50)
     print("AI自主学习交易系统启动 (Gate.io 决策辅助版)")
+    print(f"数据目录: {DATA_DIR}")
+    print(f"Volume状态: {'✅已挂载' if _volume_ok else '❌本地临时目录'}")
     print(f"模型状态: {'已训练 CV=' + str(round(ai_model.cv_accuracy, 4)) if ai_model.is_trained else '未训练'}")
     print("=" * 50)
 
-    # 修改二：从文件恢复定时状态，重启不重复推送
-    timing_state     = load_timing_state()
+    # 获取启动锁，防止新旧容器同时运行
+    acquire_startup_lock()
+
+    # 从文件恢复定时状态，重启不重复推送
+    timing_state       = load_timing_state()
     last_backtest_time = timing_state.get('last_backtest_time', 0)
     last_daily_report  = timing_state.get('last_daily_report',  0)
     print(f"📅 上次回测推送: "
@@ -1259,12 +1363,14 @@ def main():
     else:
         print("✅ 模型已训练，使用动态阈值")
 
-    # 启动通知
-    log_size = os.path.getsize(LOG_PATH) if os.path.exists(LOG_PATH) else 0
+    # 启动通知（含Volume状态，方便排查）
+    log_size    = os.path.getsize(LOG_PATH) if os.path.exists(LOG_PATH) else 0
+    volume_info = f"✅ Volume已挂载" if _volume_ok else "❌ Volume未挂载！数据重启后丢失"
     send_telegram_message(
         f"🚀 系统启动\n"
         f"模型: {'✅已训练' if ai_model.is_trained else '❌未训练'}\n"
         f"日志大小: {log_size} 字节\n"
+        f"存储: {volume_info}\n"
         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         config
     )
@@ -1431,8 +1537,19 @@ def main():
             print(f"主循环异常: {e}")
             import traceback; traceback.print_exc()
 
+        # 每轮循环更新心跳，证明进程仍存活
+        update_lock_heartbeat()
         time.sleep(config["check_interval"])
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n⛔ 用户中断，正在退出...")
+    except Exception as e:
+        print(f"❌ 主程序异常退出: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        # 无论正常退出还是异常退出，都释放启动锁
+        release_startup_lock()
