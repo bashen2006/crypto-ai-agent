@@ -24,7 +24,7 @@ def wait_for_volume(path, max_wait=60):
     Railway挂载Volume需要几秒，代码启动太快会读不到。
     max_wait=60：最多等60秒，足够覆盖任何正常挂载延迟。
     """
-    print(f"⏳ 等待Volume挂载: {path}")
+    print(f"⏳ 等待存储挂载: {path}")
     for i in range(max_wait):
         if os.path.exists(path):
             # 不只检查目录存在，还要验证真正可写
@@ -33,15 +33,15 @@ def wait_for_volume(path, max_wait=60):
                 with open(test_file, 'w') as f:
                     f.write("ok")
                 os.remove(test_file)
-                print(f"✅ Volume挂载成功（等待了 {i} 秒）: {path}")
+                print(f"✅ 存储挂载成功（等待了 {i} 秒）: {path}")
                 return True
             except Exception as e:
-                print(f"  第{i+1}秒: 目录存在但不可写 ({e})")
+                print(f"  第{i+1}秒: 目录存在但不可写: {e}")
         else:
             if i % 10 == 0:
-                print(f"  第{i+1}秒: 等待中...")
+                print(f"  第{i+1}秒: 挂载等待中...")
         time.sleep(1)
-    print(f"❌ Volume挂载超时（{max_wait}秒），将使用本地临时目录")
+    print(f"❌ 存储挂载超时（{max_wait}秒），使用本地临时目录")
     return False
 
 # =========================
@@ -55,11 +55,11 @@ if _volume_ok:
 else:
     # Volume不可用时使用本地目录，但明确告警
     DATA_DIR = "./data"
-    print("⚠️ 警告：使用本地临时目录，重启后数据将丢失！")
-    print("⚠️ 请检查Railway Volume是否正确挂载到 /app/data")
+    print("⚠️ 警告：使用本地临时目录，重启后数据将全部丢失！")
+    print("⚠️ 请检查云服务器存储卷是否正确挂载到 /app/data")
 
 os.makedirs(DATA_DIR, exist_ok=True)
-print(f"📁 数据目录: {DATA_DIR}")
+print(f"📁 数据存储目录: {DATA_DIR}")
 
 # =========================
 # 机器学习库导入
@@ -76,7 +76,7 @@ try:
     BAYES_OPT_AVAILABLE = True
 except ImportError:
     BAYES_OPT_AVAILABLE = False
-    print("提示: 未安装 scikit-optimize，贝叶斯优化功能将禁用。")
+    print("提示: 未安装 scikit-optimize，贝叶斯超参优化功能已禁用。")
 
 # =========================
 # 配置常量
@@ -90,6 +90,7 @@ FEATURES_FILE      = "feature_config.json"
 SIGNAL_CONFIRM_FILE= "signal_confirm.json"
 # 修改二：新增定时状态持久化文件，防止重启重复发送
 TIMING_FILE        = "timing_state.json"
+SIGNAL_TIME_FILE   = "signal_time.json"   # 新增：信号冷却时间持久化
 
 MEMORY_PATH        = os.path.join(DATA_DIR, MEMORY_FILE)
 LOG_PATH           = os.path.join(DATA_DIR, LOG_FILE)
@@ -98,6 +99,7 @@ SCALER_PATH        = os.path.join(DATA_DIR, SCALER_FILE)
 FEATURES_PATH      = os.path.join(DATA_DIR, FEATURES_FILE)
 SIGNAL_CONFIRM_PATH= os.path.join(DATA_DIR, SIGNAL_CONFIRM_FILE)
 TIMING_PATH        = os.path.join(DATA_DIR, TIMING_FILE)
+SIGNAL_TIME_PATH   = os.path.join(DATA_DIR, SIGNAL_TIME_FILE)
 
 # 时间间隔
 STATUS_PUSH_INTERVAL          = 300
@@ -207,7 +209,33 @@ def save_timing_state(state):
             json.dump(state, f, indent=2)
         shutil.move(tmp, TIMING_PATH)
     except Exception as e:
-        print(f"⚠️ save_timing_state 失败: {e}")
+        print(f"⚠️ 定时状态保存失败: {e}")
+
+# =========================
+# last_signal_time 持久化
+# 解决：重启后新旧容器并发，各自内存独立导致同一信号发两次
+# =========================
+def load_signal_time():
+    """从文件恢复信号冷却时间，重启后不丢失"""
+    try:
+        with open(SIGNAL_TIME_PATH, encoding='utf-8') as f:
+            data = json.load(f)
+        # 过滤掉过期的记录（超过最长冷却时间3600秒），避免加载太旧的数据
+        now = time.time()
+        max_cooldown = max(COOLDOWN_BY_CYCLE.values())
+        return {k: v for k, v in data.items() if now - v < max_cooldown}
+    except Exception:
+        return {}
+
+def save_signal_time(signal_times):
+    """原子保存信号冷却时间"""
+    tmp = SIGNAL_TIME_PATH + ".tmp"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(signal_times, f, indent=2)
+        shutil.move(tmp, SIGNAL_TIME_PATH)
+    except Exception as e:
+        print(f"⚠️ 信号冷却时间保存失败: {e}")
 
 # =========================
 # 工具函数
@@ -222,9 +250,9 @@ def safe_request(url, params=None, max_retries=3):
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
                 return r.json()
-            print(f"请求失败 {r.status_code}: {url}")
+            print(f"网络请求失败，状态码 {r.status_code}: {url}")
         except Exception as e:
-            print(f"请求异常: {e}")
+            print(f"网络请求异常: {e}")
             time.sleep(2)
     return None
 
@@ -351,7 +379,7 @@ def get_btc_dominance_trend():
             'btc_falling':    btc_falling
         }
     except Exception as e:
-        print(f"BTC主导度判断失败: {e}")
+        print(f"BTC市场主导度判断失败: {e}")
         return {
             'btc_change':     0,
             'market_avg':     0,
@@ -376,7 +404,7 @@ def save_signal_confirm(data):
             json.dump(data, f, indent=2)
         shutil.move(tmp, SIGNAL_CONFIRM_PATH)
     except Exception as e:
-        print(f"⚠️ save_signal_confirm 失败: {e}")
+        print(f"⚠️ 信号确认状态保存失败: {e}")
 
 # 内存缓存：signal_confirm 不再每次读写文件
 # 进程内共享，重启时从文件恢复一次
@@ -479,7 +507,9 @@ class AITradingModel:
         features['atr_ratio']    = calculate_atr(df) / close[-1] if close[-1] != 0 else 0
         features['whale_value']  = whale / 10000
         features['market_cycle'] = 2 if market_cycle == "牛市" else (1 if market_cycle == "震荡" else 0)
-        features['coin_id']      = abs(hash(coin_name)) % 100 / 100
+        # 用 hashlib 代替 hash()，保证跨进程/跨重启稳定（Python hash() 每次启动随机）
+        import hashlib
+        features['coin_id'] = int(hashlib.md5(coin_name.encode()).hexdigest()[:8], 16) % 100 / 100
 
         try:
             df_h1 = get_kline(coin_name, interval="1h", limit=100)
@@ -546,7 +576,7 @@ class AITradingModel:
 
     def train(self, X, y):
         if X is None or len(X) < MIN_TRAIN_SAMPLES:
-            print(f"训练样本不足: {len(X) if X is not None else 0}/{MIN_TRAIN_SAMPLES}")
+            print(f"训练样本不足，当前: {len(X) if X is not None else 0} 条，需要: {MIN_TRAIN_SAMPLES} 条")
             return False
 
         if isinstance(X, pd.DataFrame):
@@ -556,16 +586,16 @@ class AITradingModel:
             y      = np.array(y)[X.index.tolist()]
             X      = X.reset_index(drop=True)
             if len(X) < MIN_TRAIN_SAMPLES:
-                print(f"清洗后样本不足{MIN_TRAIN_SAMPLES}，跳过训练")
+                print(f"清洗NaN后样本不足 {MIN_TRAIN_SAMPLES} 条，跳过本次训练")
                 return False
             if len(X) < orig:
-                print(f"删除了{orig - len(X)}行NaN样本")
+                print(f"已清除 {orig - len(X)} 条含NaN的样本")
 
         # ✅ 到这里才真正开始训练，此时同步更新 feature_names
         # scaler 也会在下面 fit_transform 中重新拟合，保证两者始终匹配
         if isinstance(X, pd.DataFrame):
             self.feature_names = X.columns.tolist()
-        print(f"开始训练，特征数: {len(self.feature_names)}")
+        print(f"开始训练模型，特征数量: {len(self.feature_names)}")
 
         X_scaled = self.scaler.fit_transform(X)
 
@@ -592,7 +622,7 @@ class AITradingModel:
 
         overfit_gap = train_acc - cv_acc
         if overfit_gap > 0.2:
-            print(f"⚠️ 过拟合警告: 训练={train_acc:.3f}, CV={cv_acc:.3f}, 差距={overfit_gap:.3f}")
+            print(f"⚠️ 过拟合警告: 训练准确率={train_acc:.3f}，交叉验证准确率={cv_acc:.3f}，差距={overfit_gap:.3f}")
 
         self.model       = model
         self.cv_accuracy = cv_acc
@@ -614,10 +644,10 @@ class AITradingModel:
             'features':    len(self.feature_names)
         })
 
-        print(f"✅ 训练完成: 样本={len(X)}, 训练准确率={train_acc:.4f}, CV准确率={cv_acc:.4f}")
+        print(f"✅ 模型训练完成: 样本数={len(X)}，训练准确率={train_acc:.4f}，交叉验证准确率={cv_acc:.4f}")
         if self.feature_importance:
             top5 = sorted(self.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
-            print(f"Top5特征: {top5}")
+            print(f"前5重要特征: {top5}")
         return True
 
     def predict(self, features):
@@ -656,10 +686,10 @@ class AITradingModel:
             shutil.move(tmp_m, MODEL_PATH)
             shutil.move(tmp_s, SCALER_PATH)
             shutil.move(tmp_f, FEATURES_PATH)
-            print("✅ 模型原子保存成功")
+            print("✅ 模型文件保存成功")
             return True
         except Exception as e:
-            print(f"❌ 模型保存失败: {e}")
+            print(f"❌ 模型文件保存失败: {e}")
             for tmp in [tmp_m, tmp_s, tmp_f]:
                 if os.path.exists(tmp):
                     try: os.remove(tmp)
@@ -671,18 +701,18 @@ class AITradingModel:
         missing = [p for p in [MODEL_PATH, SCALER_PATH, FEATURES_PATH]
                    if not os.path.exists(p)]
         if missing:
-            print(f"⚠️ 模型文件缺失: {missing}")
+            print(f"⚠️ 模型文件不存在: {missing}")
             return False
         try:
             self.model = joblib.load(MODEL_PATH)
-            print("  ✔ model 加载成功")
+            print("  ✔ 模型主文件加载成功")
         except Exception as e:
-            print(f"  ✘ model 加载失败: {e}"); return False
+            print(f"  ✘ 模型主文件加载失败: {e}"); return False
         try:
             self.scaler = joblib.load(SCALER_PATH)
-            print("  ✔ scaler 加载成功")
+            print("  ✔ 归一化器加载成功")
         except Exception as e:
-            print(f"  ✘ scaler 加载失败: {e}"); return False
+            print(f"  ✘ 归一化器加载失败: {e}"); return False
         try:
             with open(FEATURES_PATH, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -690,12 +720,12 @@ class AITradingModel:
             self.training_history   = data.get('training_history', [])
             self.feature_importance = data.get('feature_importance', {})
             self.cv_accuracy        = data.get('cv_accuracy', 0.0)
-            print(f"  ✔ features 加载成功，特征数: {len(self.feature_names)}")
+            print(f"  ✔ 特征配置加载成功，共 {len(self.feature_names)} 个特征")
         except Exception as e:
-            print(f"  ✘ features 加载失败: {e}"); return False
+            print(f"  ✘ 特征配置加载失败: {e}"); return False
         self.is_trained = True
         last = self.training_history[-1] if self.training_history else {}
-        print(f"✅ 模型加载成功 | CV准确率={self.cv_accuracy:.4f} | 样本={last.get('samples','?')}")
+        print(f"✅ 模型加载成功 | 交叉验证准确率={self.cv_accuracy:.4f} | 样本数={last.get('samples','?')}") 
         return True
 
 
@@ -750,7 +780,7 @@ def save_memory(memory):
             json.dump(memory, f, indent=4)
         shutil.move(tmp, MEMORY_PATH)
     except Exception as e:
-        print(f"⚠️ save_memory 失败: {e}")
+        print(f"⚠️ 策略记忆保存失败: {e}")
 
 # =========================
 # 通知
@@ -767,7 +797,7 @@ def send_telegram_message(text, config):
             timeout=10
         )
     except Exception as e:
-        print(f"Telegram发送失败: {e}")
+        print(f"Telegram消息发送失败: {e}")
 
 def send_email(subject, body, config):
     user, pwd, receiver = (config.get("email_user"),
@@ -789,7 +819,7 @@ def send_email(subject, body, config):
             srv.quit()
             return
         except Exception as e:
-            print(f"邮件 {host}:{port} 失败: {e}")
+            print(f"邮件发送失败 {host}:{port}: {e}")
 
 def send_notification(content, config, subject=None):
     send_telegram_message(content, config)
@@ -814,7 +844,7 @@ def detect_market_cycle():
         else:
             return "震荡"
     except Exception as e:
-        print(f"周期识别失败: {e}")
+        print(f"市场周期识别失败: {e}")
         return "未知"
 
 def apply_cycle_strategy_adjustment(memory, cycle):
@@ -935,7 +965,7 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
                 ml_score, ml_info = ai_model.predict(features)
                 ml_confidence     = ml_info.get('confidence', 0)
         except Exception as e:
-            print(f"ML预测失败: {e}")
+            print(f"AI模型预测失败: {e}")
     else:
         try:
             features = ai_model.extract_features(df, whale, market_cycle, coin)
@@ -981,7 +1011,7 @@ def save_log(log):
             json.dump(log, f, indent=4)
         shutil.move(tmp, LOG_PATH)
     except Exception as e:
-        print(f"⚠️ save_log 失败: {e}")
+        print(f"⚠️ 信号日志保存失败: {e}")
 
 def verify_past_signals(config):
     log     = load_log()
@@ -999,7 +1029,7 @@ def verify_past_signals(config):
             continue
 
         try:
-            df = get_kline(coin, interval="5m", limit=100)
+            df = get_kline(coin, interval="5m", limit=300)  # 覆盖25小时，确保信号能被验证
             df['ts_sec'] = df['ts'] / 1000
             future_df    = df[df['ts_sec'] > signal_time].sort_values('ts_sec')
 
@@ -1031,10 +1061,10 @@ def verify_past_signals(config):
                 entry["profit"]   = round(profit * 100, 3)
                 entry["note"]     = "超时验证（用当前价格估算）"
                 updated = True
-                print(f"⏰ {coin} 信号超时验证({age_minutes:.0f}分钟): {entry['result']}")
+                print(f"⏰ {coin} 信号超时（{age_minutes:.0f}分钟），使用当前价格验证: {entry['result']}") 
 
         except Exception as e:
-            print(f"验证{coin}失败: {e}")
+            print(f"验证 {coin} 历史信号失败: {e}")
     if updated:
         save_log(log)
 
@@ -1071,12 +1101,12 @@ def adaptive_strategy_optimization(config):
     log      = load_log()
     verified = [e for e in log if e.get("verified") and e.get("result") in ("correct", "wrong")]
     if len(verified) < MIN_TRAIN_SAMPLES:
-        print(f"自适应优化：已验证{len(verified)}/{MIN_TRAIN_SAMPLES}条，跳过")
+        print(f"自适应优化：已验证 {len(verified)}/{MIN_TRAIN_SAMPLES} 条，样本不足，跳过训练")
         return
 
     X_df, y = ai_model.prepare_training_data(verified)
     if X_df is None:
-        print("特征提取后样本不足")
+        print("特征提取完成后样本仍不足，跳过训练")
         return
 
     success = ai_model.train(X_df, y)
@@ -1096,7 +1126,7 @@ def adaptive_strategy_optimization(config):
         memory['buy_threshold']  = max(memory.get('buy_threshold', 70) - 2, 55)
         memory['sell_threshold'] = min(memory.get('sell_threshold', 35) + 2, 45)
         memory['ml_weight']      = max(0.1, memory.get('ml_weight', 0.4) - 0.1)
-        print(f"⚠️ CV准确率偏低({cv_acc:.3f})，降低ML权重至{memory['ml_weight']:.2f}")
+        print(f"⚠️ 交叉验证准确率偏低({cv_acc:.3f})，已降低AI模型权重至{memory['ml_weight']:.2f}")
 
     memory['buy_threshold']  = max(min(memory['buy_threshold'], 85), memory['sell_threshold'] + 5)
     memory['sell_threshold'] = max(min(memory['sell_threshold'], 50), 15)
@@ -1109,7 +1139,7 @@ def adaptive_strategy_optimization(config):
     train_acc = ai_model.training_history[-1]['train_acc']
     overfit_warning = ""
     if train_acc - cv_acc > 0.15:
-        overfit_warning = f"\n⚠️ 检测到过拟合(差距{train_acc - cv_acc:.2%})，已自动降低模型权重"
+        overfit_warning = f"\n⚠️ 检测到过拟合（训练与验证差距{train_acc - cv_acc:.2%}），已自动降低AI模型权重"
 
     top5        = sorted(ai_model.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
     feature_msg = "\n".join([f"  {f}: {v:.4f}" for f, v in top5]) if top5 else "  （暂无）"
@@ -1117,16 +1147,16 @@ def adaptive_strategy_optimization(config):
     msg = (f"🤖 AI模型已进化\n"
            f"训练样本: {len(X_df)}\n"
            f"训练准确率: {train_acc:.2%}\n"
-           f"CV准确率: {cv_acc:.2%}  ← 真实参考值\n"
+           f"交叉验证准确率: {cv_acc:.2%}  ← 真实参考值\n"
            f"实际胜率(近100条): {real_winrate:.2%}\n"
            f"新阈值: 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}\n"
-           f"ML权重: {memory['ml_weight']:.2f}\n"
-           f"Top5特征:\n{feature_msg}"
+           f"AI模型权重: {memory['ml_weight']:.2f}\n"
+           f"前5重要特征:\n{feature_msg}"
            f"{overfit_warning}")
     # 训练成功后同步更新config阈值，当轮循环立即生效
     config['buy_threshold']  = memory['buy_threshold']
     config['sell_threshold'] = memory['sell_threshold']
-    print(f"✅ 首次训练完成，阈值已同步: 买入={config['buy_threshold']}, 卖出={config['sell_threshold']}")
+    print(f"✅ 模型训练完成，阈值已更新: 买入={config['buy_threshold']}，卖出={config['sell_threshold']}")
     send_notification(msg, config, "AI模型进化报告")
 
 # =========================
@@ -1256,9 +1286,9 @@ def build_signal_message(coin, base_signal, score, display_price,
         position_suggest = "正常仓(≤50%)"
 
     cv_acc = ai_model.cv_accuracy if ai_model.is_trained else 0
-    model_reliability = "⚠️ 模型未训练" if not ai_model.is_trained else \
-                        (f"✅ 可靠(CV:{cv_acc:.0%})" if cv_acc >= 0.55 else
-                         f"⚠️ 低可信(CV:{cv_acc:.0%})，仅供参考")
+    model_reliability = "⚠️ 模型未训练，仅供参考" if not ai_model.is_trained else \
+                        (f"✅ 可靠（交叉验证: {cv_acc:.0%}）" if cv_acc >= 0.55 else
+                         f"⚠️ 可信度偏低（交叉验证: {cv_acc:.0%}），谨慎参考")
 
     # 修改三：显示当前冷却时间
     cooldown_sec = COOLDOWN_BY_CYCLE.get(current_market_cycle, 1800)
@@ -1270,7 +1300,7 @@ def build_signal_message(coin, base_signal, score, display_price,
     msg = (
         f"{signal_emoji} <b>{coin} {base_signal}信号</b>\n\n"
         f"💰 价格：${display_price:.6g}\n"
-        f"📊 综合评分：{score} (规则:{factors['rule_score']} ML:{factors['ml_score']:.0f})\n"
+        f"📊 综合评分：{score} (规则:{factors['rule_score']} AI:{factors['ml_score']:.0f})\n"
         f"🎯 上涨概率：{up_prob:.1f}%\n"
         f"🔁 连续确认：{confirm_count}次 (均分{avg_score:.0f})\n\n"
         f"📈 趋势：{analysis['trend']} | 动量：{analysis['momentum']}\n"
@@ -1282,7 +1312,7 @@ def build_signal_message(coin, base_signal, score, display_price,
         f"{risk_emoji} 风险等级：{risk_level}\n"
         f"⚠️ 风险点：{'、'.join(risks) if risks else '无明显风险'}\n\n"
         f"🤖 模型：{model_reliability}\n"
-        f"🌍 市场周期：{current_market_cycle}（冷却{cooldown_str}）\n"
+        f"🌍 当前周期：{current_market_cycle}（下次信号冷却：{cooldown_str}）\n"
         f"⏰ {datetime.now().strftime('%m-%d %H:%M')}"
     )
     return msg
@@ -1290,7 +1320,13 @@ def build_signal_message(coin, base_signal, score, display_price,
 # =========================
 # 状态推送
 # =========================
-def build_status_message(coins, memory, config):
+def build_status_message(coins, memory, config,
+                          cached_scores=None, cached_factors=None):
+    """
+    构建状态推送消息。
+    cached_scores/cached_factors：主循环本轮已计算的评分，
+    传入后直接复用，不重复调用 calculate_score。
+    """
     now    = time.time()
     uptime = int(now - start_time)
     h, m   = uptime // 3600, (uptime % 3600) // 60
@@ -1300,11 +1336,20 @@ def build_status_message(coins, memory, config):
         train_acc = last.get('train_acc', last.get('accuracy', 0))
         cv_acc    = last.get('cv_accuracy', ai_model.cv_accuracy)
         gap       = train_acc - cv_acc
-        overfit_tag = f" ⚠️过拟合" if gap > 0.15 else ""
+        overfit_tag = f" ⚠️轻微过拟合" if gap > 0.15 else ""
         model_info  = (f"✅ 已训练 | 样本:{last['samples']}\n"
-                       f"     训练准确率:{train_acc:.0%} CV:{cv_acc:.0%}{overfit_tag}")
+                       f"     训练准确率:{train_acc:.0%} 交叉验证:{cv_acc:.0%}{overfit_tag}")
     else:
-        model_info = "❌ 未训练（积累中...）"
+        # 显示已积累的训练数据进度，让用户知道还差多少
+        try:
+            log_data       = load_log()
+            verified_count = sum(1 for e in log_data
+                                 if e.get("verified") and e.get("result") in ("correct", "wrong"))
+            total_logged   = len([e for e in log_data if e.get("signal") in ("买入", "卖出")])
+            model_info = (f"❌ 未训练 | 已积累: {verified_count}/{MIN_TRAIN_SAMPLES}条"
+                          f" (已记录信号: {total_logged}条，等待验证中...)")
+        except Exception:
+            model_info = "❌ 未训练（积累中...）"
 
     today_total, today_correct = get_signal_stats_since(24)
     today_winrate = today_correct / today_total if today_total > 0 else 0
@@ -1313,19 +1358,24 @@ def build_status_message(coins, memory, config):
     sixh_total, sixh_correct = get_signal_stats_since(6)
     sixh_winrate = sixh_correct / sixh_total if sixh_total > 0 else 0
 
-    # 修改三：显示当前周期对应的冷却时间
     cooldown_sec = COOLDOWN_BY_CYCLE.get(current_market_cycle, 1800)
     cooldown_str = f"{cooldown_sec // 60}分钟"
 
     coin_lines = []
     for coin in coins:
         try:
-            df      = get_kline(coin, interval="5m", limit=300)
-            whale   = detect_whale(coin)
-            score, factors, _ = calculate_score(df, memory, whale,
-                                                current_market_cycle, coin, config)
-            analysis  = factors['analysis']
-            price     = get_ticker(coin) or df['close'].iloc[-1]
+            # 优先复用主循环本轮缓存，避免重复计算
+            if cached_scores and cached_factors and coin in cached_scores:
+                score   = cached_scores[coin]
+                factors = cached_factors[coin]
+                analysis= factors['analysis']
+                price   = get_ticker(coin) or 0
+            else:
+                df      = get_kline(coin, interval="5m", limit=300)
+                score, factors, _ = calculate_score(df, memory, detect_whale(coin),
+                                                    current_market_cycle, coin, config)
+                analysis= factors['analysis']
+                price   = get_ticker(coin) or df['close'].iloc[-1]
             direction = "↑" if analysis['trend'] == "多头" else "↓"
             up_prob   = factors['up_prob'] * 100
             coin_lines.append(
@@ -1349,7 +1399,7 @@ def build_status_message(coins, memory, config):
         f"  6小时: {sixh_total}次 | {sixh_winrate:.0%}\n"
         f"  24小时: {today_total}次 | {today_winrate:.0%}{winrate_tag}\n\n"
         f"⚙️ 阈值: 买入{config['buy_threshold']} | 卖出{config['sell_threshold']}\n"
-        f"⏳ 信号冷却: {cooldown_str}（{current_market_cycle}）\n"
+        f"⏳ 信号冷却时间: {cooldown_str}（{current_market_cycle}）\n"
         f"🕐 运行: {h}小时{m}分钟 | {current_market_cycle}"
     )
     return status
@@ -1373,7 +1423,7 @@ def acquire_startup_lock():
             age = now - data.get('timestamp', 0)
             pid = data.get('pid', 0)
             if age < LOCK_TIMEOUT:
-                print(f"⏳ 检测到旧进程锁 (PID:{pid}, {age:.0f}秒前)，等待旧进程退出...")
+                print(f"⏳ 检测到旧进程运行中 (进程号:{pid}, {age:.0f}秒前)，等待旧进程退出...")
                 wait_start = time.time()
                 while time.time() - wait_start < LOCK_TIMEOUT:
                     time.sleep(2)
@@ -1384,24 +1434,24 @@ def acquire_startup_lock():
                             break
                     except Exception:
                         break
-                print("✅ 旧进程已退出，继续启动")
+                print("✅ 旧进程已退出，新进程继续启动")
             else:
-                print(f"⚠️ 发现过期锁({age:.0f}秒前)，直接覆盖")
+                print(f"⚠️ 发现过期进程锁（{age:.0f}秒前），直接覆盖")
         except Exception as e:
-            print(f"⚠️ 读取锁文件异常({e})，直接覆盖")
+            print(f"⚠️ 读取进程锁异常（{e}），直接覆盖")
     try:
         with open(LOCK_FILE, 'w') as f:
             json.dump({'timestamp': now, 'pid': os.getpid()}, f)
-        print(f"🔒 启动锁已获取 (PID:{os.getpid()})")
+        print(f"🔒 进程锁已获取 (进程号:{os.getpid()})")
     except Exception as e:
-        print(f"⚠️ 无法写入启动锁: {e}")
+        print(f"⚠️ 无法写入进程锁: {e}")
 
 def release_startup_lock():
     """进程退出时释放启动锁"""
     try:
         if os.path.exists(LOCK_FILE):
             os.remove(LOCK_FILE)
-            print("🔓 启动锁已释放")
+            print("🔓 进程锁已释放")
     except Exception:
         pass
 
@@ -1427,10 +1477,10 @@ def main():
     config     = load_config()
     start_time = time.time()
     print("=" * 50)
-    print("AI自主学习交易系统启动 (Gate.io 决策辅助版)")
+    print("AI自主学习交易系统启动（Gate.io 决策辅助版）")
     print(f"数据目录: {DATA_DIR}")
-    print(f"Volume状态: {'✅已挂载' if _volume_ok else '❌本地临时目录'}")
-    print(f"模型状态: {'已训练 CV=' + str(round(ai_model.cv_accuracy, 4)) if ai_model.is_trained else '未训练'}")
+    print(f"存储状态: {'✅已挂载' if _volume_ok else '❌本地临时目录（数据重启丢失）'}")
+    print(f"模型状态: {'已训练，交叉验证准确率=' + str(round(ai_model.cv_accuracy, 4)) if ai_model.is_trained else '未训练，等待积累数据'}")
     print("=" * 50)
 
     # 获取启动锁，防止新旧容器同时运行
@@ -1441,11 +1491,11 @@ def main():
     last_backtest_time = timing_state.get('last_backtest_time', 0)
     last_daily_report  = timing_state.get('last_daily_report',  0)
     last_status_push   = timing_state.get('last_status_push',   0)
-    print(f"📅 上次回测推送: "
+    print(f"📅 上次回测报告: "
           f"{datetime.fromtimestamp(last_backtest_time).strftime('%Y-%m-%d %H:%M') if last_backtest_time > 0 else '从未'}")
-    print(f"📅 上次日报推送: "
+    print(f"📅 上次每日报告: "
           f"{datetime.fromtimestamp(last_daily_report).strftime('%Y-%m-%d %H:%M') if last_daily_report > 0 else '从未'}")
-    print(f"📅 上次状态推送: "
+    print(f"📅 上次状态报告: "
           f"{datetime.fromtimestamp(last_status_push).strftime('%Y-%m-%d %H:%M') if last_status_push > 0 else '从未'}")
 
     if not ai_model.is_trained:
@@ -1458,13 +1508,13 @@ def main():
         save_memory(memory)
         config["buy_threshold"]  = 55
         config["sell_threshold"] = 45
-        print("⚠️ 模型未训练，使用宽松阈值: 买入55 / 卖出45（加速积累训练数据）")
+        print("⚠️ 模型未训练，使用宽松阈值: 买入55 / 卖出45（加速积累初始训练数据）")
     else:
         print("✅ 模型已训练，使用动态阈值")
 
     # 启动通知（含Volume状态，方便排查）
     log_size    = os.path.getsize(LOG_PATH) if os.path.exists(LOG_PATH) else 0
-    volume_info = f"✅ Volume已挂载" if _volume_ok else "❌ Volume未挂载！数据重启后丢失"
+    volume_info = f"✅ 存储已挂载" if _volume_ok else "❌ 存储未挂载！重启后数据全部丢失"
     send_telegram_message(
         f"🚀 系统启动\n"
         f"模型: {'✅已训练' if ai_model.is_trained else '❌未训练'}\n"
@@ -1473,6 +1523,13 @@ def main():
         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         config
     )
+
+    # 恢复信号冷却时间，防止重启后重复发送信号
+    last_signal_time = load_signal_time()
+    if last_signal_time:
+        active = {k: v for k, v in last_signal_time.items()
+                  if time.time() - v < max(COOLDOWN_BY_CYCLE.values())}
+        print(f"📅 已恢复信号冷却记录，共 {len(active)} 个币种")
 
     # 启动后强制推送一次状态，让用户确认系统正常运行
     # 不受 need_push / 评分变化 条件限制
@@ -1489,10 +1546,10 @@ def main():
                     current_market_cycle = new_cycle
                     memory = load_memory()
                     memory = apply_cycle_strategy_adjustment(memory, current_market_cycle)
-                    print(f"市场周期更新: {current_market_cycle}")
+                    print(f"市场周期已更新: {current_market_cycle}")
                     # 周期变化时通知冷却时间也跟着变了
                     cooldown_sec = COOLDOWN_BY_CYCLE.get(current_market_cycle, 1800)
-                    print(f"信号冷却时间调整为: {cooldown_sec // 60}分钟")
+                    print(f"信号冷却时间已调整为: {cooldown_sec // 60} 分钟")
                 last_cycle_check = now
 
             verify_past_signals(config)
@@ -1518,9 +1575,7 @@ def main():
             _loop_count = getattr(main, '_loop_count', 0) + 1
             main._loop_count = _loop_count
             if _loop_count % 10 == 1:
-                print(f"[DEBUG] 第{_loop_count}轮 | 阈值: 买入={config['buy_threshold']}, "
-                      f"卖出={config['sell_threshold']} | 周期:{current_market_cycle} | "
-                      f"模型:{'已训练' if ai_model.is_trained else '未训练'}")
+                print(f"[监控] 第{_loop_count}轮 | 阈值: 买入={config['buy_threshold']} 卖出={config['sell_threshold']} | 周期:{current_market_cycle} | 模型:{'已训练' if ai_model.is_trained else '未训练'}")
 
             # 未训练时缩短冷却时间到15分钟，加速积累训练数据
             # 已训练后恢复按市场周期的动态冷却时间
@@ -1528,6 +1583,10 @@ def main():
                 signal_cooldown = 900   # 15分钟，加速数据积累
             else:
                 signal_cooldown = COOLDOWN_BY_CYCLE.get(current_market_cycle, 1800)
+
+            # 本轮评分缓存，供信号循环和状态推送共用，避免重复计算
+            current_round_scores  = {}
+            current_round_factors = {}
 
             # ======= 核心信号循环 =======
             for coin in coins:
@@ -1537,6 +1596,9 @@ def main():
                     score, factors, features = calculate_score(
                         df, memory, whale, current_market_cycle, coin, config)
                     analysis = factors['analysis']
+                    # 缓存本轮评分供状态推送使用
+                    current_round_scores[coin]  = score
+                    current_round_factors[coin] = factors
 
                     if score >= config["buy_threshold"]:
                         base_signal = "买入"
@@ -1554,15 +1616,15 @@ def main():
                     confirmed, avg_score = check_signal_confirm(coin, base_signal, score)
                     confirm_entry = _get_confirm_cache().get(coin, {})
                     if confirm_entry.get('count', 0) < required_confirms:
-                        print(f"{coin} {base_signal}信号等待确认"
-                              f"({confirm_entry.get('count',0)}/{required_confirms}, {score}分)...")
+                        print(f"{coin} {base_signal}信号等待二次确认 ({confirm_entry.get('count',0)}/{required_confirms}次，当前评分:{score})")
                         continue
 
                     # 修改三：使用动态冷却时间
                     if now - last_signal_time.get(coin, 0) < signal_cooldown:
-                        print(f"{coin} 信号冷却中({signal_cooldown//60}分钟)，跳过")
+                        print(f"{coin} 信号冷却中（{signal_cooldown//60}分钟内不重复发送），跳过")
                         continue
                     last_signal_time[coin] = now
+                    save_signal_time(last_signal_time)  # 立即持久化，防止并发容器重复发送
 
                     price = get_ticker(coin) or df["close"].iloc[-1]
 
@@ -1570,15 +1632,15 @@ def main():
                     if coin in config["coins"]:
                         log_signal(coin, base_signal, score, price, whale,
                                    current_market_cycle, factors, features)
-                        print(f"📝 记录信号: {coin} {base_signal} 评分{score}")
+                        print(f"📝 信号已记录: {coin} {base_signal} 评分{score}")
                     else:
-                        print(f"📝 热门币 {coin} 信号不记录训练日志")
+                        print(f"📝 热门币种 {coin} 信号不计入训练数据")
 
                     # 修改一：使用新的买入过滤逻辑
                     if base_signal == "买入":
                         ok, reason = check_buy_filters(coin, df, memory)
                         if not ok:
-                            print(f"{coin} 买入被过滤: {reason}")
+                            print(f"{coin} 买入信号已过滤: {reason}")
                             continue
 
                     risk_level, risks = generate_risk_analysis(analysis, factors, config)
@@ -1598,7 +1660,7 @@ def main():
                     msg = build_signal_message(
                         coin, base_signal, score, price,
                         factors, analysis, risk_level, risks,
-                        SIGNAL_CONFIRM_COUNT, avg_score, config
+                        required_confirms, avg_score, config
                     )
                     send_notification(msg, config, f"{coin} {base_signal}信号")
                     reset_signal_confirm(coin)
@@ -1623,15 +1685,8 @@ def main():
                 })
 
             if now - last_status_push > STATUS_PUSH_INTERVAL:
-                current_scores = {}
-                for coin in coins:
-                    try:
-                        df    = get_kline(coin, interval="5m", limit=300)
-                        score, _, _ = calculate_score(df, memory, detect_whale(coin),
-                                                      current_market_cycle, coin, config)
-                        current_scores[coin] = score
-                    except Exception:
-                        current_scores[coin] = None
+                # 直接复用主循环已计算的评分，不再重复调用 calculate_score
+                current_scores = {c: current_round_scores.get(c) for c in coins}
 
                 need_push = (not last_scores) or any(
                     last_scores.get(c) is None or
@@ -1646,7 +1701,8 @@ def main():
                 # 启动后第一次强制推送，忽略评分变化条件
                 # 让用户收到通知确认系统正常运行
                 if force_push_on_start or (need_push and cur_interval != last_interval):
-                    status = build_status_message(coins, memory, config)
+                    status = build_status_message(coins, memory, config,
+                                                  current_round_scores, current_round_factors)
                     send_telegram_message(status, config)
                     last_scores    = current_scores.copy()
                     force_push_on_start = False   # 只强制推送一次
@@ -1669,7 +1725,7 @@ def main():
                 })
 
         except Exception as e:
-            print(f"主循环异常: {e}")
+            print(f"主循环运行异常: {e}")
             import traceback; traceback.print_exc()
 
         # 每轮循环更新心跳，证明进程仍存活
@@ -1684,9 +1740,9 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n⛔ 用户中断，正在退出...")
+        print("\n⛔ 收到中断信号，系统正在退出...")
     except Exception as e:
-        print(f"❌ 主程序异常退出: {e}")
+        print(f"❌ 系统异常退出: {e}")
         import traceback; traceback.print_exc()
     finally:
         # 无论正常退出还是异常退出，都释放启动锁
