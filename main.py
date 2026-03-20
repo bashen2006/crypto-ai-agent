@@ -378,8 +378,18 @@ def save_signal_confirm(data):
     except Exception as e:
         print(f"⚠️ save_signal_confirm 失败: {e}")
 
+# 内存缓存：signal_confirm 不再每次读写文件
+# 进程内共享，重启时从文件恢复一次
+_signal_confirm_cache = None
+
+def _get_confirm_cache():
+    global _signal_confirm_cache
+    if _signal_confirm_cache is None:
+        _signal_confirm_cache = load_signal_confirm()
+    return _signal_confirm_cache
+
 def check_signal_confirm(coin, signal_type, score):
-    confirms = load_signal_confirm()
+    confirms = _get_confirm_cache()
     entry    = confirms.get(coin, {'signal': None, 'count': 0, 'scores': []})
     if entry['signal'] != signal_type:
         entry = {'signal': signal_type, 'count': 1, 'scores': [score]}
@@ -388,13 +398,15 @@ def check_signal_confirm(coin, signal_type, score):
         entry['scores'].append(score)
         entry['scores'] = entry['scores'][-SIGNAL_CONFIRM_COUNT:]
     confirms[coin] = entry
-    save_signal_confirm(confirms)
+    # 每5次写一次文件，减少I/O（重启后最多丢失5次确认记录，影响极小）
+    if sum(e.get('count', 0) for e in confirms.values()) % 5 == 0:
+        save_signal_confirm(confirms)
     if entry['count'] >= SIGNAL_CONFIRM_COUNT:
         return True, float(np.mean(entry['scores']))
     return False, score
 
 def reset_signal_confirm(coin):
-    confirms = load_signal_confirm()
+    confirms = _get_confirm_cache()
     if coin in confirms:
         del confirms[coin]
         save_signal_confirm(confirms)
@@ -807,6 +819,19 @@ def detect_market_cycle():
 
 def apply_cycle_strategy_adjustment(memory, cycle):
     memory = memory.copy()
+    # 未训练时只调整权重，不改阈值
+    # 阈值固定为55/45，等待训练完成后再动态调整
+    if not ai_model.is_trained:
+        if cycle == "牛市":
+            memory["trend_weight"] = min(memory.get("trend_weight", 0.3) + 0.05, 1.0)
+        elif cycle == "熊市":
+            memory["trend_weight"] = max(memory.get("trend_weight", 0.3) - 0.05, 0.0)
+        elif cycle == "震荡":
+            memory["volume_weight"] = min(memory.get("volume_weight", 0.2) + 0.05, 1.0)
+        save_memory(memory)
+        print(f"周期调整(未训练): {cycle}，仅调整权重，阈值保持55/45")
+        return memory
+    # 已训练时正常调整阈值
     if cycle == "牛市":
         memory["trend_weight"]   = min(memory.get("trend_weight", 0.3) + 0.05, 1.0)
         memory["buy_threshold"]  = min(memory.get("buy_threshold", 70) + 2, 85)
@@ -842,17 +867,41 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
         ma60       = df["ma60"].iloc[-1]
         momentum   = (df["close"].iloc[-1] - df["close"].iloc[-10]) / df["close"].iloc[-10]
 
+        # 未训练时使用放大权重，让评分更分散，方便积累信号数据
+        # 已训练后使用memory里的自适应权重
+        if not ai_model.is_trained:
+            trend_w    = 0.8   # 放大，原0.3
+            momentum_w = 0.6   # 放大，原0.25
+            volume_w   = 0.5   # 放大，原0.2
+        else:
+            trend_w    = memory.get("trend_weight",    0.3)
+            momentum_w = memory.get("momentum_weight", 0.25)
+            volume_w   = memory.get("volume_weight",   0.2)
+
         rule_score = 50
+
+        # 趋势：双向评分（多头加分，空头减分）
         if ma20 > ma60:
-            rule_score += 20 * memory.get("trend_weight", 0.3)
+            rule_score += 20 * trend_w
+        else:
+            rule_score -= 20 * trend_w
+
+        # 动量：双向评分（强势加分，弱势减分）
         if momentum > 0.02:
-            rule_score += 15 * memory.get("momentum_weight", 0.25)
+            rule_score += 15 * momentum_w
+        elif momentum < -0.02:
+            rule_score -= 15 * momentum_w
 
         volume    = df["volume"].iloc[-1]
         avg_volume= df["volume"].mean()
         vol_ratio = volume / avg_volume if avg_volume != 0 else 1
+
+        # 量能：双向评分（放量加分，缩量减分）
         if vol_ratio > 1.5:
-            rule_score += 10 * memory.get("volume_weight", 0.2)
+            rule_score += 10 * volume_w
+        elif vol_ratio < 0.5:
+            rule_score -= 10 * volume_w
+
         if whale > 0:
             rule_score += 5
         rule_score = max(0, min(100, int(rule_score)))
@@ -937,27 +986,53 @@ def save_log(log):
 def verify_past_signals(config):
     log     = load_log()
     updated = False
+    now_ts  = time.time()
     for entry in log:
         if entry.get("verified", False):
             continue
         coin        = entry["coin"]
         signal_time = entry["timestamp"]
+        age_minutes = (now_ts - signal_time) / 60
+
+        # 信号不足25分钟（5根K线），等待数据成熟
+        if age_minutes < 25:
+            continue
+
         try:
-            df = get_kline(coin, interval="5m", limit=10)
+            df = get_kline(coin, interval="5m", limit=100)
             df['ts_sec'] = df['ts'] / 1000
             future_df    = df[df['ts_sec'] > signal_time].sort_values('ts_sec')
-            if len(future_df) < 5:
-                continue
-            if entry["signal"] == "买入":
-                profit = (future_df['high'].iloc[:5].max() - entry["price"]) / entry["price"]
-            elif entry["signal"] == "卖出":
-                profit = (entry["price"] - future_df['low'].iloc[:5].min()) / entry["price"]
-            else:
-                continue
-            entry["verified"] = True
-            entry["result"]   = "correct" if profit > PROFIT_THRESHOLD else "wrong"
-            entry["profit"]   = round(profit * 100, 3)
-            updated = True
+
+            if len(future_df) >= 5:
+                # 有足够未来K线，正常验证
+                if entry["signal"] == "买入":
+                    profit = (future_df['high'].iloc[:5].max() - entry["price"]) / entry["price"]
+                elif entry["signal"] == "卖出":
+                    profit = (entry["price"] - future_df['low'].iloc[:5].min()) / entry["price"]
+                else:
+                    continue
+                entry["verified"] = True
+                entry["result"]   = "correct" if profit > PROFIT_THRESHOLD else "wrong"
+                entry["profit"]   = round(profit * 100, 3)
+                updated = True
+
+            elif age_minutes > 120:
+                # 超过2小时仍找不到足够未来K线（信号太老，K线已滚出窗口）
+                # 用当前最新价格 vs 信号价格估算结果，强制标记避免永久积压
+                current_price = df['close'].iloc[-1]
+                if entry["signal"] == "买入":
+                    profit = (current_price - entry["price"]) / entry["price"]
+                elif entry["signal"] == "卖出":
+                    profit = (entry["price"] - current_price) / entry["price"]
+                else:
+                    continue
+                entry["verified"] = True
+                entry["result"]   = "correct" if profit > PROFIT_THRESHOLD else "wrong"
+                entry["profit"]   = round(profit * 100, 3)
+                entry["note"]     = "超时验证（用当前价格估算）"
+                updated = True
+                print(f"⏰ {coin} 信号超时验证({age_minutes:.0f}分钟): {entry['result']}")
+
         except Exception as e:
             print(f"验证{coin}失败: {e}")
     if updated:
@@ -1048,6 +1123,10 @@ def adaptive_strategy_optimization(config):
            f"ML权重: {memory['ml_weight']:.2f}\n"
            f"Top5特征:\n{feature_msg}"
            f"{overfit_warning}")
+    # 训练成功后同步更新config阈值，当轮循环立即生效
+    config['buy_threshold']  = memory['buy_threshold']
+    config['sell_threshold'] = memory['sell_threshold']
+    print(f"✅ 首次训练完成，阈值已同步: 买入={config['buy_threshold']}, 卖出={config['sell_threshold']}")
     send_notification(msg, config, "AI模型进化报告")
 
 # =========================
@@ -1097,34 +1176,36 @@ def get_signal_stats_since(hours):
 # 区分主流币（BTC联动强）和山寨币（可能独立行情）
 # =========================
 def check_buy_filters(coin, df, memory):
-    base       = coin.split("-")[0].upper()
-    is_major   = base in MAJOR_COINS
-    btc_info   = get_btc_dominance_trend()
+    base             = coin.split("-")[0].upper()
+    is_major         = base in MAJOR_COINS
+    btc_info         = get_btc_dominance_trend()
+    # 未训练时放宽过滤，目标是积累训练数据
+    is_accumulating  = not ai_model.is_trained
 
     if is_major:
-        # 主流币：BTC整体下跌趋势时过滤
+        # 主流币：BTC整体下跌趋势时过滤（无论是否训练都执行）
         if btc_info['btc_falling']:
             return False, f"BTC均线死叉下跌，主流币{coin}过滤"
     else:
-        # 山寨币：BTC走独立行情时才过滤（资金被虹吸）
-        # BTC普跌不过滤山寨币（山寨可能有独立行情）
+        # 山寨币：BTC走独立行情时才过滤
         if btc_info['btc_independent']:
             return False, (f"BTC独立拉升中"
                            f"(BTC+{btc_info['btc_change']*100:.1f}% vs 大盘"
                            f"{btc_info['market_avg']*100:.1f}%)，资金虹吸，山寨暂缓")
 
-    # 成交量过滤（所有币种共用）
-    volume  = df['volume'].iloc[-1]
-    avg_vol = df['volume'].mean()
-    if volume < avg_vol * VOLUME_RATIO_MIN:
-        return False, f"成交量不足({volume:.0f}<{avg_vol*VOLUME_RATIO_MIN:.0f})"
+    # 已训练后才做成交量和波动率过滤
+    # 未训练阶段只做方向性过滤，不做量价过滤，降低门槛积累数据
+    if not is_accumulating:
+        volume  = df['volume'].iloc[-1]
+        avg_vol = df['volume'].mean()
+        if volume < avg_vol * VOLUME_RATIO_MIN:
+            return False, f"成交量不足({volume:.0f}<{avg_vol*VOLUME_RATIO_MIN:.0f})"
 
-    # 波动率过滤（所有币种共用）
-    close = df['close'].values
-    if len(close) >= 21:
-        vol = np.std(np.diff(close[-21:]) / close[-21:-1])
-        if vol < VOLATILITY_MIN:
-            return False, f"波动率过低({vol:.4f})"
+        close = df['close'].values
+        if len(close) >= 21:
+            vol = np.std(np.diff(close[-21:]) / close[-21:-1])
+            if vol < VOLATILITY_MIN:
+                return False, f"波动率过低({vol:.4f})"
 
     return True, "通过"
 
@@ -1369,12 +1450,15 @@ def main():
 
     if not ai_model.is_trained:
         memory = load_memory()
-        memory["buy_threshold"]  = 65
-        memory["sell_threshold"] = 35
+        # 未训练时使用宽松阈值，配合放大权重，让规则评分能触发信号
+        # 规则评分上限约82（多头+强动量+放量），下限约18（空头+弱动量+缩量）
+        # 阈值55/45可以覆盖到明显的涨跌行情
+        memory["buy_threshold"]  = 55
+        memory["sell_threshold"] = 45
         save_memory(memory)
-        config["buy_threshold"]  = 65
-        config["sell_threshold"] = 35
-        print("⚠️ 模型未训练，使用保守阈值: 买入65 / 卖出35")
+        config["buy_threshold"]  = 55
+        config["sell_threshold"] = 45
+        print("⚠️ 模型未训练，使用宽松阈值: 买入55 / 卖出45（加速积累训练数据）")
     else:
         print("✅ 模型已训练，使用动态阈值")
 
@@ -1389,6 +1473,10 @@ def main():
         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         config
     )
+
+    # 启动后强制推送一次状态，让用户确认系统正常运行
+    # 不受 need_push / 评分变化 条件限制
+    force_push_on_start = True
 
     while True:
         try:
@@ -1417,12 +1505,29 @@ def main():
                     coins.append(h)
 
             memory = load_memory()
-            config["buy_threshold"]  = memory.get("buy_threshold",  config["buy_threshold"])
-            config["sell_threshold"] = memory.get("sell_threshold", config["sell_threshold"])
-            print(f"[DEBUG] 阈值: 买入={config['buy_threshold']}, 卖出={config['sell_threshold']}")
+            # 未训练时固定使用宽松阈值55/45，不从memory读取
+            # 防止市场周期调整把阈值改回70/35导致信号触发不了
+            if ai_model.is_trained:
+                config["buy_threshold"]  = memory.get("buy_threshold",  config["buy_threshold"])
+                config["sell_threshold"] = memory.get("sell_threshold", config["sell_threshold"])
+            else:
+                config["buy_threshold"]  = 55
+                config["sell_threshold"] = 45
 
-            # 修改三：获取当前周期对应的冷却时间
-            signal_cooldown = COOLDOWN_BY_CYCLE.get(current_market_cycle, 1800)
+            # DEBUG每10轮打印一次，避免日志刷屏
+            _loop_count = getattr(main, '_loop_count', 0) + 1
+            main._loop_count = _loop_count
+            if _loop_count % 10 == 1:
+                print(f"[DEBUG] 第{_loop_count}轮 | 阈值: 买入={config['buy_threshold']}, "
+                      f"卖出={config['sell_threshold']} | 周期:{current_market_cycle} | "
+                      f"模型:{'已训练' if ai_model.is_trained else '未训练'}")
+
+            # 未训练时缩短冷却时间到15分钟，加速积累训练数据
+            # 已训练后恢复按市场周期的动态冷却时间
+            if not ai_model.is_trained:
+                signal_cooldown = 900   # 15分钟，加速数据积累
+            else:
+                signal_cooldown = COOLDOWN_BY_CYCLE.get(current_market_cycle, 1800)
 
             # ======= 核心信号循环 =======
             for coin in coins:
@@ -1443,9 +1548,14 @@ def main():
                         continue
 
                     # 连续确认机制
+                    # 未训练时只需1次确认（加速积累数据）
+                    # 已训练后需要2次确认（提高信号质量）
+                    required_confirms = 1 if not ai_model.is_trained else SIGNAL_CONFIRM_COUNT
                     confirmed, avg_score = check_signal_confirm(coin, base_signal, score)
-                    if not confirmed:
-                        print(f"{coin} {base_signal}信号等待确认({score}分)...")
+                    confirm_entry = _get_confirm_cache().get(coin, {})
+                    if confirm_entry.get('count', 0) < required_confirms:
+                        print(f"{coin} {base_signal}信号等待确认"
+                              f"({confirm_entry.get('count',0)}/{required_confirms}, {score}分)...")
                         continue
 
                     # 修改三：使用动态冷却时间
@@ -1533,22 +1643,24 @@ def main():
                 last_interval = int(last_status_push / STATUS_PUSH_INTERVAL) \
                                 if last_status_push > 0 else -1
 
-                if need_push and cur_interval != last_interval:
+                # 启动后第一次强制推送，忽略评分变化条件
+                # 让用户收到通知确认系统正常运行
+                if force_push_on_start or (need_push and cur_interval != last_interval):
                     status = build_status_message(coins, memory, config)
                     send_telegram_message(status, config)
-                    last_scores = current_scores.copy()
+                    last_scores    = current_scores.copy()
+                    force_push_on_start = False   # 只强制推送一次
 
                 last_status_push = now
-                # 状态推送时间也持久化，重启后不重复推送
+                # 状态推送时间持久化，重启后不重复推送
                 save_timing_state({
                     'last_backtest_time': last_backtest_time,
                     'last_daily_report':  last_daily_report,
                     'last_status_push':   last_status_push
                 })
 
-            # 修改二：日报发送后持久化时间戳
+            # 每日报告已合并到 BACKTEST_INTERVAL，此处同步更新last_daily_report即可
             if now - last_daily_report > DAILY_REPORT_INTERVAL:
-                send_notification(generate_backtest_report(), config, "每日回测报告")
                 last_daily_report = now
                 save_timing_state({
                     'last_backtest_time': last_backtest_time,
@@ -1562,7 +1674,10 @@ def main():
 
         # 每轮循环更新心跳，证明进程仍存活
         update_lock_heartbeat()
-        time.sleep(config["check_interval"])
+
+        # 安全sleep：最小60秒，防止check_interval异常值导致疯狂循环
+        sleep_time = max(60, int(config.get("check_interval", 300)))
+        time.sleep(sleep_time)
 
 
 if __name__ == "__main__":
