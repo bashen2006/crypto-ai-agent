@@ -1619,7 +1619,7 @@ def main():
     # 使用方法：在Railway Variables里添加 RESET_VERIFIED=1，
     #           部署后系统自动重置，重置完成后删除该变量即可
     # =========================
-    if os.getenv("RESET_VERIFIED") == "1":
+    if os.getenv("RESET_VERIFIED", "").strip() in ("1", "true", "True", "yes"):
         try:
             log = load_log()
             reset_count = 0
