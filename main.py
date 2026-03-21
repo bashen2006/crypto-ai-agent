@@ -102,7 +102,8 @@ TIMING_PATH        = os.path.join(DATA_DIR, TIMING_FILE)
 SIGNAL_TIME_PATH   = os.path.join(DATA_DIR, SIGNAL_TIME_FILE)
 
 # 时间间隔
-STATUS_PUSH_INTERVAL          = 300
+STATUS_PUSH_INTERVAL          = 300    # 5分钟检查一次（有变化才发）
+FORCE_STATUS_INTERVAL         = 1800   # 30分钟强制发一次（无论有无变化）
 DAILY_REPORT_INTERVAL         = 86400
 BACKTEST_INTERVAL             = 86400
 ADAPTIVE_OPTIMIZATION_INTERVAL= 3600
@@ -591,11 +592,20 @@ class AITradingModel:
             if len(X) < orig:
                 print(f"已清除 {orig - len(X)} 条含NaN的样本")
 
+        # 检查标签多样性：必须同时有correct和wrong样本
+        # 如果全部是一种标签，sklearn会报ValueError崩溃
+        unique_labels = np.unique(y)
+        if len(unique_labels) < 2:
+            label_name = "全部正确" if unique_labels[0] == 1 else "全部错误"
+            print(f"⚠️ 训练标签只有一种类型（{label_name}），无法训练，跳过本次")
+            print(f"   原因：胜率为0%或100%时模型无法学习，需等待更多样化的信号")
+            return False
+
         # ✅ 到这里才真正开始训练，此时同步更新 feature_names
         # scaler 也会在下面 fit_transform 中重新拟合，保证两者始终匹配
         if isinstance(X, pd.DataFrame):
             self.feature_names = X.columns.tolist()
-        print(f"开始训练模型，特征数量: {len(self.feature_names)}")
+        print(f"开始训练模型，特征数量: {len(self.feature_names)}, 正确率: {np.mean(y):.1%}")
 
         X_scaled = self.scaler.fit_transform(X)
 
@@ -1346,8 +1356,26 @@ def build_status_message(coins, memory, config,
             verified_count = sum(1 for e in log_data
                                  if e.get("verified") and e.get("result") in ("correct", "wrong"))
             total_logged   = len([e for e in log_data if e.get("signal") in ("买入", "卖出")])
-            model_info = (f"❌ 未训练 | 已积累: {verified_count}/{MIN_TRAIN_SAMPLES}条"
-                          f" (已记录信号: {total_logged}条，等待验证中...)")
+            # 进度条（10格）
+            pending_count = sum(1 for e in log_data
+                                if e.get("signal") in ("买入","卖出") and not e.get("verified"))
+            correct_count = sum(1 for e in log_data if e.get("result") == "correct")
+            wrong_count   = sum(1 for e in log_data if e.get("result") == "wrong")
+            progress = min(10, int(verified_count / MIN_TRAIN_SAMPLES * 10))
+            bar = "█" * progress + "░" * (10 - progress)
+            # 胜率说明
+            if verified_count > 10 and correct_count == 0:
+                winrate_note = "\n     ⚠️ 已验证全部错误，等待多样化行情（不影响积累）"
+            elif verified_count > 0:
+                winrate_note = f"\n     当前胜率: {correct_count/verified_count:.0%}（{correct_count}对/{wrong_count}错）"
+            else:
+                winrate_note = ""
+            model_info = (
+                f"❌ 未训练\n"
+                f"     进度: [{bar}] {verified_count}/{MIN_TRAIN_SAMPLES}条\n"
+                f"     已验证:{verified_count}条 | 等待中:{pending_count}条 | 已记录:{total_logged}条"
+                f"{winrate_note}"
+            )
         except Exception:
             model_info = "❌ 未训练（积累中...）"
 
@@ -1532,8 +1560,8 @@ def main():
         print(f"📅 已恢复信号冷却记录，共 {len(active)} 个币种")
 
     # 启动后强制推送一次状态，让用户确认系统正常运行
-    # 不受 need_push / 评分变化 条件限制
     force_push_on_start = True
+    last_forced_status  = 0   # 记录上次强制推送时间，初始为0确保启动后立即推送
 
     while True:
         try:
@@ -1688,7 +1716,8 @@ def main():
                 # 直接复用主循环已计算的评分，不再重复调用 calculate_score
                 current_scores = {c: current_round_scores.get(c) for c in coins}
 
-                need_push = (not last_scores) or any(
+                # 评分是否有明显变化
+                score_changed = (not last_scores) or any(
                     last_scores.get(c) is None or
                     (s is not None and abs(s - last_scores.get(c, 0)) >= SCORE_CHANGE_THRESHOLD)
                     for c, s in current_scores.items()
@@ -1698,14 +1727,17 @@ def main():
                 last_interval = int(last_status_push / STATUS_PUSH_INTERVAL) \
                                 if last_status_push > 0 else -1
 
-                # 启动后第一次强制推送，忽略评分变化条件
-                # 让用户收到通知确认系统正常运行
-                if force_push_on_start or (need_push and cur_interval != last_interval):
+                # 超过30分钟没推送，强制发一次（熊市横盘评分不变，但要让用户知道系统在运行）
+                force_by_interval = (now - last_forced_status > FORCE_STATUS_INTERVAL)
+
+                # 满足任一条件就推送：启动强制、30分钟到了、评分有变化
+                if force_push_on_start or force_by_interval or (score_changed and cur_interval != last_interval):
                     status = build_status_message(coins, memory, config,
                                                   current_round_scores, current_round_factors)
                     send_telegram_message(status, config)
-                    last_scores    = current_scores.copy()
-                    force_push_on_start = False   # 只强制推送一次
+                    last_scores         = current_scores.copy()
+                    force_push_on_start = False     # 只在启动时强制一次
+                    last_forced_status  = now        # 记录本次强制推送时间
 
                 last_status_push = now
                 # 状态推送时间持久化，重启后不重复推送
