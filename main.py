@@ -1055,19 +1055,31 @@ def save_log(log):
         print(f"⚠️ 信号日志保存失败: {e}")
 
 def verify_past_signals(config):
-    log          = load_log()
-    now_ts       = time.time()
-    updated_count= 0   # 本次验证了多少条
-    SAVE_EVERY   = 10  # 每验证10条就写一次，防止OOM Kill时全部丢失
+    # 三重障碍法验证信号（参考 Marcos Lopez de Prado 量化投资方法论）
+    # 在未来2小时窗口内：
+    #   止盈+0.3%先触发 → correct
+    #   止损-0.3%先触发 → wrong
+    #   两者都未触发    → 看2小时后收盘价方向
+    # 相比原来25分钟+最高价的方式，熊市横盘下能产生均衡的correct/wrong分布
+
+    BARRIER_PCT   = 0.003   # 止盈止损均为0.3%
+    WINDOW_BARS   = 24      # 验证窗口：24根5分钟K线 = 2小时
+    MIN_AGE_MIN   = 25      # 信号至少25分钟后才验证
+    SAVE_EVERY    = 10      # 每验证10条写一次，防OOM Kill丢失
+
+    log           = load_log()
+    now_ts        = time.time()
+    updated_count = 0
 
     for entry in log:
         if entry.get("verified", False):
             continue
+
         coin        = entry["coin"]
         signal_time = entry["timestamp"]
         age_minutes = (now_ts - signal_time) / 60
 
-        if age_minutes < 25:
+        if age_minutes < MIN_AGE_MIN:
             continue
 
         try:
@@ -1076,44 +1088,79 @@ def verify_past_signals(config):
             future_df    = df[df['ts_sec'] > signal_time].sort_values('ts_sec')
 
             if len(future_df) >= 5:
+                window_df    = future_df.iloc[:WINDOW_BARS]
+                signal_price = entry["price"]
+
                 if entry["signal"] == "买入":
-                    profit = (future_df['high'].iloc[:5].max() - entry["price"]) / entry["price"]
+                    result = None
+                    profit = 0
+                    for _, bar in window_df.iterrows():
+                        if bar['high'] >= signal_price * (1 + BARRIER_PCT):
+                            result = "correct"
+                            profit = BARRIER_PCT * 100
+                            break
+                        if bar['low'] <= signal_price * (1 - BARRIER_PCT):
+                            result = "wrong"
+                            profit = -BARRIER_PCT * 100
+                            break
+                    if result is None:
+                        final_price = window_df['close'].iloc[-1]
+                        profit      = (final_price - signal_price) / signal_price * 100
+                        result      = "correct" if profit > 0 else "wrong"
+
                 elif entry["signal"] == "卖出":
-                    profit = (entry["price"] - future_df['low'].iloc[:5].min()) / entry["price"]
+                    result = None
+                    profit = 0
+                    for _, bar in window_df.iterrows():
+                        if bar['low'] <= signal_price * (1 - BARRIER_PCT):
+                            result = "correct"
+                            profit = BARRIER_PCT * 100
+                            break
+                        if bar['high'] >= signal_price * (1 + BARRIER_PCT):
+                            result = "wrong"
+                            profit = -BARRIER_PCT * 100
+                            break
+                    if result is None:
+                        final_price = window_df['close'].iloc[-1]
+                        profit      = (signal_price - final_price) / signal_price * 100
+                        result      = "correct" if profit > 0 else "wrong"
                 else:
                     continue
+
                 entry["verified"] = True
-                entry["result"]   = "correct" if profit > PROFIT_THRESHOLD else "wrong"
-                entry["profit"]   = round(profit * 100, 3)
-                updated_count += 1
+                entry["result"]   = result
+                entry["profit"]   = round(profit, 3)
+                updated_count    += 1
 
             elif age_minutes > 120:
+                # K线数据不足时，用当前价格方向判断（不再强求盈利幅度）
                 current_price = df['close'].iloc[-1]
+                signal_price  = entry["price"]
                 if entry["signal"] == "买入":
-                    profit = (current_price - entry["price"]) / entry["price"]
+                    profit = (current_price - signal_price) / signal_price * 100
+                    result = "correct" if profit > 0 else "wrong"
                 elif entry["signal"] == "卖出":
-                    profit = (entry["price"] - current_price) / entry["price"]
+                    profit = (signal_price - current_price) / signal_price * 100
+                    result = "correct" if profit > 0 else "wrong"
                 else:
                     continue
                 entry["verified"] = True
-                entry["result"]   = "correct" if profit > PROFIT_THRESHOLD else "wrong"
-                entry["profit"]   = round(profit * 100, 3)
-                entry["note"]     = "超时验证"
-                updated_count += 1
-                print(f"⏰ {coin} 信号超时（{age_minutes:.0f}分钟），验证结果: {entry['result']}")
+                entry["result"]   = result
+                entry["profit"]   = round(profit, 3)
+                entry["note"]     = "超时验证（K线数据不足）"
+                updated_count    += 1
+                print(f"⏰ {coin} 超时验证（{age_minutes:.0f}分钟）: {result}")
 
-            # 每验证10条立即写入一次，防止OOM Kill时数据全部丢失
             if updated_count > 0 and updated_count % SAVE_EVERY == 0:
                 save_log(log)
-                print(f"💾 已验证 {updated_count} 条，中途保存防止数据丢失")
+                print(f"💾 中途保存：已验证 {updated_count} 条")
 
         except Exception as e:
             print(f"验证 {coin} 历史信号失败: {e}")
 
-    # 最后再写一次，保存剩余验证结果
     if updated_count > 0:
         save_log(log)
-        print(f"✅ 本次共验证 {updated_count} 条信号并保存")
+        print(f"✅ 本次验证完成，共验证 {updated_count} 条并保存")
 
 def log_signal(coin, signal, score, price, whale, market_cycle, factors, features):
     log          = load_log()
@@ -1565,6 +1612,38 @@ def main():
 
     # 获取启动锁，防止新旧容器同时运行
     acquire_startup_lock()
+
+    # =========================
+    # 自动重置验证数据（检测到 RESET_VERIFIED=1 环境变量时触发）
+    # 用途：部署新验证逻辑后，将旧数据重新验证
+    # 使用方法：在Railway Variables里添加 RESET_VERIFIED=1，
+    #           部署后系统自动重置，重置完成后删除该变量即可
+    # =========================
+    if os.getenv("RESET_VERIFIED") == "1":
+        try:
+            log = load_log()
+            reset_count = 0
+            for entry in log:
+                if entry.get("verified", False):
+                    entry["verified"] = False
+                    entry["result"]   = None
+                    entry["profit"]   = None
+                    entry.pop("note", None)
+                    reset_count += 1
+            if reset_count > 0:
+                save_log(log)
+                msg = (
+                    f"🔄 验证数据已重置\n"
+                    f"共重置 {reset_count} 条记录\n"
+                    f"系统将用新验证逻辑重新验证\n"
+                    f"完成后请删除 RESET_VERIFIED 变量"
+                )
+                print(msg)
+                send_telegram_message(msg, config)
+            else:
+                print("⚠️ 没有需要重置的验证数据")
+        except Exception as e:
+            print(f"⚠️ 重置验证数据失败: {e}")
 
     # 从文件恢复定时状态，重启不重复推送
     timing_state       = load_timing_state()
