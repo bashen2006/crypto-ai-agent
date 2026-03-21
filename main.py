@@ -90,7 +90,8 @@ FEATURES_FILE      = "feature_config.json"
 SIGNAL_CONFIRM_FILE= "signal_confirm.json"
 # 修改二：新增定时状态持久化文件，防止重启重复发送
 TIMING_FILE        = "timing_state.json"
-SIGNAL_TIME_FILE   = "signal_time.json"   # 新增：信号冷却时间持久化
+SIGNAL_TIME_FILE   = "signal_time.json"   # 信号冷却时间持久化
+FEATURES_LOG_FILE  = "features_log.json"  # 特征数据独立存储（防止主日志过大导致OOM）
 
 MEMORY_PATH        = os.path.join(DATA_DIR, MEMORY_FILE)
 LOG_PATH           = os.path.join(DATA_DIR, LOG_FILE)
@@ -100,6 +101,7 @@ FEATURES_PATH      = os.path.join(DATA_DIR, FEATURES_FILE)
 SIGNAL_CONFIRM_PATH= os.path.join(DATA_DIR, SIGNAL_CONFIRM_FILE)
 TIMING_PATH        = os.path.join(DATA_DIR, TIMING_FILE)
 SIGNAL_TIME_PATH   = os.path.join(DATA_DIR, SIGNAL_TIME_FILE)
+FEATURES_LOG_PATH  = os.path.join(DATA_DIR, FEATURES_LOG_FILE)
 
 # 时间间隔
 STATUS_PUSH_INTERVAL          = 300    # 5分钟检查一次（有变化才发）
@@ -132,7 +134,7 @@ GATEIO_BASE_URL = "https://api.gateio.ws/api/v4"
 # 过滤阈值
 VOLUME_RATIO_MIN  = 2.0
 VOLATILITY_MIN    = 0.01
-PROFIT_THRESHOLD  = 0.015
+PROFIT_THRESHOLD  = 0.005  # 降低到0.5%（原1.5%在熊市太难达到，导致全部错误无法训练）
 
 # 多档信号阈值
 SIGNAL_STRONG_BUY  = 75
@@ -559,20 +561,26 @@ class AITradingModel:
 
     def prepare_training_data(self, logs):
         X_list, y_list = [], []
+        # 加载features独立文件，用于还原特征数据
+        features_data  = load_features_log()
         for log in logs:
             if not log.get('verified') or log.get('result') not in ['correct', 'wrong']:
                 continue
-            if 'features' not in log or not log['features']:
+            # 优先从独立文件取features（新格式），兼容旧格式（直接含features字段）
+            features = None
+            if log.get('feature_id') and log['feature_id'] in features_data:
+                features = features_data[log['feature_id']]
+            elif log.get('features'):
+                features = log['features']  # 兼容旧格式
+            if not features:
                 continue
-            X_list.append(log['features'])
+            X_list.append(features)
             y_list.append(1 if log['result'] == 'correct' else 0)
         if len(X_list) < MIN_TRAIN_SAMPLES:
             return None, None
         X_df = pd.DataFrame(X_list)
         # ⚠️ 不在此处更新 feature_names！
         # feature_names 只能在 train() 成功完成后才更新。
-        # 若训练因样本不足被跳过，旧 feature_names 与旧 scaler 还能正常配合预测。
-        # 若在这里更新，训练跳过后 feature_names 变成新数量，但 scaler 还是旧的，预测报错。
         return X_df, np.array(y_list)
 
     def train(self, X, y):
@@ -1006,6 +1014,29 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
 
 # =========================
 # 日志
+# features 独立存储，防止主日志文件过大导致OOM
+# 主日志只存 feature_id（索引），features内容单独存一个文件
+# =========================
+def load_features_log():
+    """加载特征数据文件"""
+    try:
+        with open(FEATURES_LOG_PATH, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_features_log(features_data):
+    """原子保存特征数据文件"""
+    tmp = FEATURES_LOG_PATH + ".tmp"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(features_data, f)  # 不加indent，节省空间
+        shutil.move(tmp, FEATURES_LOG_PATH)
+    except Exception as e:
+        print(f"⚠️ 特征数据保存失败: {e}")
+
+# =========================
+# 日志
 # =========================
 def load_log():
     try:
@@ -1024,9 +1055,11 @@ def save_log(log):
         print(f"⚠️ 信号日志保存失败: {e}")
 
 def verify_past_signals(config):
-    log     = load_log()
-    updated = False
-    now_ts  = time.time()
+    log          = load_log()
+    now_ts       = time.time()
+    updated_count= 0   # 本次验证了多少条
+    SAVE_EVERY   = 10  # 每验证10条就写一次，防止OOM Kill时全部丢失
+
     for entry in log:
         if entry.get("verified", False):
             continue
@@ -1034,17 +1067,15 @@ def verify_past_signals(config):
         signal_time = entry["timestamp"]
         age_minutes = (now_ts - signal_time) / 60
 
-        # 信号不足25分钟（5根K线），等待数据成熟
         if age_minutes < 25:
             continue
 
         try:
-            df = get_kline(coin, interval="5m", limit=300)  # 覆盖25小时，确保信号能被验证
+            df = get_kline(coin, interval="5m", limit=300)
             df['ts_sec'] = df['ts'] / 1000
             future_df    = df[df['ts_sec'] > signal_time].sort_values('ts_sec')
 
             if len(future_df) >= 5:
-                # 有足够未来K线，正常验证
                 if entry["signal"] == "买入":
                     profit = (future_df['high'].iloc[:5].max() - entry["price"]) / entry["price"]
                 elif entry["signal"] == "卖出":
@@ -1054,11 +1085,9 @@ def verify_past_signals(config):
                 entry["verified"] = True
                 entry["result"]   = "correct" if profit > PROFIT_THRESHOLD else "wrong"
                 entry["profit"]   = round(profit * 100, 3)
-                updated = True
+                updated_count += 1
 
             elif age_minutes > 120:
-                # 超过2小时仍找不到足够未来K线（信号太老，K线已滚出窗口）
-                # 用当前最新价格 vs 信号价格估算结果，强制标记避免永久积压
                 current_price = df['close'].iloc[-1]
                 if entry["signal"] == "买入":
                     profit = (current_price - entry["price"]) / entry["price"]
@@ -1069,19 +1098,38 @@ def verify_past_signals(config):
                 entry["verified"] = True
                 entry["result"]   = "correct" if profit > PROFIT_THRESHOLD else "wrong"
                 entry["profit"]   = round(profit * 100, 3)
-                entry["note"]     = "超时验证（用当前价格估算）"
-                updated = True
-                print(f"⏰ {coin} 信号超时（{age_minutes:.0f}分钟），使用当前价格验证: {entry['result']}") 
+                entry["note"]     = "超时验证"
+                updated_count += 1
+                print(f"⏰ {coin} 信号超时（{age_minutes:.0f}分钟），验证结果: {entry['result']}")
+
+            # 每验证10条立即写入一次，防止OOM Kill时数据全部丢失
+            if updated_count > 0 and updated_count % SAVE_EVERY == 0:
+                save_log(log)
+                print(f"💾 已验证 {updated_count} 条，中途保存防止数据丢失")
 
         except Exception as e:
             print(f"验证 {coin} 历史信号失败: {e}")
-    if updated:
+
+    # 最后再写一次，保存剩余验证结果
+    if updated_count > 0:
         save_log(log)
+        print(f"✅ 本次共验证 {updated_count} 条信号并保存")
 
 def log_signal(coin, signal, score, price, whale, market_cycle, factors, features):
-    log   = load_log()
+    log          = load_log()
+    features_data= load_features_log()
+    ts           = time.time()
+
+    # features 单独存储，主日志只存 feature_id（时间戳字符串作为索引）
+    # 这样主日志每条记录只有几十字节，而不是几KB
+    feature_id = None
+    if features:
+        feature_id = str(int(ts * 1000))  # 毫秒时间戳作为唯一ID
+        features_data[feature_id] = features
+        save_features_log(features_data)
+
     entry = {
-        "timestamp":     time.time(),
+        "timestamp":     ts,
         "coin":          coin,
         "signal":        signal,
         "score":         score,
@@ -1091,7 +1139,7 @@ def log_signal(coin, signal, score, price, whale, market_cycle, factors, feature
         "rule_score":    factors.get('rule_score', 50),
         "ml_score":      factors.get('ml_score', 50),
         "ml_confidence": factors.get('ml_confidence', 0),
-        "features":      features,
+        "feature_id":    feature_id,  # 只存ID，不存完整features
         "verified":      False,
         "result":        None,
         "profit":        None
@@ -1101,7 +1149,11 @@ def log_signal(coin, signal, score, price, whale, market_cycle, factors, feature
         verified   = [e for e in log if e.get("verified")]
         unverified = [e for e in log if not e.get("verified")]
         keep       = MAX_LOG_SIZE - len(unverified)
-        log        = (verified[-keep:] if keep > 0 else []) + unverified
+        # 清理已删除日志对应的features，避免features_log无限增长
+        kept_ids   = {e.get('feature_id') for e in verified[-keep:] + unverified if e.get('feature_id')}
+        features_data = {k: v for k, v in features_data.items() if k in kept_ids}
+        save_features_log(features_data)
+        log = (verified[-keep:] if keep > 0 else []) + unverified
     save_log(log)
 
 # =========================
