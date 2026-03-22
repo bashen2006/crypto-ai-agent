@@ -1227,18 +1227,30 @@ def adaptive_strategy_optimization(config):
     memory = load_memory()
     memory['feature_importance'] = ai_model.feature_importance
 
-    if cv_acc > 0.60:
-        memory['buy_threshold']  = min(memory.get('buy_threshold', 70) + 2, 85)
-        memory['sell_threshold'] = max(memory.get('sell_threshold', 35) - 2, 20)
-        memory['ml_weight']      = min(0.7, memory.get('ml_weight', 0.4) + 0.05)
-    elif cv_acc < 0.50:
-        memory['buy_threshold']  = max(memory.get('buy_threshold', 70) - 2, 55)
-        memory['sell_threshold'] = min(memory.get('sell_threshold', 35) + 2, 45)
-        memory['ml_weight']      = max(0.1, memory.get('ml_weight', 0.4) - 0.1)
-        print(f"⚠️ 交叉验证准确率偏低({cv_acc:.3f})，已降低AI模型权重至{memory['ml_weight']:.2f}")
+    # 近期信号样本数（用于防止少量样本胜率虚高导致阈值失控）
+    recent_signals_count = len(sorted(verified,
+                                      key=lambda x: x.get('timestamp', 0),
+                                      reverse=True)[:50])
 
-    memory['buy_threshold']  = max(min(memory['buy_threshold'], 85), memory['sell_threshold'] + 5)
-    memory['sell_threshold'] = max(min(memory['sell_threshold'], 50), 15)
+    # 至少需要30条近期已验证信号才能调整阈值
+    # 防止3条样本100%胜率就把阈值推到85的情况
+    if recent_signals_count >= 30:
+        if cv_acc > 0.60:
+            memory['buy_threshold']  = min(memory.get('buy_threshold', 65) + 2, 75)  # 上限75（原85）
+            memory['sell_threshold'] = max(memory.get('sell_threshold', 35) - 2, 25)  # 下限25（原20）
+            memory['ml_weight']      = min(0.7, memory.get('ml_weight', 0.4) + 0.05)
+        elif cv_acc < 0.50:
+            memory['buy_threshold']  = max(memory.get('buy_threshold', 65) - 2, 55)
+            memory['sell_threshold'] = min(memory.get('sell_threshold', 35) + 2, 45)
+            memory['ml_weight']      = max(0.1, memory.get('ml_weight', 0.4) - 0.1)
+            print(f"⚠️ 交叉验证准确率偏低({cv_acc:.3f})，已降低AI模型权重至{memory['ml_weight']:.2f}")
+    else:
+        print(f"⚠️ 近期样本不足30条（当前{recent_signals_count}条），跳过阈值调整，防止虚高胜率误导")
+
+    # 阈值安全边界（绝对不能超出的范围）
+    # 买入最高75，卖出最低25，两者差值至少5
+    memory['buy_threshold']  = max(min(memory['buy_threshold'], 75), memory['sell_threshold'] + 5)
+    memory['sell_threshold'] = max(min(memory['sell_threshold'], 45), 25)
     save_memory(memory)
 
     recent_verified = sorted(verified, key=lambda x: x.get('timestamp', 0), reverse=True)[:100]
@@ -1669,7 +1681,19 @@ def main():
         config["sell_threshold"] = 45
         print("⚠️ 模型未训练，使用宽松阈值: 买入55 / 卖出45（加速积累初始训练数据）")
     else:
-        print("✅ 模型已训练，使用动态阈值")
+        # 已训练时检测阈值是否合理，防止历史遗留的异常值（如阈值跑到85/20）
+        memory = load_memory()
+        buy_thr  = memory.get("buy_threshold", 65)
+        sell_thr = memory.get("sell_threshold", 35)
+        if buy_thr > 75 or sell_thr < 25 or buy_thr - sell_thr < 5:
+            print(f"⚠️ 检测到异常阈值（买入={buy_thr} 卖出={sell_thr}），自动重置为65/35")
+            memory["buy_threshold"]  = 65
+            memory["sell_threshold"] = 35
+            save_memory(memory)
+            config["buy_threshold"]  = 65
+            config["sell_threshold"] = 35
+        else:
+            print(f"✅ 模型已训练，阈值正常（买入={buy_thr} 卖出={sell_thr}），使用动态阈值")
 
     # 启动通知（含Volume状态，方便排查）
     log_size    = os.path.getsize(LOG_PATH) if os.path.exists(LOG_PATH) else 0
