@@ -187,6 +187,46 @@ current_market_cycle= "未知"
 last_scores         = {}
 btc_features_cache  = {'timestamp': 0, 'features': None}
 start_time          = time.time()
+# 历史评分缓存：用于百分位数动态阈值计算
+# 每轮循环把所有监控币种的评分存入，最多保留500条
+_score_history      = []   # 格式：[score, score, ...]
+_SCORE_HISTORY_MAX  = 500  # 最多保留500条
+
+# =========================
+# 百分位数动态阈值
+# 核心思路：无论牛熊震荡，始终取最强20%信号作为买入阈值
+#           最弱20%信号作为卖出阈值，完全自适应市场
+# =========================
+def calc_dynamic_threshold(score_history, default_buy=62, default_sell=38):
+    """
+    用最近500条历史评分的百分位数动态计算阈值。
+    数据不足20条时使用默认值，避免样本太少导致阈值失真。
+
+    牛市：评分整体高 → 阈值自动升高 → 只选最强信号
+    熊市：评分整体低 → 阈值自动降低 → 熊市反弹也能捕捉
+    震荡：评分均匀分布 → 阈值适中   → 频率稳定
+    """
+    if len(score_history) < 20:
+        return default_buy, default_sell
+
+    scores = np.array(score_history[-500:])  # 最近500条
+
+    # 第80百分位作为买入阈值（最强20%才触发）
+    # 第20百分位作为卖出阈值（最弱20%才触发）
+    buy_thr  = float(np.percentile(scores, 80))
+    sell_thr = float(np.percentile(scores, 20))
+
+    # 安全边界：防止极端行情下阈值过高或过低
+    buy_thr  = max(min(round(buy_thr),  70), 55)  # 买入：55-70之间
+    sell_thr = max(min(round(sell_thr), 45), 30)  # 卖出：30-45之间
+
+    # 保证买卖之间至少10分间距
+    if buy_thr - sell_thr < 10:
+        mid      = (buy_thr + sell_thr) / 2
+        buy_thr  = int(mid + 5)
+        sell_thr = int(mid - 5)
+
+    return buy_thr, sell_thr
 
 # =========================
 # 修改二：定时状态持久化
@@ -1248,9 +1288,11 @@ def adaptive_strategy_optimization(config):
         print(f"⚠️ 近期样本不足30条（当前{recent_signals_count}条），跳过阈值调整，防止虚高胜率误导")
 
     # 阈值安全边界（绝对不能超出的范围）
-    # 买入最高75，卖出最低25，两者差值至少5
-    memory['buy_threshold']  = max(min(memory['buy_threshold'], 75), memory['sell_threshold'] + 5)
-    memory['sell_threshold'] = max(min(memory['sell_threshold'], 45), 25)
+    # 买入最高70（熊市评分普遍40-65，70以上几乎触发不了）
+    # 卖出最低30（同理）
+    # 两者差值至少10，保证信号区间足够宽
+    memory['buy_threshold']  = max(min(memory['buy_threshold'], 70), memory['sell_threshold'] + 10)
+    memory['sell_threshold'] = max(min(memory['sell_threshold'], 45), 30)
     save_memory(memory)
 
     recent_verified = sorted(verified, key=lambda x: x.get('timestamp', 0), reverse=True)[:100]
@@ -1265,13 +1307,18 @@ def adaptive_strategy_optimization(config):
     top5        = sorted(ai_model.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
     feature_msg = "\n".join([f"  {f}: {v:.4f}" for f, v in top5]) if top5 else "  （暂无）"
 
+    # 计算期望值
+    ev_data = calculate_expected_value(recent_verified)
+    ev_msg  = format_ev_message(ev_data)
+
     msg = (f"🤖 AI模型已进化\n"
            f"训练样本: {len(X_df)}\n"
            f"训练准确率: {train_acc:.2%}\n"
            f"交叉验证准确率: {cv_acc:.2%}  ← 真实参考值\n"
            f"实际胜率(近100条): {real_winrate:.2%}\n"
            f"新阈值: 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}\n"
-           f"AI模型权重: {memory['ml_weight']:.2f}\n"
+           f"AI模型权重: {memory['ml_weight']:.2f}\n\n"
+           f"💰 系统期望值:\n{ev_msg}\n\n"
            f"前5重要特征:\n{feature_msg}"
            f"{overfit_warning}")
     # 训练成功后同步更新config阈值，当轮循环立即生效
@@ -1281,23 +1328,100 @@ def adaptive_strategy_optimization(config):
     send_notification(msg, config, "AI模型进化报告")
 
 # =========================
+# 核心盈利指标：期望值（Expected Value）
+# 判断系统是否真正在盈利的唯一可靠指标
+# expected_value > 0 → 长期盈利
+# expected_value < 0 → 长期亏损，需要优化
+# =========================
+def calculate_expected_value(verified_list=None):
+    """
+    计算系统期望值（Expected Value）
+    EV = 胜率 × 平均盈利 - 败率 × 平均亏损
+    正值说明系统长期可盈利，负值说明需要优化
+    """
+    if verified_list is None:
+        log = load_log()
+        verified_list = [e for e in log if e.get("verified")
+                         and e.get("result") in ("correct", "wrong")
+                         and e.get("profit") is not None]
+
+    if len(verified_list) < 10:
+        return None  # 样本不足，无法计算
+
+    correct_list = [e for e in verified_list if e.get("result") == "correct"]
+    wrong_list   = [e for e in verified_list if e.get("result") == "wrong"]
+
+    if not correct_list or not wrong_list:
+        return None  # 标签不均衡，无法计算
+
+    win_rate     = len(correct_list) / len(verified_list)
+    loss_rate    = len(wrong_list)   / len(verified_list)
+    avg_win      = np.mean([abs(e['profit']) for e in correct_list])
+    avg_loss     = np.mean([abs(e['profit']) for e in wrong_list])
+
+    ev = win_rate * avg_win - loss_rate * avg_loss
+
+    return {
+        'ev':        round(ev, 4),          # 每次信号的期望盈利（%）
+        'win_rate':  round(win_rate, 4),    # 胜率
+        'loss_rate': round(loss_rate, 4),   # 败率
+        'avg_win':   round(avg_win, 4),     # 平均盈利（%）
+        'avg_loss':  round(avg_loss, 4),    # 平均亏损（%）
+        'total':     len(verified_list),    # 样本总数
+        'is_profitable': ev > 0             # 是否盈利
+    }
+
+def format_ev_message(ev_data):
+    """格式化期望值信息用于消息推送"""
+    if ev_data is None:
+        return "  期望值: 样本不足（需至少10条验证信号）"
+    ev      = ev_data['ev']
+    emoji   = "✅" if ev > 0 else "❌"
+    trend   = "长期盈利" if ev > 0 else "长期亏损，需优化"
+    return (
+        f"  {emoji} 期望值: {ev:+.3f}% （{trend}）\n"
+        f"  胜率:{ev_data['win_rate']:.0%} | 平均盈利:{ev_data['avg_win']:.3f}%\n"
+        f"  败率:{ev_data['loss_rate']:.0%} | 平均亏损:{ev_data['avg_loss']:.3f}%\n"
+        f"  计算样本: {ev_data['total']}条"
+    )
+
+# =========================
 # 回测 & 统计
 # =========================
 def generate_backtest_report():
     log      = load_log()
-    verified = [e for e in log if e.get("verified")]
+    verified = [e for e in log if e.get("verified")
+                and e.get("result") in ("correct", "wrong")]
     if not verified:
         return "暂无已验证数据"
     total      = len(verified)
     correct    = sum(1 for e in verified if e.get("result") == "correct")
     profits    = [e.get('profit', 0) for e in verified if e.get('profit') is not None]
     avg_profit = np.mean(profits) if profits else 0
-    return (f"📊 回测报告\n"
-            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-            f"总信号: {total}\n"
-            f"正确: {correct} | 错误: {total - correct}\n"
-            f"胜率: {correct/total:.2%}\n"
-            f"平均利润: {avg_profit:.3f}%")
+
+    # 计算期望值
+    ev_data = calculate_expected_value(verified)
+    ev_msg  = format_ev_message(ev_data)
+
+    # 买入/卖出分别统计
+    buy_list  = [e for e in verified if e.get("signal") == "买入"]
+    sell_list = [e for e in verified if e.get("signal") == "卖出"]
+    buy_correct  = sum(1 for e in buy_list  if e.get("result") == "correct")
+    sell_correct = sum(1 for e in sell_list if e.get("result") == "correct")
+    buy_wr  = buy_correct  / len(buy_list)  if buy_list  else 0
+    sell_wr = sell_correct / len(sell_list) if sell_list else 0
+
+    return (f"📊 每日回测报告\n"
+            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"📈 总体统计:\n"
+            f"  总信号: {total}条\n"
+            f"  正确: {correct} | 错误: {total - correct}\n"
+            f"  综合胜率: {correct/total:.2%}\n"
+            f"  平均盈亏: {avg_profit:.3f}%\n\n"
+            f"🔍 分类胜率:\n"
+            f"  买入信号: {len(buy_list)}次 | 胜率{buy_wr:.0%}\n"
+            f"  卖出信号: {len(sell_list)}次 | 胜率{sell_wr:.0%}\n\n"
+            f"💰 系统期望值:\n{ev_msg}")
 
 def get_recent_signals(n=3):
     log     = load_log()
@@ -1384,7 +1508,8 @@ def generate_risk_analysis(analysis, factors, config):
 # =========================
 def build_signal_message(coin, base_signal, score, display_price,
                           factors, analysis, risk_level, risks,
-                          confirm_count, avg_score, config):
+                          confirm_count, avg_score, config,
+                          signal_grade="strong"):
     up_prob    = factors['up_prob'] * 100
     confidence = factors.get('ml_confidence', 0) * 100
 
@@ -1418,8 +1543,15 @@ def build_signal_message(coin, base_signal, score, display_price,
     signal_emoji = "🟢" if base_signal == "买入" else "🔴"
     risk_emoji   = "🔴" if risk_level == "高" else ("🟡" if risk_level == "中" else "🟢")
 
+    # 次级信号用黄色标注，提示用户谨慎参考
+    grade_note = ""
+    if signal_grade == "weak":
+        signal_emoji = "🟡"
+        grade_note   = "⚠️ 次级信号（评分接近阈值，谨慎参考）\n\n"
+
     msg = (
         f"{signal_emoji} <b>{coin} {base_signal}信号</b>\n\n"
+        f"{grade_note}"
         f"💰 价格：${display_price:.6g}\n"
         f"📊 综合评分：{score} (规则:{factors['rule_score']} AI:{factors['ml_score']:.0f})\n"
         f"🎯 上涨概率：{up_prob:.1f}%\n"
@@ -1527,6 +1659,16 @@ def build_status_message(coins, memory, config,
     hot     = scan_hot_coins()[:3]
     hot_str = "\n".join([f"  {c}: {ch:+.2f}%" for c, ch in hot]) if hot else "  暂无"
 
+    # 计算期望值
+    ev_data = calculate_expected_value()
+    ev_line = ""
+    if ev_data:
+        ev_emoji = "✅" if ev_data['ev'] > 0 else "❌"
+        ev_line  = (f"\n💰 系统期望值:\n"
+                    f"  {ev_emoji} {ev_data['ev']:+.3f}% | "
+                    f"胜率{ev_data['win_rate']:.0%} | "
+                    f"盈{ev_data['avg_win']:.2f}% 亏{ev_data['avg_loss']:.2f}%")
+
     status = (
         f"📡 <b>AI监控状态报告</b>\n\n"
         f"📈 监控币种:\n" + "\n".join(coin_lines) + "\n\n"
@@ -1536,8 +1678,10 @@ def build_status_message(coins, memory, config,
         f"🤖 模型状态:\n  {model_info}\n\n"
         f"📊 胜率统计:\n"
         f"  6小时: {sixh_total}次 | {sixh_winrate:.0%}\n"
-        f"  24小时: {today_total}次 | {today_winrate:.0%}{winrate_tag}\n\n"
-        f"⚙️ 阈值: 买入{config['buy_threshold']} | 卖出{config['sell_threshold']}\n"
+        f"  24小时: {today_total}次 | {today_winrate:.0%}{winrate_tag}"
+        f"{ev_line}\n\n"
+        f"⚙️ 阈值: 买入{config['buy_threshold']} | 卖出{config['sell_threshold']}"
+        f"（{'动态' if ai_model.is_trained and len(_score_history)>=20 else '固定'}，基于{len(_score_history)}条历史评分）\n"
         f"⏳ 信号冷却时间: {cooldown_str}（{current_market_cycle}）\n"
         f"🕐 运行: {h}小时{m}分钟 | {current_market_cycle}"
     )
@@ -1611,7 +1755,7 @@ def update_lock_heartbeat():
 def main():
     global last_backtest_time, last_adaptive_time, last_cycle_check
     global last_status_push, last_daily_report, last_signal_time, last_scores
-    global current_market_cycle, start_time
+    global current_market_cycle, start_time, _score_history
 
     config     = load_config()
     start_time = time.time()
@@ -1685,7 +1829,7 @@ def main():
         memory = load_memory()
         buy_thr  = memory.get("buy_threshold", 65)
         sell_thr = memory.get("sell_threshold", 35)
-        if buy_thr > 75 or sell_thr < 25 or buy_thr - sell_thr < 5:
+        if buy_thr > 70 or sell_thr < 30 or buy_thr - sell_thr < 10:
             print(f"⚠️ 检测到异常阈值（买入={buy_thr} 卖出={sell_thr}），自动重置为65/35")
             memory["buy_threshold"]  = 65
             memory["sell_threshold"] = 35
@@ -1745,14 +1889,25 @@ def main():
                     coins.append(h)
 
             memory = load_memory()
-            # 未训练时固定使用宽松阈值55/45，不从memory读取
-            # 防止市场周期调整把阈值改回70/35导致信号触发不了
-            if ai_model.is_trained:
-                config["buy_threshold"]  = memory.get("buy_threshold",  config["buy_threshold"])
-                config["sell_threshold"] = memory.get("sell_threshold", config["sell_threshold"])
-            else:
+            # 未训练时固定使用宽松阈值55/45
+            if not ai_model.is_trained:
                 config["buy_threshold"]  = 55
                 config["sell_threshold"] = 45
+            else:
+                # ── 百分位数动态阈值（GPT方案一核心）──
+                # 用最近500条历史评分自动计算阈值
+                # 牛市自动升高，熊市自动降低，完全自适应
+                dyn_buy, dyn_sell = calc_dynamic_threshold(_score_history)
+                config["buy_threshold"]  = dyn_buy
+                config["sell_threshold"] = dyn_sell
+
+                # 同步保存到memory，供模型训练等模块使用
+                memory["buy_threshold"]  = dyn_buy
+                memory["sell_threshold"] = dyn_sell
+                save_memory(memory)
+
+                print(f"[动态阈值] 历史评分{len(_score_history)}条 → "
+                      f"买入={dyn_buy} 卖出={dyn_sell}")
 
             # DEBUG每10轮打印一次，避免日志刷屏
             _loop_count = getattr(main, '_loop_count', 0) + 1
@@ -1783,12 +1938,32 @@ def main():
                     current_round_scores[coin]  = score
                     current_round_factors[coin] = factors
 
+                    # 收集历史评分用于百分位数动态阈值计算
+                    _score_history.append(score)
+                    if len(_score_history) > _SCORE_HISTORY_MAX:
+                        _score_history.pop(0)
+
                     if score >= config["buy_threshold"]:
-                        base_signal = "买入"
+                        base_signal  = "买入"
+                        signal_grade = "strong"   # 强信号
                     elif score <= config["sell_threshold"]:
-                        base_signal = "卖出"
+                        base_signal  = "卖出"
+                        signal_grade = "strong"   # 强信号
+                    elif (ai_model.is_trained and
+                          score >= config["buy_threshold"] - 5 and
+                          score < config["buy_threshold"]):
+                        # 次级买入：评分接近阈值但未达到，加⚠️标注
+                        base_signal  = "买入"
+                        signal_grade = "weak"
+                    elif (ai_model.is_trained and
+                          score <= config["sell_threshold"] + 5 and
+                          score > config["sell_threshold"]):
+                        # 次级卖出：评分接近阈值但未达到，加⚠️标注
+                        base_signal  = "卖出"
+                        signal_grade = "weak"
                     else:
-                        base_signal = "中性"
+                        base_signal  = "中性"
+                        signal_grade = "none"
                         reset_signal_confirm(coin)
                         continue
 
@@ -1843,9 +2018,11 @@ def main():
                     msg = build_signal_message(
                         coin, base_signal, score, price,
                         factors, analysis, risk_level, risks,
-                        required_confirms, avg_score, config
+                        required_confirms, avg_score, config,
+                        signal_grade=signal_grade
                     )
-                    send_notification(msg, config, f"{coin} {base_signal}信号")
+                    subject = f"{coin} {base_signal}信号" if signal_grade == "strong"                               else f"⚠️ {coin} {base_signal}次级信号（谨慎参考）"
+                    send_notification(msg, config, subject)
                     reset_signal_confirm(coin)
 
                 except Exception as e:
