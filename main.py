@@ -550,9 +550,7 @@ class AITradingModel:
         features['atr_ratio']    = calculate_atr(df) / close[-1] if close[-1] != 0 else 0
         features['whale_value']  = whale / 10000
         features['market_cycle'] = 2 if market_cycle == "牛市" else (1 if market_cycle == "震荡" else 0)
-        # 用 hashlib 代替 hash()，保证跨进程/跨重启稳定（Python hash() 每次启动随机）
-        import hashlib
-        features['coin_id'] = int(hashlib.md5(coin_name.encode()).hexdigest()[:8], 16) % 100 / 100
+        # coin_id 已删除（md5哈希对模型无实际参考价值）
 
         try:
             df_h1 = get_kline(coin_name, interval="1h", limit=100)
@@ -584,10 +582,10 @@ class AITradingModel:
         if btc_features_cache['features']:
             features.update(btc_features_cache['features'])
 
-        dt = datetime.now()
-        features['hour']       = dt.hour
-        features['weekday']    = dt.weekday()
-        features['is_weekend'] = 1 if dt.weekday() >= 5 else 0
+        # 注意：已删除 hour/weekday/is_weekend/coin_id 四个无效特征
+        # 原因：加密货币24小时全年无休，时间特征意义不大
+        #       coin_id 用md5哈希，对模型没有实际参考价值
+        # 效果：特征从47个降到43个，减少过拟合风险
 
         sentiment = get_market_sentiment()
         if sentiment:
@@ -598,6 +596,10 @@ class AITradingModel:
             features['funding_rate'] = funding
 
         return features
+
+    # 需要从特征中过滤掉的无效特征
+    # 这里统一定义，方便后续维护
+    DROPPED_FEATURES = {'hour', 'weekday', 'is_weekend', 'coin_id'}
 
     def prepare_training_data(self, logs):
         X_list, y_list = [], []
@@ -614,6 +616,9 @@ class AITradingModel:
                 features = log['features']  # 兼容旧格式
             if not features:
                 continue
+            # 过滤掉无效特征（兼容旧数据，新数据已不包含这些特征）
+            features = {k: v for k, v in features.items()
+                       if k not in self.DROPPED_FEATURES}
             X_list.append(features)
             y_list.append(1 if log['result'] == 'correct' else 0)
         if len(X_list) < MIN_TRAIN_SAMPLES:
