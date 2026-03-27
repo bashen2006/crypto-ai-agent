@@ -1087,6 +1087,8 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
     atr       = calculate_atr(df)
     cur_price = df['close'].iloc[-1]
 
+    # 盈亏比优化：止盈ATR×4，止损ATR×1.5，盈亏比2.67:1
+    # 即使胜率只有40%，期望值仍为正（0.4×4 - 0.6×1.5 = 0.7 > 0）
     factors = {
         'rule_score':      rule_score,
         'ml_score':        ml_score,
@@ -1095,10 +1097,10 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
         'up_prob':         max(0, min(1, up_prob)),
         'analysis':        analysis,
         'atr':             atr,
-        'stop_loss_buy':   round(cur_price - atr * 2, 6),
-        'take_profit_buy': round(cur_price + atr * 3, 6),
-        'stop_loss_sell':  round(cur_price + atr * 2, 6),
-        'take_profit_sell':round(cur_price - atr * 3, 6),
+        'stop_loss_buy':   round(cur_price - atr * 1.5, 6),
+        'take_profit_buy': round(cur_price + atr * 4,   6),
+        'stop_loss_sell':  round(cur_price + atr * 1.5, 6),
+        'take_profit_sell':round(cur_price - atr * 4,   6),
     }
     return int(combined_score), factors, features
 
@@ -1328,7 +1330,7 @@ def adaptive_strategy_optimization(config):
         if cv_acc > 0.60:
             memory['buy_threshold']  = min(memory.get('buy_threshold', 65) + 2, 75)  # 上限75（原85）
             memory['sell_threshold'] = max(memory.get('sell_threshold', 35) - 2, 25)  # 下限25（原20）
-            memory['ml_weight']      = min(0.7, memory.get('ml_weight', 0.4) + 0.05)
+            memory['ml_weight']      = min(0.5, memory.get('ml_weight', 0.4) + 0.05)  # 上限0.5（原0.7）
         elif cv_acc < 0.50:
             memory['buy_threshold']  = max(memory.get('buy_threshold', 65) - 2, 55)
             memory['sell_threshold'] = min(memory.get('sell_threshold', 35) + 2, 45)
@@ -1887,8 +1889,14 @@ def main():
             save_memory(memory)
             config["buy_threshold"]  = 65
             config["sell_threshold"] = 35
+        # 检测ml_weight是否超出新上限0.5
+        ml_w = memory.get("ml_weight", 0.4)
+        if ml_w > 0.5:
+            print(f"⚠️ AI权重过高（{ml_w:.2f}），自动降至0.5（防过拟合放大错误）")
+            memory["ml_weight"] = 0.5
+            save_memory(memory)
         else:
-            print(f"✅ 模型已训练，阈值正常（买入={buy_thr} 卖出={sell_thr}），使用动态阈值")
+            print(f"✅ 模型已训练，阈值正常（买入={buy_thr} 卖出={sell_thr}），AI权重={ml_w:.2f}")
 
     # 启动通知（含Volume状态，方便排查）
     log_size    = os.path.getsize(LOG_PATH) if os.path.exists(LOG_PATH) else 0
