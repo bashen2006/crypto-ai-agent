@@ -112,14 +112,15 @@ ADAPTIVE_OPTIMIZATION_INTERVAL= 3600
 MARKET_CYCLE_INTERVAL         = 3600
 
 # 修改三：按市场周期动态冷却时间（秒）
-# 牛市行情快，缩短冷却避免错过机会
-# 熊市保守，延长冷却避免频繁抄底
-# 震荡使用默认30分钟
+# 升级为15m+1h+4h三周期系统后，信号质量提高，冷却时间同步放大
+# 牛市趋势明确，使用180分钟（趋势冷却）
+# 震荡行情，使用90分钟（震荡冷却）
+# 熊市保守，使用180分钟（避免频繁抄底）
 COOLDOWN_BY_CYCLE = {
-    "牛市": 900,    # 15分钟
-    "震荡": 1800,   # 30分钟
-    "熊市": 3600,   # 60分钟
-    "未知": 1800    # 默认30分钟
+    "牛市": 10800,  # 180分钟（趋势市）
+    "震荡": 5400,   # 90分钟（震荡市）
+    "熊市": 10800,  # 180分钟（熊市保守）
+    "未知": 5400    # 默认90分钟
 }
 
 # 数据限制
@@ -308,8 +309,8 @@ def get_ticker(inst):
         return float(data[0]['last'])
     return None
 
-@cache(ttl_seconds=30, max_size=64)
-def get_kline(inst, interval="5m", limit=300):
+@cache(ttl_seconds=60, max_size=64)
+def get_kline(inst, interval="15m", limit=200):
     symbol = format_gateio_symbol(inst)
     url    = f"{GATEIO_BASE_URL}/spot/candlesticks"
     data   = safe_request(url, params={"currency_pair": symbol,
@@ -399,9 +400,9 @@ def get_btc_dominance_trend():
     - market_avg:      大盘平均涨跌幅
     """
     try:
-        df_btc     = get_kline("BTC-USDT", interval="5m", limit=60)
-        btc_change = (df_btc['close'].iloc[-1] - df_btc['close'].iloc[-12]) \
-                     / df_btc['close'].iloc[-12]   # 近1小时涨跌幅（12根5分钟K线）
+        df_btc     = get_kline("BTC-USDT", interval="15m", limit=60)
+        btc_change = (df_btc['close'].iloc[-1] - df_btc['close'].iloc[-4]) \
+                     / df_btc['close'].iloc[-4]   # 近1小时涨跌幅（4根15分钟K线）
 
         # 大盘平均涨跌幅
         sentiment  = get_market_sentiment()
@@ -567,7 +568,7 @@ class AITradingModel:
         now = time.time()
         if now - btc_features_cache['timestamp'] > 60:
             try:
-                df_btc = get_kline("BTC-USDT", interval="5m", limit=100)
+                df_btc = get_kline("BTC-USDT", interval="15m", limit=100)
                 if df_btc is not None and len(df_btc) >= 60:
                     ma20b = df_btc['close'].rolling(20).mean().iloc[-1]
                     btc_features_cache['features'] = {
@@ -802,7 +803,7 @@ def load_config():
     default = {
         "coins": ["BTC-USDT", "ETH-USDT", "OKB-USDT"],
         "buy_threshold": 70, "sell_threshold": 35,
-        "check_interval": 300,
+        "check_interval": 900,
         "telegram_bot_token": "", "telegram_chat_id": "",
         "email_user": "", "email_pass": "", "email_receiver": "",
         "use_ml_model": True, "ml_weight": 0.4
@@ -894,15 +895,18 @@ def send_notification(content, config, subject=None):
 # =========================
 def detect_market_cycle():
     try:
-        df      = get_kline("BTC-USDT", interval="5m", limit=300)
-        ma200   = df["close"].rolling(200).mean().iloc[-1]
-        price   = df["close"].iloc[-1]
-        if pd.isna(ma200):
+        # 使用4h K线判断大方向（18根4h = 72小时趋势），与GPT建议一致
+        df_4h   = get_kline("BTC-USDT", interval="4h", limit=60)
+        df_1h   = get_kline("BTC-USDT", interval="1h", limit=100)
+        ma50_1h = df_1h["close"].rolling(50).mean().iloc[-1]
+        price   = df_4h["close"].iloc[-1]
+        if pd.isna(ma50_1h):
             return "未知"
-        momentum = (price - df["close"].iloc[-30]) / df["close"].iloc[-30]
-        if price > ma200 and momentum > 0.05:
+        # 4h K线看18根内动量（约72小时）
+        momentum = (price - df_4h["close"].iloc[-18]) / df_4h["close"].iloc[-18]
+        if price > ma50_1h and momentum > 0.05:
             return "牛市"
-        elif price < ma200:
+        elif price < ma50_1h:
             return "熊市"
         else:
             return "震荡"
@@ -952,7 +956,8 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
         rule_score = 50
         analysis   = {'trend': '未知', 'momentum': '未知', 'volume': '未知',
                       'volatility': '未知', 'position': 0.5,
-                      'position_desc': '中等', 'volume_ratio': 1.0}
+                      'position_desc': '中等', 'volume_ratio': 1.0,
+                      'trend_4h': '未知', 'trend_1h': '未知'}
     else:
         df["ma20"] = df["close"].rolling(20).mean()
         df["ma60"] = df["close"].rolling(60).mean()
@@ -973,11 +978,48 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
 
         rule_score = 50
 
-        # 趋势：双向评分（多头加分，空头减分）
-        if ma20 > ma60:
-            rule_score += 20 * trend_w
+        # ======= 三周期共振过滤（核心改动）=======
+        # 获取4h大方向和1h主趋势
+        trend_4h = "未知"
+        trend_1h = "未知"
+        try:
+            df_4h  = get_kline(coin, interval="4h", limit=50)
+            ma20_4h = df_4h['close'].rolling(20).mean().iloc[-1]
+            ma5_4h  = df_4h['close'].rolling(5).mean().iloc[-1]
+            trend_4h = "↑" if ma5_4h > ma20_4h else "↓"
+        except Exception:
+            pass
+        try:
+            df_1h  = get_kline(coin, interval="1h", limit=50)
+            ma20_1h = df_1h['close'].rolling(20).mean().iloc[-1]
+            ma5_1h  = df_1h['close'].rolling(5).mean().iloc[-1]
+            trend_1h = "↑" if ma5_1h > ma20_1h else "↓"
+        except Exception:
+            pass
+
+        # 三周期共振加权：
+        # 4h定方向（权重最高），1h确认趋势，15m入场（当前df）
+        # 三周期同向 → 强信号加分；逆向 → 减分
+        trend_15m = "↑" if ma20 > ma60 else "↓"
+        if trend_4h != "未知" and trend_1h != "未知":
+            if trend_4h == "↑" and trend_1h == "↑" and trend_15m == "↑":
+                rule_score += 25 * trend_w   # 三周期全做多：最强信号
+            elif trend_4h == "↓" and trend_1h == "↓" and trend_15m == "↓":
+                rule_score -= 25 * trend_w   # 三周期全做空：最强空信号
+            elif trend_4h == "↑" and trend_1h == "↑":
+                rule_score += 15 * trend_w   # 4h+1h做多，15m未确认：普通信号
+            elif trend_4h == "↓" and trend_1h == "↓":
+                rule_score -= 15 * trend_w   # 4h+1h做空
+            elif trend_4h == "↑":
+                rule_score += 8 * trend_w    # 只有4h看多
+            elif trend_4h == "↓":
+                rule_score -= 8 * trend_w    # 只有4h看空
         else:
-            rule_score -= 20 * trend_w
+            # 降级到原来的单周期判断（兜底）
+            if ma20 > ma60:
+                rule_score += 20 * trend_w
+            else:
+                rule_score -= 20 * trend_w
 
         # 动量：双向评分（强势加分，弱势减分）
         if momentum > 0.02:
@@ -1008,6 +1050,9 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
 
         analysis = {
             'trend':         "多头" if ma20 > ma60 else "空头",
+            'trend_4h':      trend_4h,
+            'trend_1h':      trend_1h,
+            'trend_15m':     trend_15m,
             'momentum':      "强" if momentum > 0.03 else ("中等" if momentum > 0.01 else "弱"),
             'volume':        "放量" if vol_ratio > 2 else ("温和放量" if vol_ratio > 1.5 else
                              ("缩量" if vol_ratio < 0.5 else "正常")),
@@ -1108,8 +1153,8 @@ def verify_past_signals(config):
     # 相比原来25分钟+最高价的方式，熊市横盘下能产生均衡的correct/wrong分布
 
     BARRIER_PCT   = 0.003   # 止盈止损均为0.3%
-    WINDOW_BARS   = 24      # 验证窗口：24根5分钟K线 = 2小时
-    MIN_AGE_MIN   = 25      # 信号至少25分钟后才验证
+    WINDOW_BARS   = 8       # 验证窗口：8根15分钟K线 = 2小时
+    MIN_AGE_MIN   = 30      # 信号至少30分钟后才验证（15m系统等一根K线关闭）
     SAVE_EVERY    = 10      # 每验证10条写一次，防OOM Kill丢失
 
     log           = load_log()
@@ -1128,7 +1173,7 @@ def verify_past_signals(config):
             continue
 
         try:
-            df = get_kline(coin, interval="5m", limit=300)
+            df = get_kline(coin, interval="15m", limit=100)
             df['ts_sec'] = df['ts'] / 1000
             future_df    = df[df['ts_sec'] > signal_time].sort_values('ts_sec')
 
@@ -1562,6 +1607,7 @@ def build_signal_message(coin, base_signal, score, display_price,
         f"🎯 上涨概率：{up_prob:.1f}%\n"
         f"🔁 连续确认：{confirm_count}次 (均分{avg_score:.0f})\n\n"
         f"📈 趋势：{analysis['trend']} | 动量：{analysis['momentum']}\n"
+        f"🔍 三周期: 4h{analysis.get('trend_4h','?')} | 1h{analysis.get('trend_1h','?')} | 15m{analysis.get('trend_15m','?')}\n"
         f"📦 成交量：{analysis['volume']} | 波动：{analysis['volatility']}\n"
         f"📍 位置：{analysis['position_desc']}\n\n"
         f"🛡️ 止损价：${sl:.6g} (-{sl_pct:.1f}%)\n"
@@ -1647,7 +1693,7 @@ def build_status_message(coins, memory, config,
                 analysis= factors['analysis']
                 price   = get_ticker(coin) or 0
             else:
-                df      = get_kline(coin, interval="5m", limit=300)
+                df      = get_kline(coin, interval="15m", limit=200)
                 score, factors, _ = calculate_score(df, memory, detect_whale(coin),
                                                     current_market_cycle, coin, config)
                 analysis= factors['analysis']
@@ -1923,7 +1969,7 @@ def main():
             # 未训练时缩短冷却时间到15分钟，加速积累训练数据
             # 已训练后恢复按市场周期的动态冷却时间
             if not ai_model.is_trained:
-                signal_cooldown = 900   # 15分钟，加速数据积累
+                signal_cooldown = 1800   # 30分钟，加速数据积累（15m系统节奏）
             else:
                 signal_cooldown = COOLDOWN_BY_CYCLE.get(current_market_cycle, 1800)
 
@@ -1934,7 +1980,7 @@ def main():
             # ======= 核心信号循环 =======
             for coin in coins:
                 try:
-                    df    = get_kline(coin, interval="5m", limit=300)
+                    df    = get_kline(coin, interval="15m", limit=200)
                     whale = detect_whale(coin)
                     score, factors, features = calculate_score(
                         df, memory, whale, current_market_cycle, coin, config)
@@ -2100,8 +2146,8 @@ def main():
         # 每轮循环更新心跳，证明进程仍存活
         update_lock_heartbeat()
 
-        # 安全sleep：最小60秒，防止check_interval异常值导致疯狂循环
-        sleep_time = max(60, int(config.get("check_interval", 300)))
+        # 安全sleep：最小300秒（15m系统每15分钟扫一次足够），防止check_interval异常值导致疯狂循环
+        sleep_time = max(300, int(config.get("check_interval", 900)))
         time.sleep(sleep_time)
 
 
