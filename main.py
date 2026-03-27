@@ -1087,8 +1087,6 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
     atr       = calculate_atr(df)
     cur_price = df['close'].iloc[-1]
 
-    # 盈亏比优化：止盈ATR×4，止损ATR×1.5，盈亏比2.67:1
-    # 即使胜率只有40%，期望值仍为正（0.4×4 - 0.6×1.5 = 0.7 > 0）
     factors = {
         'rule_score':      rule_score,
         'ml_score':        ml_score,
@@ -1097,10 +1095,10 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
         'up_prob':         max(0, min(1, up_prob)),
         'analysis':        analysis,
         'atr':             atr,
-        'stop_loss_buy':   round(cur_price - atr * 1.5, 6),
-        'take_profit_buy': round(cur_price + atr * 4,   6),
-        'stop_loss_sell':  round(cur_price + atr * 1.5, 6),
-        'take_profit_sell':round(cur_price - atr * 4,   6),
+        'stop_loss_buy':   round(cur_price - atr * 2, 6),
+        'take_profit_buy': round(cur_price + atr * 3, 6),
+        'stop_loss_sell':  round(cur_price + atr * 2, 6),
+        'take_profit_sell':round(cur_price - atr * 3, 6),
     }
     return int(combined_score), factors, features
 
@@ -1330,7 +1328,7 @@ def adaptive_strategy_optimization(config):
         if cv_acc > 0.60:
             memory['buy_threshold']  = min(memory.get('buy_threshold', 65) + 2, 75)  # 上限75（原85）
             memory['sell_threshold'] = max(memory.get('sell_threshold', 35) - 2, 25)  # 下限25（原20）
-            memory['ml_weight']      = min(0.5, memory.get('ml_weight', 0.4) + 0.05)  # 上限0.5（原0.7）
+            memory['ml_weight']      = min(0.7, memory.get('ml_weight', 0.4) + 0.05)
         elif cv_acc < 0.50:
             memory['buy_threshold']  = max(memory.get('buy_threshold', 65) - 2, 55)
             memory['sell_threshold'] = min(memory.get('sell_threshold', 35) + 2, 45)
@@ -1463,6 +1461,30 @@ def generate_backtest_report():
     buy_wr  = buy_correct  / len(buy_list)  if buy_list  else 0
     sell_wr = sell_correct / len(sell_list) if sell_list else 0
 
+    # 按币种统计（≥5条才显示，按胜率排序）
+    coins_stats = {}
+    for e in verified:
+        c = e.get("coin", "未知")
+        if c not in coins_stats:
+            coins_stats[c] = {"correct": 0, "total": 0, "profits": []}
+        coins_stats[c]["total"] += 1
+        if e.get("result") == "correct":
+            coins_stats[c]["correct"] += 1
+        if e.get("profit") is not None:
+            coins_stats[c]["profits"].append(e["profit"])
+
+    coin_lines = []
+    for cn, stat in sorted(coins_stats.items(),
+                           key=lambda x: x[1]["correct"]/x[1]["total"] if x[1]["total"] > 0 else 0,
+                           reverse=True):
+        if stat["total"] < 5:
+            continue
+        wr    = stat["correct"] / stat["total"]
+        avg_p = np.mean(stat["profits"]) if stat["profits"] else 0
+        emoji = "✅" if wr >= 0.55 else ("⚠️" if wr >= 0.45 else "❌")
+        coin_lines.append(f"  {emoji} {cn}: {stat['total']}次 | 胜率{wr:.0%} | 均盈亏{avg_p:+.3f}%")
+    coin_report = "\n".join(coin_lines) if coin_lines else "  （各币种数据不足5条）"
+
     return (f"📊 每日回测报告\n"
             f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
             f"📈 总体统计:\n"
@@ -1473,6 +1495,7 @@ def generate_backtest_report():
             f"🔍 分类胜率:\n"
             f"  买入信号: {len(buy_list)}次 | 胜率{buy_wr:.0%}\n"
             f"  卖出信号: {len(sell_list)}次 | 胜率{sell_wr:.0%}\n\n"
+            f"🪙 按币种胜率（≥5条数据）:\n{coin_report}\n\n"
             f"💰 系统期望值:\n{ev_msg}")
 
 def get_recent_signals(n=3):
@@ -1502,26 +1525,26 @@ def get_signal_stats_since(hours):
 # 修改一：优化后的买入过滤
 # 区分主流币（BTC联动强）和山寨币（可能独立行情）
 # =========================
-def check_buy_filters(coin, df, memory):
+def check_buy_filters(coin, df, memory, analysis=None):
     base             = coin.split("-")[0].upper()
     is_major         = base in MAJOR_COINS
     btc_info         = get_btc_dominance_trend()
-    # 未训练时放宽过滤，目标是积累训练数据
     is_accumulating  = not ai_model.is_trained
 
+    # ── 趋势过滤（核心）──
+    # 4小时趋势向下时禁止买入，避免逆势操作
+    if analysis and analysis.get('trend_4h') == "↓":
+        return False, f"4小时趋势向下，禁止买入（逆势风险高）"
+
     if is_major:
-        # 主流币：BTC整体下跌趋势时过滤（无论是否训练都执行）
         if btc_info['btc_falling']:
             return False, f"BTC均线死叉下跌，主流币{coin}过滤"
     else:
-        # 山寨币：BTC走独立行情时才过滤
         if btc_info['btc_independent']:
             return False, (f"BTC独立拉升中"
                            f"(BTC+{btc_info['btc_change']*100:.1f}% vs 大盘"
                            f"{btc_info['market_avg']*100:.1f}%)，资金虹吸，山寨暂缓")
 
-    # 已训练后才做成交量和波动率过滤
-    # 未训练阶段只做方向性过滤，不做量价过滤，降低门槛积累数据
     if not is_accumulating:
         volume  = df['volume'].iloc[-1]
         avg_vol = df['volume'].mean()
@@ -1534,6 +1557,13 @@ def check_buy_filters(coin, df, memory):
             if vol < VOLATILITY_MIN:
                 return False, f"波动率过低({vol:.4f})"
 
+    return True, "通过"
+
+
+def check_sell_filters(coin, analysis=None):
+    """卖出信号过滤：4小时趋势向上时禁止卖出，避免逆势做空"""
+    if analysis and analysis.get('trend_4h') == "↑":
+        return False, f"4小时趋势向上，禁止卖出（逆势风险高）"
     return True, "通过"
 
 def generate_risk_analysis(analysis, factors, config):
@@ -1576,12 +1606,26 @@ def build_signal_message(coin, base_signal, score, display_price,
         sl_pct = abs(sl - display_price) / display_price * 100
         tp_pct = abs(display_price - tp) / display_price * 100
 
+    # 期望值联动仓位建议
+    ev_data  = calculate_expected_value()
+    ev_value = ev_data['ev'] if ev_data else 0
+
     if risk_level == "高":
         position_suggest = "轻仓(≤10%)"
     elif risk_level == "中":
-        position_suggest = "半仓(≤30%)"
+        if ev_value < 0:
+            position_suggest = "极轻仓(≤5%) ⚠️期望值为负"
+        elif ev_value < 0.01:
+            position_suggest = "轻仓(≤15%) 期望值偏低"
+        else:
+            position_suggest = "半仓(≤30%)"
     else:
-        position_suggest = "正常仓(≤50%)"
+        if ev_value < 0:
+            position_suggest = "轻仓(≤10%) ⚠️期望值为负"
+        elif ev_value < 0.01:
+            position_suggest = "半仓(≤30%) 期望值偏低"
+        else:
+            position_suggest = "正常仓(≤50%)"
 
     cv_acc = ai_model.cv_accuracy if ai_model.is_trained else 0
     model_reliability = "⚠️ 模型未训练，仅供参考" if not ai_model.is_trained else \
@@ -1889,14 +1933,8 @@ def main():
             save_memory(memory)
             config["buy_threshold"]  = 65
             config["sell_threshold"] = 35
-        # 检测ml_weight是否超出新上限0.5
-        ml_w = memory.get("ml_weight", 0.4)
-        if ml_w > 0.5:
-            print(f"⚠️ AI权重过高（{ml_w:.2f}），自动降至0.5（防过拟合放大错误）")
-            memory["ml_weight"] = 0.5
-            save_memory(memory)
         else:
-            print(f"✅ 模型已训练，阈值正常（买入={buy_thr} 卖出={sell_thr}），AI权重={ml_w:.2f}")
+            print(f"✅ 模型已训练，阈值正常（买入={buy_thr} 卖出={sell_thr}），使用动态阈值")
 
     # 启动通知（含Volume状态，方便排查）
     log_size    = os.path.getsize(LOG_PATH) if os.path.exists(LOG_PATH) else 0
@@ -2053,11 +2091,16 @@ def main():
                     else:
                         print(f"📝 热门币种 {coin} 信号不计入训练数据")
 
-                    # 修改一：使用新的买入过滤逻辑
+                    # 趋势过滤+原有过滤逻辑
                     if base_signal == "买入":
-                        ok, reason = check_buy_filters(coin, df, memory)
+                        ok, reason = check_buy_filters(coin, df, memory, analysis)
                         if not ok:
                             print(f"{coin} 买入信号已过滤: {reason}")
+                            continue
+                    elif base_signal == "卖出":
+                        ok, reason = check_sell_filters(coin, analysis)
+                        if not ok:
+                            print(f"{coin} 卖出信号已过滤: {reason}")
                             continue
 
                     risk_level, risks = generate_risk_analysis(analysis, factors, config)
