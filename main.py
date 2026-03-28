@@ -92,6 +92,7 @@ SIGNAL_CONFIRM_FILE= "signal_confirm.json"
 TIMING_FILE        = "timing_state.json"
 SIGNAL_TIME_FILE   = "signal_time.json"   # 信号冷却时间持久化
 FEATURES_LOG_FILE  = "features_log.json"  # 特征数据独立存储（防止主日志过大导致OOM）
+PORTFOLIO_FILE     = "portfolio.json"     # 仓位追踪（模拟持仓/盈利统计）
 
 MEMORY_PATH        = os.path.join(DATA_DIR, MEMORY_FILE)
 LOG_PATH           = os.path.join(DATA_DIR, LOG_FILE)
@@ -102,6 +103,7 @@ SIGNAL_CONFIRM_PATH= os.path.join(DATA_DIR, SIGNAL_CONFIRM_FILE)
 TIMING_PATH        = os.path.join(DATA_DIR, TIMING_FILE)
 SIGNAL_TIME_PATH   = os.path.join(DATA_DIR, SIGNAL_TIME_FILE)
 FEATURES_LOG_PATH  = os.path.join(DATA_DIR, FEATURES_LOG_FILE)
+PORTFOLIO_PATH     = os.path.join(DATA_DIR, PORTFOLIO_FILE)
 
 # 时间间隔
 STATUS_PUSH_INTERVAL          = 300    # 5分钟检查一次（有变化才发）
@@ -131,6 +133,7 @@ SCORE_CHANGE_THRESHOLD= 10
 
 # Gate.io
 GATEIO_BASE_URL = "https://api.gateio.ws/api/v4"
+FEE_RATE        = 0.001   # Gate.io 手续费 0.1%（买入和卖出各扣一次）
 
 # 过滤阈值
 VOLUME_RATIO_MIN  = 2.0
@@ -192,6 +195,246 @@ start_time          = time.time()
 # 每轮循环把所有监控币种的评分存入，最多保留500条
 _score_history      = []   # 格式：[score, score, ...]
 _SCORE_HISTORY_MAX  = 500  # 最多保留500条
+
+# =========================
+# 仓位追踪系统（Portfolio）
+# 根据AI发出的信号模拟追踪持仓和盈利
+# 注意：这是辅助参考，实际交易以您的判断为准
+# =========================
+def _default_portfolio():
+    """初始化默认仓位结构"""
+    return {
+        "initial_balance": 10000.0,  # 初始模拟资金
+        "balance":         10000.0,  # 当前可用资金
+        "total_profit":    0.0,      # 累计盈利
+        "positions": {}              # 各币种持仓
+    }
+
+def _default_position():
+    """初始化单币种默认持仓"""
+    return {
+        "holding":        False,   # 是否持仓
+        "entry_price":    0.0,     # 建仓价格（含手续费）
+        "position_size":  0.0,     # 仓位金额
+        "highest_price":  0.0,     # 持仓期间最高价（用于回撤判断）
+        "entry_time":     0,       # 建仓时间戳
+        "profit":         0.0,     # 本币种累计盈利
+        "trade_count":    0        # 本币种交易次数
+    }
+
+def load_portfolio():
+    """从文件加载仓位数据"""
+    try:
+        with open(PORTFOLIO_PATH, encoding='utf-8') as f:
+            data = json.load(f)
+        # 补全缺失字段（兼容旧数据）
+        for k, v in _default_portfolio().items():
+            if k not in data:
+                data[k] = v
+        return data
+    except Exception:
+        return _default_portfolio()
+
+def save_portfolio(portfolio):
+    """原子保存仓位数据"""
+    tmp = PORTFOLIO_PATH + ".tmp"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(portfolio, f, indent=2, ensure_ascii=False)
+        shutil.move(tmp, PORTFOLIO_PATH)
+    except Exception as e:
+        print(f"⚠️ 仓位数据保存失败: {e}")
+
+def update_highest_price(portfolio):
+    """
+    每轮循环更新各持仓币种的最高价
+    用于牛市回撤止盈判断
+    """
+    updated = False
+    for coin_key, pos in portfolio.get("positions", {}).items():
+        if not pos.get("holding"):
+            continue
+        try:
+            price = get_ticker(coin_key)
+            if price and price > pos.get("highest_price", 0):
+                pos["highest_price"] = price
+                updated = True
+        except Exception:
+            pass
+    if updated:
+        save_portfolio(portfolio)
+
+def get_buy_reason(base_signal, analysis, factors, market_cycle):
+    """
+    根据市场状态和技术分析，给买入信号标注具体原因
+    返回：(类型标签, 详细说明)
+    """
+    if base_signal != "买入":
+        return None, None
+
+    trend_4h  = analysis.get('trend_4h', '未知')
+    trend_1h  = analysis.get('trend_1h', '未知')
+    rsi       = factors.get('rule_score', 50)  # 用rule_score近似RSI强弱
+    position  = analysis.get('position', 0.5)  # 价格位置（0=低位，1=高位）
+    momentum  = analysis.get('momentum', '弱')
+
+    if market_cycle == "牛市":
+        if trend_4h == "↑" and trend_1h == "↑":
+            if position >= 0.8:
+                return "🚀 追涨", "三周期共振向上，突破高位（风险较高，注意仓位）"
+            elif momentum in ("弱", "中等") and position <= 0.5:
+                return "📉 回调买入", "牛市趋势中的回调机会，性价比较高"
+            else:
+                return "📈 趋势跟随", "牛市多头趋势，顺势而为"
+
+    elif market_cycle == "熊市":
+        if position <= 0.3:
+            return "⚡ 超跌反弹", "熊市超跌区域，短线反弹机会（轻仓，快进快出）"
+        else:
+            return "⚠️ 熊市做多", "熊市中的做多信号，风险较高，谨慎参考"
+
+    elif market_cycle == "震荡":
+        if position <= 0.35:
+            return "🔄 区间低吸", "震荡区间底部买入，等待反弹至上沿"
+        else:
+            return "📊 震荡做多", "震荡市中的做多机会，控制仓位"
+
+    return "📌 信号买入", "综合指标触发买入"
+
+def get_sell_reason(base_signal, analysis, factors, market_cycle, pos):
+    """
+    根据市场状态和持仓数据，给卖出信号标注具体原因
+    返回：(类型标签, 详细说明)
+    """
+    if base_signal != "卖出":
+        return None, None
+
+    trend_1h     = analysis.get('trend_1h', '未知')
+    position     = analysis.get('position', 0.5)
+    current_price= factors.get('atr', 0)  # 用于辅助判断
+
+    # 如果有持仓，判断是止盈还是止损
+    if pos and pos.get("holding"):
+        entry    = pos.get("entry_price", 0)
+        highest  = pos.get("highest_price", 0)
+
+        if entry > 0:
+            price = get_ticker(None) or entry  # 用持仓数据估算
+            # 从最高价回撤超过2% → 回撤止盈
+            if highest > 0 and price < highest * 0.98:
+                return "📉 回撤止盈", f"从最高点回撤，锁定利润（最高:{highest:.4f}）"
+
+    if market_cycle == "牛市":
+        if trend_1h == "↓":
+            return "⚠️ 趋势反转", "1小时趋势转弱，短期风险上升"
+        return "💰 牛市止盈", "牛市中的止盈机会"
+
+    elif market_cycle == "熊市":
+        if position >= 0.7:
+            return "💰 反弹止盈", "熊市反弹至高位，及时止盈"
+        return "❌ 止损离场", "熊市下行风险，保护资金"
+
+    elif market_cycle == "震荡":
+        if position >= 0.65:
+            return "💰 区间止盈", "震荡区间上沿，逢高卖出"
+        return "❌ 破位止损", "跌破区间支撑，止损离场"
+
+    return "📌 信号卖出", "综合指标触发卖出"
+
+def track_portfolio_signal(coin, base_signal, price, position_suggest, portfolio):
+    """
+    根据发出的信号更新模拟仓位
+    买入信号 → 记录建仓（如果该币未持仓）
+    卖出信号 → 记录平仓并计算盈亏（如果该币已持仓）
+    """
+    if coin not in portfolio["positions"]:
+        portfolio["positions"][coin] = _default_position()
+
+    pos = portfolio["positions"][coin]
+
+    if base_signal == "买入" and not pos["holding"]:
+        # 根据仓位建议确定投入比例
+        if "≤5%" in position_suggest:
+            ratio = 0.05
+        elif "≤10%" in position_suggest:
+            ratio = 0.10
+        elif "≤15%" in position_suggest:
+            ratio = 0.15
+        elif "≤30%" in position_suggest:
+            ratio = 0.30
+        else:
+            ratio = 0.20  # 默认20%
+
+        size        = portfolio["balance"] * ratio
+        entry_price = price * (1 + FEE_RATE)  # 含手续费
+
+        pos.update({
+            "holding":       True,
+            "entry_price":   round(entry_price, 8),
+            "position_size": round(size, 2),
+            "highest_price": price,
+            "entry_time":    time.time(),
+        })
+        pos["trade_count"] = pos.get("trade_count", 0) + 1
+        print(f"💼 仓位追踪 - {coin} 买入: 价格{price:.6g} 仓位{size:.2f}({ratio:.0%})")
+
+    elif base_signal == "卖出" and pos["holding"]:
+        exit_price   = price * (1 - FEE_RATE)  # 含手续费
+        entry        = pos["entry_price"]
+        size         = pos["position_size"]
+        profit_pct   = (exit_price - entry) / entry if entry > 0 else 0
+        profit_amount= size * profit_pct
+
+        portfolio["balance"]      = round(portfolio["balance"] + profit_amount, 2)
+        portfolio["total_profit"] = round(portfolio.get("total_profit", 0) + profit_amount, 2)
+        pos["profit"]             = round(pos.get("profit", 0) + profit_amount, 2)
+
+        result_emoji = "✅" if profit_amount >= 0 else "❌"
+        print(f"💼 仓位追踪 - {coin} 卖出: {result_emoji} {profit_pct*100:.2f}% "
+              f"盈亏{profit_amount:+.2f}")
+
+        pos.update({
+            "holding":       False,
+            "entry_price":   0.0,
+            "position_size": 0.0,
+            "highest_price": 0.0,
+            "entry_time":    0,
+        })
+
+    save_portfolio(portfolio)
+    return portfolio
+
+def format_portfolio_status(portfolio):
+    """格式化仓位状态用于状态报告"""
+    lines = []
+    total_unrealized = 0.0
+
+    for coin_key, pos in portfolio.get("positions", {}).items():
+        if pos.get("holding"):
+            # 尝试获取当前价格计算浮动盈亏
+            try:
+                cur = get_ticker(coin_key) or pos["entry_price"]
+                unrealized_pct  = (cur * (1 - FEE_RATE) - pos["entry_price"]) / pos["entry_price"]
+                unrealized_amt  = pos["position_size"] * unrealized_pct
+                total_unrealized += unrealized_amt
+                pnl_str = f"{unrealized_pct*100:+.2f}% ({unrealized_amt:+.2f})"
+                lines.append(f"  🟢 {coin_key}: 持仓中 | 浮盈 {pnl_str}")
+            except Exception:
+                lines.append(f"  🟢 {coin_key}: 持仓中")
+        elif pos.get("trade_count", 0) > 0:
+            lines.append(f"  ⚪ {coin_key}: 空仓 | 累计盈亏 {pos.get('profit', 0):+.2f}")
+
+    if not lines:
+        return "  暂无持仓记录"
+
+    total_profit = portfolio.get("total_profit", 0)
+    balance      = portfolio.get("balance", 10000)
+    init_balance = portfolio.get("initial_balance", 10000)
+    total_return = (balance - init_balance + total_unrealized) / init_balance * 100
+
+    lines.append(f"  💰 模拟总资金: {balance:.2f} | 浮动盈亏: {total_unrealized:+.2f}")
+    lines.append(f"  📈 累计收益率: {total_return:+.2f}%")
+    return "\n".join(lines)
 
 # =========================
 # 百分位数动态阈值
@@ -1645,9 +1888,20 @@ def build_signal_message(coin, base_signal, score, display_price,
         signal_emoji = "🟡"
         grade_note   = "⚠️ 次级信号（评分接近阈值，谨慎参考）\n\n"
 
+    # 买卖原因标注
+    portfolio  = load_portfolio()
+    coin_pos   = portfolio.get("positions", {}).get(coin, _default_position())
+    reason_type, reason_detail = (
+        get_buy_reason(base_signal, analysis, factors, current_market_cycle)
+        if base_signal == "买入"
+        else get_sell_reason(base_signal, analysis, factors, current_market_cycle, coin_pos)
+    )
+    reason_note = f"💡 {reason_type}: {reason_detail}\n\n" if reason_type else ""
+
     msg = (
         f"{signal_emoji} <b>{coin} {base_signal}信号</b>\n\n"
         f"{grade_note}"
+        f"{reason_note}"
         f"💰 价格：${display_price:.6g}\n"
         f"📊 综合评分：{score} (规则:{factors['rule_score']} AI:{factors['ml_score']:.0f})\n"
         f"🎯 上涨概率：{up_prob:.1f}%\n"
@@ -1665,7 +1919,7 @@ def build_signal_message(coin, base_signal, score, display_price,
         f"🌍 当前周期：{current_market_cycle}（下次信号冷却：{cooldown_str}）\n"
         f"⏰ {datetime.now().strftime('%m-%d %H:%M')}"
     )
-    return msg
+    return msg, position_suggest
 
 # =========================
 # 状态推送
@@ -1766,6 +2020,10 @@ def build_status_message(coins, memory, config,
                     f"胜率{ev_data['win_rate']:.0%} | "
                     f"盈{ev_data['avg_win']:.2f}% 亏{ev_data['avg_loss']:.2f}%")
 
+    # 仓位状态
+    portfolio     = load_portfolio()
+    portfolio_str = format_portfolio_status(portfolio)
+
     status = (
         f"📡 <b>AI监控状态报告</b>\n\n"
         f"📈 监控币种:\n" + "\n".join(coin_lines) + "\n\n"
@@ -1777,6 +2035,7 @@ def build_status_message(coins, memory, config,
         f"  6小时: {sixh_total}次 | {sixh_winrate:.0%}\n"
         f"  24小时: {today_total}次 | {today_winrate:.0%}{winrate_tag}"
         f"{ev_line}\n\n"
+        f"💼 模拟仓位:\n{portfolio_str}\n\n"
         f"⚙️ 阈值: 买入{config['buy_threshold']} | 卖出{config['sell_threshold']}"
         f"（{'动态' if ai_model.is_trained and len(_score_history)>=20 else '固定'}，基于{len(_score_history)}条历史评分）\n"
         f"⏳ 信号冷却时间: {cooldown_str}（{current_market_cycle}）\n"
@@ -1978,6 +2237,10 @@ def main():
 
             verify_past_signals(config)
 
+            # 更新各持仓币种的最高价（用于牛市回撤止盈判断）
+            portfolio = load_portfolio()
+            update_highest_price(portfolio)
+
             # 动态扩展监控币种
             hot_coins = [c for c, _ in scan_hot_coins()[:MAX_DYNAMIC_COINS]]
             coins     = config["coins"].copy()
@@ -2117,7 +2380,7 @@ def main():
                     print(f"{coin} {display_signal} {score:.1f}分 "
                           f"({factors['up_prob']*100:.1f}%) {current_market_cycle} 价格:{price}")
 
-                    msg = build_signal_message(
+                    msg, position_suggest = build_signal_message(
                         coin, base_signal, score, price,
                         factors, analysis, risk_level, risks,
                         required_confirms, avg_score, config,
@@ -2126,6 +2389,12 @@ def main():
                     subject = f"{coin} {base_signal}信号" if signal_grade == "strong"                               else f"⚠️ {coin} {base_signal}次级信号（谨慎参考）"
                     send_notification(msg, config, subject)
                     reset_signal_confirm(coin)
+
+                    # 仓位追踪：根据发出的信号模拟更新持仓
+                    portfolio = load_portfolio()
+                    portfolio = track_portfolio_signal(
+                        coin, base_signal, price, position_suggest, portfolio
+                    )
 
                 except Exception as e:
                     print(f"处理{coin}时出错: {e}")
