@@ -214,23 +214,33 @@ def _default_position():
     """初始化单币种默认持仓"""
     return {
         "holding":        False,   # 是否持仓
-        "entry_price":    0.0,     # 建仓价格（含手续费）
+        "entry_price":    0.0,     # 买入价格（含手续费）
         "position_size":  0.0,     # 仓位金额
         "highest_price":  0.0,     # 持仓期间最高价（用于回撤判断）
-        "entry_time":     0,       # 建仓时间戳
+        "entry_time":     0,       # 买入时间戳
+        "stop_loss":      0.0,     # 止损价（硬规则）
+        "take_profit":    0.0,     # 止盈价（硬规则）
+        "sl_triggered":   False,   # 止损是否已执行
+        "tp_triggered":   False,   # 止盈是否已执行
         "profit":         0.0,     # 本币种累计盈利
         "trade_count":    0        # 本币种交易次数
     }
 
 def load_portfolio():
-    """从文件加载仓位数据"""
+    """从文件加载仓位数据，自动补全旧数据缺失字段"""
     try:
         with open(PORTFOLIO_PATH, encoding='utf-8') as f:
             data = json.load(f)
-        # 补全缺失字段（兼容旧数据）
+        # 补全portfolio顶层字段
         for k, v in _default_portfolio().items():
             if k not in data:
                 data[k] = v
+        # 补全每个持仓的缺失字段（兼容旧版本数据）
+        default_pos = _default_position()
+        for coin_key, pos in data.get("positions", {}).items():
+            for k, v in default_pos.items():
+                if k not in pos:
+                    pos[k] = v
         return data
     except Exception:
         return _default_portfolio()
@@ -319,10 +329,10 @@ def get_sell_reason(base_signal, analysis, factors, market_cycle, pos):
         highest  = pos.get("highest_price", 0)
 
         if entry > 0:
-            price = get_ticker(None) or entry  # 用持仓数据估算
-            # 从最高价回撤超过2% → 回撤止盈
-            if highest > 0 and price < highest * 0.98:
-                return "📉 回撤止盈", f"从最高点回撤，锁定利润（最高:{highest:.4f}）"
+            # 注意：coin_key在这里不可用，用highest和entry估算
+            # 实际回撤判断在持仓监控循环里做，这里只做方向性判断
+            if highest > 0 and highest > entry * 1.01:
+                return "📉 回撤止盈", f"从高点回撤，锁定利润（最高:{highest:.4f}）"
 
     if market_cycle == "牛市":
         if trend_1h == "↓":
@@ -341,12 +351,19 @@ def get_sell_reason(base_signal, analysis, factors, market_cycle, pos):
 
     return "📌 信号卖出", "综合指标触发卖出"
 
-def track_portfolio_signal(coin, base_signal, price, position_suggest, portfolio):
+def track_portfolio_signal(coin, base_signal, price, position_suggest, portfolio,
+                            sl_price=0, tp_price=0, portfolio_coins=None):
     """
     根据发出的信号更新模拟仓位
-    买入信号 → 记录建仓（如果该币未持仓）
-    卖出信号 → 记录平仓并计算盈亏（如果该币已持仓）
+    只追踪portfolio_coins里的主流币种
+    买入信号 → 记录买入（如果该币未持仓）
+    卖出信号 → 记录卖出并计算盈亏（如果该币已持仓）
     """
+    # 只追踪指定的主流币种
+    if portfolio_coins and coin not in portfolio_coins:
+        print(f"[仓位追踪] {coin} 不在追踪列表，跳过")
+        return portfolio
+
     if coin not in portfolio["positions"]:
         portfolio["positions"][coin] = _default_position()
 
@@ -365,7 +382,19 @@ def track_portfolio_signal(coin, base_signal, price, position_suggest, portfolio
         else:
             ratio = 0.20  # 默认20%
 
-        size        = portfolio["balance"] * ratio
+        # 计算可用余额：总余额 - 已持仓金额（防止超额买入）
+        used_capital = sum(
+            p.get("position_size", 0)
+            for p in portfolio["positions"].values()
+            if p.get("holding")
+        )
+        available_balance = max(0, portfolio["balance"] - used_capital)
+        if available_balance < portfolio.get("initial_balance", 10000) * 0.05:
+            print(f"💼 {coin} 可用余额不足（已用:{used_capital:.2f} 余:{available_balance:.2f}），跳过买入")
+            save_portfolio(portfolio)
+            return portfolio
+
+        size        = available_balance * ratio
         entry_price = price * (1 + FEE_RATE)  # 含手续费
 
         pos.update({
@@ -374,9 +403,13 @@ def track_portfolio_signal(coin, base_signal, price, position_suggest, portfolio
             "position_size": round(size, 2),
             "highest_price": price,
             "entry_time":    time.time(),
+            "stop_loss":     round(sl_price, 8),    # 止损价，用于实时监控
+            "take_profit":   round(tp_price, 8),    # 止盈价，用于实时监控
+            "sl_triggered":  False,                  # 止损是否已提醒
+            "tp_triggered":  False,                  # 止盈是否已提醒
         })
         pos["trade_count"] = pos.get("trade_count", 0) + 1
-        print(f"💼 仓位追踪 - {coin} 买入: 价格{price:.6g} 仓位{size:.2f}({ratio:.0%})")
+        print(f"💼 仓位追踪 - {coin} 买入: 价格{price:.6g} 仓位{size:.2f}({ratio:.0%}) 止损:{sl_price:.6g} 止盈:{tp_price:.6g}")
 
     elif base_signal == "卖出" and pos["holding"]:
         exit_price   = price * (1 - FEE_RATE)  # 含手续费
@@ -432,7 +465,12 @@ def format_portfolio_status(portfolio):
     init_balance = portfolio.get("initial_balance", 10000)
     total_return = (balance - init_balance + total_unrealized) / init_balance * 100
 
-    lines.append(f"  💰 模拟总资金: {balance:.2f} | 浮动盈亏: {total_unrealized:+.2f}")
+    used_capital = sum(
+        p.get("position_size", 0) for p in portfolio.get("positions", {}).values()
+        if p.get("holding")
+    )
+    available = balance - used_capital
+    lines.append(f"  💰 总资金: {balance:.2f} | 可用: {available:.2f} | 浮盈: {total_unrealized:+.2f}")
     lines.append(f"  📈 累计收益率: {total_return:+.2f}%")
     return "\n".join(lines)
 
@@ -1045,6 +1083,7 @@ ai_model.load()
 def load_config():
     default = {
         "coins": ["BTC-USDT", "ETH-USDT", "OKB-USDT"],
+        "portfolio_coins": ["BTC-USDT", "ETH-USDT", "OKB-USDT"],
         "buy_threshold": 70, "sell_threshold": 35,
         "check_interval": 900,
         "telegram_bot_token": "", "telegram_chat_id": "",
@@ -1330,6 +1369,17 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
     atr       = calculate_atr(df)
     cur_price = df['close'].iloc[-1]
 
+    # 按市场周期动态止盈止损倍数
+    # 牛市：给趋势空间，止损宽，止盈远（拿大利润）
+    # 熊市：快速止损保本，止盈近（反弹不贪）
+    # 震荡：均衡设置，区间内操作
+    if market_cycle == "牛市":
+        sl_mult, tp_mult = 2.0, 5.0   # 盈亏比2.5:1
+    elif market_cycle == "熊市":
+        sl_mult, tp_mult = 1.0, 2.5   # 盈亏比2.5:1
+    else:  # 震荡或未知
+        sl_mult, tp_mult = 1.5, 4.0   # 盈亏比2.67:1
+
     factors = {
         'rule_score':      rule_score,
         'ml_score':        ml_score,
@@ -1338,10 +1388,12 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
         'up_prob':         max(0, min(1, up_prob)),
         'analysis':        analysis,
         'atr':             atr,
-        'stop_loss_buy':   round(cur_price - atr * 2, 6),
-        'take_profit_buy': round(cur_price + atr * 3, 6),
-        'stop_loss_sell':  round(cur_price + atr * 2, 6),
-        'take_profit_sell':round(cur_price - atr * 3, 6),
+        'sl_mult':         sl_mult,
+        'tp_mult':         tp_mult,
+        'stop_loss_buy':   round(cur_price - atr * sl_mult, 6),
+        'take_profit_buy': round(cur_price + atr * tp_mult, 6),
+        'stop_loss_sell':  round(cur_price + atr * sl_mult, 6),
+        'take_profit_sell':round(cur_price - atr * tp_mult, 6),
     }
     return int(combined_score), factors, features
 
@@ -1395,7 +1447,7 @@ def verify_past_signals(config):
     #   两者都未触发    → 看2小时后收盘价方向
     # 相比原来25分钟+最高价的方式，熊市横盘下能产生均衡的correct/wrong分布
 
-    BARRIER_PCT   = 0.003   # 止盈止损均为0.3%
+    BARRIER_PCT   = 0.005   # 止盈止损均为0.5%（与ATR止盈止损比例更匹配）
     WINDOW_BARS   = 8       # 验证窗口：8根15分钟K线 = 2小时
     MIN_AGE_MIN   = 30      # 信号至少30分钟后才验证（15m系统等一根K线关闭）
     SAVE_EVERY    = 10      # 每验证10条写一次，防OOM Kill丢失
@@ -1571,7 +1623,7 @@ def adaptive_strategy_optimization(config):
         if cv_acc > 0.60:
             memory['buy_threshold']  = min(memory.get('buy_threshold', 65) + 2, 75)  # 上限75（原85）
             memory['sell_threshold'] = max(memory.get('sell_threshold', 35) - 2, 25)  # 下限25（原20）
-            memory['ml_weight']      = min(0.7, memory.get('ml_weight', 0.4) + 0.05)
+            memory['ml_weight']      = min(0.5, memory.get('ml_weight', 0.4) + 0.05)  # 上限0.5，防过拟合放大
         elif cv_acc < 0.50:
             memory['buy_threshold']  = max(memory.get('buy_threshold', 65) - 2, 55)
             memory['sell_threshold'] = min(memory.get('sell_threshold', 35) + 2, 45)
@@ -1604,21 +1656,22 @@ def adaptive_strategy_optimization(config):
     ev_data = calculate_expected_value(recent_verified)
     ev_msg  = format_ev_message(ev_data)
 
-    msg = (f"🤖 AI模型已进化\n"
-           f"训练样本: {len(X_df)}\n"
-           f"训练准确率: {train_acc:.2%}\n"
-           f"交叉验证准确率: {cv_acc:.2%}  ← 真实参考值\n"
-           f"实际胜率(近100条): {real_winrate:.2%}\n"
-           f"新阈值: 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}\n"
-           f"AI模型权重: {memory['ml_weight']:.2f}\n\n"
-           f"💰 系统期望值:\n{ev_msg}\n\n"
-           f"前5重要特征:\n{feature_msg}"
-           f"{overfit_warning}")
-    # 训练成功后同步更新config阈值，当轮循环立即生效
+    # 详细训练报告打印到日志（方便排查）
+    print(f"[AI进化] 样本:{len(X_df)} | 训练:{train_acc:.2%} | CV:{cv_acc:.2%} | "
+          f"胜率:{real_winrate:.2%} | 阈值:买入{memory['buy_threshold']}/卖出{memory['sell_threshold']} | "
+          f"权重:{memory['ml_weight']:.2f}{overfit_warning}")
+    print(f"[AI进化] 前5特征: {feature_msg.replace(chr(10), ', ')}")
+
+    # Telegram只发简洁的盈利相关信息
     config['buy_threshold']  = memory['buy_threshold']
     config['sell_threshold'] = memory['sell_threshold']
-    print(f"✅ 模型训练完成，阈值已更新: 买入={config['buy_threshold']}，卖出={config['sell_threshold']}")
-    send_notification(msg, config, "AI模型进化报告")
+    simple_msg = (
+        f"🤖 AI模型已更新\n\n"
+        f"📊 系统表现:\n{ev_msg}\n\n"
+        f"实际胜率(近100条): {real_winrate:.2%}\n"
+        f"样本数: {len(X_df)}条{overfit_warning}"
+    )
+    send_notification(simple_msg, config, "AI模型更新")
 
 # =========================
 # 核心盈利指标：期望值（Expected Value）
@@ -1898,26 +1951,26 @@ def build_signal_message(coin, base_signal, score, display_price,
     )
     reason_note = f"💡 {reason_type}: {reason_detail}\n\n" if reason_type else ""
 
+    # 三周期方向简洁显示
+    t4 = analysis.get('trend_4h', '?')
+    t1 = analysis.get('trend_1h', '?')
+    t15= analysis.get('trend_15m', '?')
+    cycle_str = f"4h{t4} 1h{t1} 15m{t15}"
+
+    # 风险点简洁显示
+    risk_str = "、".join(risks) if risks else "无明显风险"
+
     msg = (
-        f"{signal_emoji} <b>{coin} {base_signal}信号</b>\n\n"
+        f"{signal_emoji} <b>{coin} {base_signal}</b>\n\n"
         f"{grade_note}"
         f"{reason_note}"
-        f"💰 价格：${display_price:.6g}\n"
-        f"📊 综合评分：{score} (规则:{factors['rule_score']} AI:{factors['ml_score']:.0f})\n"
-        f"🎯 上涨概率：{up_prob:.1f}%\n"
-        f"🔁 连续确认：{confirm_count}次 (均分{avg_score:.0f})\n\n"
-        f"📈 趋势：{analysis['trend']} | 动量：{analysis['momentum']}\n"
-        f"🔍 三周期: 4h{analysis.get('trend_4h','?')} | 1h{analysis.get('trend_1h','?')} | 15m{analysis.get('trend_15m','?')}\n"
-        f"📦 成交量：{analysis['volume']} | 波动：{analysis['volatility']}\n"
-        f"📍 位置：{analysis['position_desc']}\n\n"
-        f"🛡️ 止损价：${sl:.6g} (-{sl_pct:.1f}%)\n"
-        f"🎯 目标价：${tp:.6g} (+{tp_pct:.1f}%)\n"
+        f"📍 周期方向：{cycle_str}\n\n"
+        f"💰 {'买入' if base_signal == '买入' else '卖出'}价：${display_price:.6g}\n"
+        f"🛡️ 止损：${sl:.6g}（-{sl_pct:.1f}%）\n"
+        f"🎯 目标：${tp:.6g}（+{tp_pct:.1f}%）\n"
         f"💼 建议仓位：{position_suggest}\n\n"
-        f"{risk_emoji} 风险等级：{risk_level}\n"
-        f"⚠️ 风险点：{'、'.join(risks) if risks else '无明显风险'}\n\n"
-        f"🤖 模型：{model_reliability}\n"
-        f"🌍 当前周期：{current_market_cycle}（下次信号冷却：{cooldown_str}）\n"
-        f"⏰ {datetime.now().strftime('%m-%d %H:%M')}"
+        f"⚠️ 风险：{risk_str}\n"
+        f"⏰ {datetime.now().strftime('%m-%d %H:%M')} | {current_market_cycle}"
     )
     return msg, position_suggest
 
@@ -2024,22 +2077,19 @@ def build_status_message(coins, memory, config,
     portfolio     = load_portfolio()
     portfolio_str = format_portfolio_status(portfolio)
 
+    # 打印系统状态到日志（不发Telegram）
+    print(f"[状态] 运行:{h}h{m}m | 周期:{current_market_cycle} | "
+          f"阈值:买入{config['buy_threshold']}/卖出{config['sell_threshold']} | "
+          f"评分历史:{len(_score_history)}条 | {model_info.replace(chr(10), ' ')}")
+
     status = (
-        f"📡 <b>AI监控状态报告</b>\n\n"
-        f"📈 监控币种:\n" + "\n".join(coin_lines) + "\n\n"
+        f"📡 <b>AI监控</b> | {current_market_cycle} | 运行{h}h{m}m\n\n"
+        f"💼 持仓状态:\n{portfolio_str}\n\n"
         f"⏱️ 最近信号:\n" +
         ("\n".join([f"  {s}" for s in recent]) if recent else "  暂无") + "\n\n"
-        f"🔥 市场热点:\n{hot_str}\n\n"
-        f"🤖 模型状态:\n  {model_info}\n\n"
-        f"📊 胜率统计:\n"
-        f"  6小时: {sixh_total}次 | {sixh_winrate:.0%}\n"
-        f"  24小时: {today_total}次 | {today_winrate:.0%}{winrate_tag}"
-        f"{ev_line}\n\n"
-        f"💼 模拟仓位:\n{portfolio_str}\n\n"
-        f"⚙️ 阈值: 买入{config['buy_threshold']} | 卖出{config['sell_threshold']}"
-        f"（{'动态' if ai_model.is_trained and len(_score_history)>=20 else '固定'}，基于{len(_score_history)}条历史评分）\n"
-        f"⏳ 信号冷却时间: {cooldown_str}（{current_market_cycle}）\n"
-        f"🕐 运行: {h}小时{m}分钟 | {current_market_cycle}"
+        f"💰 系统表现:\n"
+        f"  24小时: {today_total}次信号 | 胜率{today_winrate:.0%}{winrate_tag}\n"
+        f"{ev_line}"
     )
     return status
 
@@ -2192,18 +2242,27 @@ def main():
             save_memory(memory)
             config["buy_threshold"]  = 65
             config["sell_threshold"] = 35
+        # 检测ml_weight是否超出上限0.5
+        ml_w = memory.get("ml_weight", 0.4)
+        if ml_w > 0.5:
+            print(f"⚠️ AI权重过高（{ml_w:.2f}），自动降至0.5（防过拟合放大错误）")
+            memory["ml_weight"] = 0.5
+            save_memory(memory)
         else:
-            print(f"✅ 模型已训练，阈值正常（买入={buy_thr} 卖出={sell_thr}），使用动态阈值")
+            print(f"✅ 模型已训练，阈值正常（买入={buy_thr} 卖出={sell_thr}），AI权重={ml_w:.2f}")
 
     # 启动通知（含Volume状态，方便排查）
     log_size    = os.path.getsize(LOG_PATH) if os.path.exists(LOG_PATH) else 0
     volume_info = f"✅ 存储已挂载" if _volume_ok else "❌ 存储未挂载！重启后数据全部丢失"
+    # 详细启动信息打印到日志
+    print(f"[启动] 模型:{'已训练' if ai_model.is_trained else '未训练'} | 日志:{log_size}字节 | 存储:{volume_info}")
+
+    # Telegram只发简洁启动通知
+    model_status = f"✅ 已训练（胜率约{ai_model.cv_accuracy:.0%}）" if ai_model.is_trained else "⏳ 训练中（积累数据）"
     send_telegram_message(
-        f"🚀 系统启动\n"
-        f"模型: {'✅已训练' if ai_model.is_trained else '❌未训练'}\n"
-        f"日志大小: {log_size} 字节\n"
-        f"存储: {volume_info}\n"
-        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"🚀 系统已启动\n"
+        f"模型: {model_status}\n"
+        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')} | {current_market_cycle if current_market_cycle != '未知' else '周期检测中'}",
         config
     )
 
@@ -2240,6 +2299,99 @@ def main():
             # 更新各持仓币种的最高价（用于牛市回撤止盈判断）
             portfolio = load_portfolio()
             update_highest_price(portfolio)
+
+            # ── 持仓监控：止损/止盈触发 + 按周期超时提醒 ──
+            # 按市场周期确定超时阈值
+            timeout_hours = {"牛市": 24, "熊市": 6, "震荡": 12}.get(current_market_cycle, 12)
+            portfolio_changed = False
+
+            for hold_coin, pos in list(portfolio.get("positions", {}).items()):
+                if not pos.get("holding") or not pos.get("entry_time", 0):
+                    continue
+                try:
+                    cur_price_hold = get_ticker(hold_coin) or pos["entry_price"]
+                    entry          = pos["entry_price"]
+                    pnl_pct        = (cur_price_hold * (1 - FEE_RATE) - entry) / entry * 100
+                    pnl_emoji      = "✅" if pnl_pct >= 0 else "⚠️"
+                    hold_hours     = (now - pos["entry_time"]) / 3600
+
+                    # 止损触发监控（每次都检查，触发后不重复提醒）
+                    sl_price = pos.get("stop_loss", 0)
+                    tp_price = pos.get("take_profit", 0)
+
+                    # ── 止损强制执行（硬规则）──
+                    # 价格触及止损线，不等AI信号，直接模拟卖出记录亏损
+                    if sl_price > 0 and cur_price_hold <= sl_price and not pos.get("sl_triggered"):
+                        pos["sl_triggered"] = True
+                        portfolio_changed   = True
+                        exit_price_sl    = cur_price_hold * (1 - FEE_RATE)
+                        profit_pct_sl    = (exit_price_sl - entry) / entry if entry > 0 else 0
+                        profit_amt_sl    = pos["position_size"] * profit_pct_sl
+                        portfolio["balance"]      = round(portfolio["balance"] + profit_amt_sl, 2)
+                        portfolio["total_profit"] = round(portfolio.get("total_profit", 0) + profit_amt_sl, 2)
+                        pos["profit"]             = round(pos.get("profit", 0) + profit_amt_sl, 2)
+                        pos.update({
+                            "holding": False, "entry_price": 0.0,
+                            "position_size": 0.0, "highest_price": 0.0, "entry_time": 0
+                        })
+                        sl_msg = (
+                            f"🚨 <b>{hold_coin} 止损执行</b>\n"
+                            f"触发价: ${cur_price_hold:.6g} ≤ 止损: ${sl_price:.6g}\n"
+                            f"❌ 亏损: {profit_pct_sl*100:+.2f}% ({profit_amt_sl:+.2f})\n"
+                            f"累计盈亏: {portfolio['total_profit']:+.2f}\n"
+                            f"⏰ {datetime.now().strftime('%m-%d %H:%M')}"
+                        )
+                        send_telegram_message(sl_msg, config)
+                        print(f"🚨 {hold_coin} 止损执行: {profit_pct_sl*100:.2f}% ({profit_amt_sl:+.2f})")
+                        continue
+
+                    # ── 止盈强制执行（硬规则）──
+                    # 价格触及目标价，直接模拟卖出记录盈利
+                    elif tp_price > 0 and cur_price_hold >= tp_price and not pos.get("tp_triggered"):
+                        pos["tp_triggered"] = True
+                        portfolio_changed   = True
+                        exit_price_tp    = cur_price_hold * (1 - FEE_RATE)
+                        profit_pct_tp    = (exit_price_tp - entry) / entry if entry > 0 else 0
+                        profit_amt_tp    = pos["position_size"] * profit_pct_tp
+                        portfolio["balance"]      = round(portfolio["balance"] + profit_amt_tp, 2)
+                        portfolio["total_profit"] = round(portfolio.get("total_profit", 0) + profit_amt_tp, 2)
+                        pos["profit"]             = round(pos.get("profit", 0) + profit_amt_tp, 2)
+                        pos.update({
+                            "holding": False, "entry_price": 0.0,
+                            "position_size": 0.0, "highest_price": 0.0, "entry_time": 0
+                        })
+                        tp_msg = (
+                            f"💰 <b>{hold_coin} 止盈执行</b>\n"
+                            f"触发价: ${cur_price_hold:.6g} ≥ 目标: ${tp_price:.6g}\n"
+                            f"✅ 盈利: {profit_pct_tp*100:+.2f}% ({profit_amt_tp:+.2f})\n"
+                            f"累计盈亏: {portfolio['total_profit']:+.2f}\n"
+                            f"⏰ {datetime.now().strftime('%m-%d %H:%M')}"
+                        )
+                        send_telegram_message(tp_msg, config)
+                        print(f"💰 {hold_coin} 止盈执行: {profit_pct_tp*100:.2f}% ({profit_amt_tp:+.2f})")
+                        continue
+
+                    # 超时提醒（按周期，每个周期提醒一次）
+                    if hold_hours >= timeout_hours:
+                        last_remind_key = f"_remind_{hold_coin}"
+                        last_remind     = portfolio.get(last_remind_key, 0)
+                        if now - last_remind > timeout_hours * 3600:
+                            remind_msg = (
+                                f"⏰ <b>{hold_coin} 持仓提醒</b>\n"
+                                f"已持仓 {hold_hours:.0f} 小时（{current_market_cycle}建议{timeout_hours}小时内处理）\n"
+                                f"买入价: ${entry:.6g} | 当前: ${cur_price_hold:.6g}\n"
+                                f"{pnl_emoji} 浮动盈亏: {pnl_pct:+.2f}%\n"
+                                f"止损: ${pos.get('stop_loss', 0):.6g} | 目标: ${pos.get('take_profit', 0):.6g}"
+                            )
+                            send_telegram_message(remind_msg, config)
+                            portfolio[last_remind_key] = now
+                            portfolio_changed          = True
+
+                except Exception as e:
+                    print(f"持仓监控失败 {hold_coin}: {e}")
+
+            if portfolio_changed:
+                save_portfolio(portfolio)
 
             # 动态扩展监控币种
             hot_coins = [c for c, _ in scan_hot_coins()[:MAX_DYNAMIC_COINS]]
@@ -2390,11 +2542,47 @@ def main():
                     send_notification(msg, config, subject)
                     reset_signal_confirm(coin)
 
-                    # 仓位追踪：根据发出的信号模拟更新持仓
-                    portfolio = load_portfolio()
-                    portfolio = track_portfolio_signal(
-                        coin, base_signal, price, position_suggest, portfolio
-                    )
+                    # 仓位追踪：只有强信号才记入（次级信号不追踪）
+                    if signal_grade == "strong":
+                        portfolio     = load_portfolio()
+                        portfolio_coins_cfg = config.get("portfolio_coins", config["coins"])
+                        portfolio_old = portfolio.get("positions", {}).get(coin, {}).get("holding", False)
+                        sl_price_track = factors.get('stop_loss_buy' if base_signal == '买入' else 'stop_loss_sell', 0)
+                        tp_price_track = factors.get('take_profit_buy' if base_signal == '买入' else 'take_profit_sell', 0)
+                        portfolio     = track_portfolio_signal(
+                            coin, base_signal, price, position_suggest, portfolio,
+                            sl_price=sl_price_track,
+                            tp_price=tp_price_track,
+                            portfolio_coins=portfolio_coins_cfg
+                        )
+                    else:
+                        portfolio_old = False
+                        portfolio_new = False
+                        portfolio     = load_portfolio()
+                    if signal_grade == "strong":
+                        portfolio_new = portfolio.get("positions", {}).get(coin, {}).get("holding", False)
+                    # 推送持仓变化确认（买入 or 卖出）
+                    if base_signal == "买入" and not portfolio_old and portfolio_new:
+                        pos_info = portfolio["positions"][coin]
+                        confirm_msg = (
+                            f"💼 <b>{coin} 已买入</b>\n"
+                            f"买入价: ${pos_info['entry_price']:.6g}（含手续费）\n"
+                            f"止损: ${pos_info.get('stop_loss', 0):.6g} | 目标: ${pos_info.get('take_profit', 0):.6g}\n"
+                            f"⏰ {datetime.now().strftime('%m-%d %H:%M')}"
+                        )
+                        send_telegram_message(confirm_msg, config)
+
+                    elif base_signal == "卖出" and portfolio_old and not portfolio_new:
+                        total_profit = portfolio.get("total_profit", 0)
+                        coin_profit  = portfolio["positions"][coin].get("profit", 0)
+                        result_emoji = "✅" if coin_profit >= 0 else "❌"
+                        confirm_msg = (
+                            f"💼 <b>{coin} 已卖出</b>\n"
+                            f"{result_emoji} 本次盈亏: {coin_profit:+.2f}\n"
+                            f"累计盈亏: {total_profit:+.2f}\n"
+                            f"⏰ {datetime.now().strftime('%m-%d %H:%M')}"
+                        )
+                        send_telegram_message(confirm_msg, config)
 
                 except Exception as e:
                     print(f"处理{coin}时出错: {e}")
