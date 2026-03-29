@@ -15,6 +15,24 @@ from functools import wraps
 import threading
 
 # =========================
+# 版本号
+# =========================
+VERSION = "2.2.0"
+# v1.0.0 - 基础信号系统
+# v1.1.0 - 三重障碍法验证
+# v1.2.0 - 三周期共振（4h+1h+15m）
+# v1.3.0 - 百分位数动态阈值
+# v1.4.0 - Portfolio仓位追踪
+# v1.5.0 - 期望值（EV）计算
+# v1.6.0 - 趋势过滤（4h↓禁买入）
+# v1.7.0 - 按周期动态止盈止损ATR
+# v1.8.0 - 止损/止盈强制执行（硬规则）
+# v1.9.0 - 资金锁仓 + 验证窗口±0.5%
+# v2.0.0 - 信号通知精简 + 买卖原因分类 + 消息分层
+# v2.1.0 - 强信号直通 + 最大持仓数限制 + 熊市冷却90分钟
+# v2.2.0 - 牛市冷却90分钟 + 旧持仓止损改用entry_price
+
+# =========================
 # Railway Volume 挂载等待
 # 解决：代码启动比Volume挂载快，导致读不到持久化目录
 # =========================
@@ -119,9 +137,9 @@ MARKET_CYCLE_INTERVAL         = 3600
 # 震荡行情，使用90分钟（震荡冷却）
 # 熊市保守，使用180分钟（避免频繁抄底）
 COOLDOWN_BY_CYCLE = {
-    "牛市": 10800,  # 180分钟（趋势市）
+    "牛市": 5400,   # 90分钟（原180分钟，趋势行情第一次进场后不能错过后续机会）
     "震荡": 5400,   # 90分钟（震荡市）
-    "熊市": 10800,  # 180分钟（熊市保守）
+    "熊市": 5400,   # 90分钟（熊市信号少，降低冷却加速数据积累）
     "未知": 5400    # 默认90分钟
 }
 
@@ -207,6 +225,7 @@ def _default_portfolio():
         "initial_balance": 10000.0,  # 初始模拟资金
         "balance":         10000.0,  # 当前可用资金
         "total_profit":    0.0,      # 累计盈利
+        "max_positions":   2,        # 最大同时持仓数（可在config.json修改）
         "positions": {}              # 各币种持仓
     }
 
@@ -382,6 +401,15 @@ def track_portfolio_signal(coin, base_signal, price, position_suggest, portfolio
         else:
             ratio = 0.20  # 默认20%
 
+        # 检查最大持仓数限制
+        current_holding_count = sum(
+            1 for p in portfolio["positions"].values() if p.get("holding")
+        )
+        max_pos = portfolio.get("max_positions", 2)
+        if current_holding_count >= max_pos:
+            print(f"💼 {coin} 已达最大持仓数({current_holding_count}/{max_pos})，跳过买入")
+            return portfolio
+
         # 计算可用余额：总余额 - 已持仓金额（防止超额买入）
         used_capital = sum(
             p.get("position_size", 0)
@@ -469,9 +497,12 @@ def format_portfolio_status(portfolio):
         p.get("position_size", 0) for p in portfolio.get("positions", {}).values()
         if p.get("holding")
     )
-    available = balance - used_capital
-    lines.append(f"  💰 总资金: {balance:.2f} | 可用: {available:.2f} | 浮盈: {total_unrealized:+.2f}")
-    lines.append(f"  📈 累计收益率: {total_return:+.2f}%")
+    available    = balance - used_capital
+    total_equity = balance + total_unrealized  # 总净值 = 现金 + 持仓浮动市值
+    max_pos      = portfolio.get("max_positions", 2)
+    holding_count= sum(1 for p in portfolio.get("positions", {}).values() if p.get("holding"))
+    lines.append(f"  💰 总净值: {total_equity:.2f} | 现金: {available:.2f} | 浮盈: {total_unrealized:+.2f}")
+    lines.append(f"  📈 累计收益率: {total_return:+.2f}% | 持仓: {holding_count}/{max_pos}个")
     return "\n".join(lines)
 
 # =========================
@@ -973,8 +1004,9 @@ class AITradingModel:
         self.cv_accuracy = cv_acc
 
         if hasattr(model, 'estimators_'):
+            # 注意：必须用model.estimators_（已训练），不能用base_models（未训练）
             imps = [est.feature_importances_
-                    for _, est in base_models
+                    for est in model.estimators_
                     if hasattr(est, 'feature_importances_')]
             if imps:
                 self.feature_importance = dict(zip(self.feature_names, np.mean(imps, axis=0)))
@@ -1084,6 +1116,7 @@ def load_config():
     default = {
         "coins": ["BTC-USDT", "ETH-USDT", "OKB-USDT"],
         "portfolio_coins": ["BTC-USDT", "ETH-USDT", "OKB-USDT"],
+        "max_positions": 2,
         "buy_threshold": 70, "sell_threshold": 35,
         "check_interval": 900,
         "telegram_bot_token": "", "telegram_chat_id": "",
@@ -1145,11 +1178,18 @@ def send_telegram_message(text, config):
     except Exception as e:
         print(f"Telegram消息发送失败: {e}")
 
+# 邮件失败标志：网络不通后不再重试，避免日志刷屏
+_email_network_failed = False
+
 def send_email(subject, body, config):
+    global _email_network_failed
     user, pwd, receiver = (config.get("email_user"),
                            config.get("email_pass"),
                            config.get("email_receiver"))
     if not all([user, pwd, receiver]):
+        return
+    # 上次已确认网络不通，直接跳过（不再重试）
+    if _email_network_failed:
         return
     for host, port, use_tls in [("smtp.139.com", 25, True), ("smtp.139.com", 465, False)]:
         try:
@@ -1163,7 +1203,15 @@ def send_email(subject, body, config):
             msg.attach(MIMEText(body, "plain", "utf-8"))
             srv.send_message(msg)
             srv.quit()
+            _email_network_failed = False  # 发送成功，重置标志
             return
+        except OSError as e:
+            # 网络不可达（Railway环境SMTP端口被封），标记后不再重试
+            if "Network is unreachable" in str(e) or "Connection refused" in str(e):
+                _email_network_failed = True
+                print(f"⚠️ 邮件网络不可达，后续将跳过邮件发送: {e}")
+                return
+            print(f"邮件发送失败 {host}:{port}: {e}")
         except Exception as e:
             print(f"邮件发送失败 {host}:{port}: {e}")
 
@@ -1960,14 +2008,43 @@ def build_signal_message(coin, base_signal, score, display_price,
     # 风险点简洁显示
     risk_str = "、".join(risks) if risks else "无明显风险"
 
+    # 买入：止损在下方(-%)，目标在上方(+%)
+    # 卖出：止损在上方(+%)，目标在下方(-%)
+    if base_signal == "买入":
+        sl_sign, tp_sign = "-", "+"
+        sl_label = "止损"
+        tp_label = "目标"
+    else:
+        sl_sign, tp_sign = "+", "-"
+        sl_label = "止损"   # 卖出止损：若价格上涨则止损
+        tp_label = "目标"   # 卖出目标：若价格下跌则达到目标
+
+    # 卖出信号加持仓状态说明（现货交易里卖出信号只对有持仓的人有意义）
+    portfolio_check = load_portfolio()
+    has_position    = portfolio_check.get("positions", {}).get(coin, {}).get("holding", False)
+    if base_signal == "卖出" and not has_position:
+        position_note = "⚠️ 您当前无此仓位，此信号供参考\n\n"
+    elif base_signal == "卖出" and has_position:
+        # 有持仓时显示当前浮动盈亏，帮助用户决策是否卖出
+        pos_check = portfolio_check["positions"][coin]
+        entry_p   = pos_check.get("entry_price", 0)
+        if entry_p > 0:
+            cur_pnl   = (display_price * (1 - FEE_RATE) - entry_p) / entry_p * 100
+            pnl_emoji = "✅" if cur_pnl >= 0 else "⚠️"
+            position_note = f"{pnl_emoji} 当前持仓浮盈: {cur_pnl:+.2f}%\n\n"
+        else:
+            position_note = ""
+    else:
+        position_note = ""
     msg = (
         f"{signal_emoji} <b>{coin} {base_signal}</b>\n\n"
         f"{grade_note}"
+        f"{position_note}"
         f"{reason_note}"
         f"📍 周期方向：{cycle_str}\n\n"
         f"💰 {'买入' if base_signal == '买入' else '卖出'}价：${display_price:.6g}\n"
-        f"🛡️ 止损：${sl:.6g}（-{sl_pct:.1f}%）\n"
-        f"🎯 目标：${tp:.6g}（+{tp_pct:.1f}%）\n"
+        f"🛡️ {sl_label}：${sl:.6g}（{sl_sign}{sl_pct:.1f}%）\n"
+        f"🎯 {tp_label}：${tp:.6g}（{tp_sign}{tp_pct:.1f}%）\n"
         f"💼 建议仓位：{position_suggest}\n\n"
         f"⚠️ 风险：{risk_str}\n"
         f"⏰ {datetime.now().strftime('%m-%d %H:%M')} | {current_market_cycle}"
@@ -2319,6 +2396,36 @@ def main():
                     sl_price = pos.get("stop_loss", 0)
                     tp_price = pos.get("take_profit", 0)
 
+                    # ── 旧持仓自动补设止损价（兼容旧数据）──
+                    # 如果持仓没有止损价（旧版本买入），自动根据当前ATR设置
+                    if pos.get("holding") and sl_price == 0:
+                        try:
+                            df_temp   = get_kline(hold_coin, interval="15m", limit=50)
+                            atr_temp  = calculate_atr(df_temp)
+                            sl_m = {"牛市": 2.0, "熊市": 1.0}.get(current_market_cycle, 1.5)
+                            tp_m = {"牛市": 5.0, "熊市": 2.5}.get(current_market_cycle, 4.0)
+                            # 止损从entry_price计算（GPT建议：基于入场价，更有意义）
+                            # 保护：若算出的止损高于当前价（已深度亏损），改用当前价-ATR
+                            raw_sl = round(entry - atr_temp * sl_m, 8) if entry > 0 else round(cur_price_hold - atr_temp * sl_m, 8)
+                            new_sl = raw_sl if raw_sl < cur_price_hold else round(cur_price_hold - atr_temp * sl_m * 0.5, 8)
+                            new_tp = round(entry + atr_temp * tp_m, 8) if entry > 0 else round(cur_price_hold + atr_temp * tp_m, 8)
+                            pos["stop_loss"]   = new_sl
+                            pos["take_profit"] = new_tp
+                            sl_price           = new_sl
+                            tp_price           = new_tp
+                            portfolio_changed  = True
+                            alert_msg = (
+                                f"⚙️ <b>{hold_coin} 止损已自动设置</b>\n"
+                                f"（旧持仓缺少止损价，已自动补充）\n"
+                                f"🛡️ 止损价: ${new_sl:.6g}\n"
+                                f"🎯 目标价: ${new_tp:.6g}\n"
+                                f"当前浮盈: {pnl_pct:+.2f}%"
+                            )
+                            send_telegram_message(alert_msg, config)
+                            print(f"⚙️ {hold_coin} 旧持仓自动设置止损: {new_sl:.6g} 止盈: {new_tp:.6g}")
+                        except Exception as e:
+                            print(f"旧持仓止损设置失败 {hold_coin}: {e}")
+
                     # ── 止损强制执行（硬规则）──
                     # 价格触及止损线，不等AI信号，直接模拟卖出记录亏损
                     if sl_price > 0 and cur_price_hold <= sl_price and not pos.get("sl_triggered"):
@@ -2480,14 +2587,23 @@ def main():
                         continue
 
                     # 连续确认机制
-                    # 未训练时只需1次确认（加速积累数据）
-                    # 已训练后需要2次确认（提高信号质量）
-                    required_confirms = 1 if not ai_model.is_trained else SIGNAL_CONFIRM_COUNT
-                    confirmed, avg_score = check_signal_confirm(coin, base_signal, score)
-                    confirm_entry = _get_confirm_cache().get(coin, {})
-                    if confirm_entry.get('count', 0) < required_confirms:
-                        print(f"{coin} {base_signal}信号等待二次确认 ({confirm_entry.get('count',0)}/{required_confirms}次，当前评分:{score})")
-                        continue
+                    # 强信号(买入≥75 / 卖出≤25)：直接触发，不等二次确认
+                    #   → 强信号延迟15-30分钟会错过最优入场点
+                    # 普通信号：未训练需1次，已训练需2次
+                    is_strong = (base_signal == "买入" and score >= SIGNAL_STRONG_BUY) or                                 (base_signal == "卖出" and score <= SIGNAL_STRONG_SELL)
+
+                    if is_strong:
+                        # 强信号直通，跳过二次确认等待
+                        required_confirms = 1
+                        _, avg_score = check_signal_confirm(coin, base_signal, score)
+                        print(f"{coin} 强信号直通（评分{score}，无需二次确认）")
+                    else:
+                        required_confirms = 1 if not ai_model.is_trained else SIGNAL_CONFIRM_COUNT
+                        confirmed, avg_score = check_signal_confirm(coin, base_signal, score)
+                        confirm_entry = _get_confirm_cache().get(coin, {})
+                        if confirm_entry.get('count', 0) < required_confirms:
+                            print(f"{coin} {base_signal}信号等待二次确认 ({confirm_entry.get('count',0)}/{required_confirms}次，当前评分:{score})")
+                            continue
 
                     # 修改三：使用动态冷却时间
                     if now - last_signal_time.get(coin, 0) < signal_cooldown:
@@ -2498,15 +2614,9 @@ def main():
 
                     price = get_ticker(coin) or df["close"].iloc[-1]
 
-                    # 记录日志（仅自定义币种）
-                    if coin in config["coins"]:
-                        log_signal(coin, base_signal, score, price, whale,
-                                   current_market_cycle, factors, features)
-                        print(f"📝 信号已记录: {coin} {base_signal} 评分{score}")
-                    else:
-                        print(f"📝 热门币种 {coin} 信号不计入训练数据")
-
-                    # 趋势过滤+原有过滤逻辑
+                    # ── 先过滤，再记录 ──
+                    # 被过滤的信号不发给用户，也不应进入训练数据
+                    # 否则AI会学到"被过滤信号"的特征，污染模型
                     if base_signal == "买入":
                         ok, reason = check_buy_filters(coin, df, memory, analysis)
                         if not ok:
@@ -2517,6 +2627,14 @@ def main():
                         if not ok:
                             print(f"{coin} 卖出信号已过滤: {reason}")
                             continue
+
+                    # 过滤通过后才记录日志（只记录真正发出的信号）
+                    if coin in config["coins"]:
+                        log_signal(coin, base_signal, score, price, whale,
+                                   current_market_cycle, factors, features)
+                        print(f"📝 信号已记录: {coin} {base_signal} 评分{score}")
+                    else:
+                        print(f"📝 热门币种 {coin} 信号不计入训练数据")
 
                     risk_level, risks = generate_risk_analysis(analysis, factors, config)
 
@@ -2543,12 +2661,16 @@ def main():
                     reset_signal_confirm(coin)
 
                     # 仓位追踪：只有强信号才记入（次级信号不追踪）
+                    portfolio_old = False
+                    portfolio_new = False
                     if signal_grade == "strong":
                         portfolio     = load_portfolio()
                         portfolio_coins_cfg = config.get("portfolio_coins", config["coins"])
                         portfolio_old = portfolio.get("positions", {}).get(coin, {}).get("holding", False)
                         sl_price_track = factors.get('stop_loss_buy' if base_signal == '买入' else 'stop_loss_sell', 0)
                         tp_price_track = factors.get('take_profit_buy' if base_signal == '买入' else 'take_profit_sell', 0)
+                        # 同步config里的max_positions到portfolio，确保修改config.json即时生效
+                        portfolio["max_positions"] = config.get("max_positions", 2)
                         portfolio     = track_portfolio_signal(
                             coin, base_signal, price, position_suggest, portfolio,
                             sl_price=sl_price_track,
@@ -2556,9 +2678,7 @@ def main():
                             portfolio_coins=portfolio_coins_cfg
                         )
                     else:
-                        portfolio_old = False
-                        portfolio_new = False
-                        portfolio     = load_portfolio()
+                        portfolio = load_portfolio()
                     if signal_grade == "strong":
                         portfolio_new = portfolio.get("positions", {}).get(coin, {}).get("holding", False)
                     # 推送持仓变化确认（买入 or 卖出）
