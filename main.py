@@ -17,7 +17,7 @@ import threading
 # =========================
 # 版本号
 # =========================
-VERSION = "2.2.0"
+VERSION = "2.3.1"
 # v1.0.0 - 基础信号系统
 # v1.1.0 - 三重障碍法验证
 # v1.2.0 - 三周期共振（4h+1h+15m）
@@ -31,6 +31,8 @@ VERSION = "2.2.0"
 # v2.0.0 - 信号通知精简 + 买卖原因分类 + 消息分层
 # v2.1.0 - 强信号直通 + 最大持仓数限制 + 熊市冷却90分钟
 # v2.2.0 - 牛市冷却90分钟 + 旧持仓止损改用entry_price
+# v2.3.0 - 周期阈值偏移 + 4h斜率过滤 + 临界信号放宽 + 修复阈值覆盖
+# v2.3.1 - 推送重构：市场动态+持仓盈亏+账户表现 + 盈亏比RR
 
 # =========================
 # Railway Volume 挂载等待
@@ -466,43 +468,55 @@ def track_portfolio_signal(coin, base_signal, price, position_suggest, portfolio
     return portfolio
 
 def format_portfolio_status(portfolio):
-    """格式化仓位状态用于状态报告"""
+    """格式化仓位状态：显示买入价、当前价、涨跌幅、止损止盈"""
     lines = []
     total_unrealized = 0.0
 
     for coin_key, pos in portfolio.get("positions", {}).items():
         if pos.get("holding"):
-            # 尝试获取当前价格计算浮动盈亏
             try:
-                cur = get_ticker(coin_key) or pos["entry_price"]
-                unrealized_pct  = (cur * (1 - FEE_RATE) - pos["entry_price"]) / pos["entry_price"]
-                unrealized_amt  = pos["position_size"] * unrealized_pct
+                cur            = get_ticker(coin_key) or pos["entry_price"]
+                entry          = pos["entry_price"]
+                unrealized_pct = (cur * (1 - FEE_RATE) - entry) / entry if entry > 0 else 0
+                unrealized_amt = pos["position_size"] * unrealized_pct
                 total_unrealized += unrealized_amt
-                pnl_str = f"{unrealized_pct*100:+.2f}% ({unrealized_amt:+.2f})"
-                lines.append(f"  🟢 {coin_key}: 持仓中 | 浮盈 {pnl_str}")
+                pnl_emoji      = "✅" if unrealized_pct >= 0 else "🔻"
+                sl             = pos.get("stop_loss", 0)
+                tp             = pos.get("take_profit", 0)
+                sl_str         = f"止损${sl:.6g}" if sl > 0 else "止损未设"
+                tp_str         = f"目标${tp:.6g}" if tp > 0 else "目标未设"
+                lines.append(
+                    f"  🟢 <b>{coin_key}</b>\n"
+                    f"     买入${entry:.6g} → 现价${cur:.6g}\n"
+                    f"     {pnl_emoji} 浮盈 {unrealized_pct*100:+.2f}% ({unrealized_amt:+.2f})\n"
+                    f"     {sl_str} | {tp_str}"
+                )
             except Exception:
-                lines.append(f"  🟢 {coin_key}: 持仓中")
+                lines.append(f"  🟢 {coin_key}: 持仓中（价格获取失败）")
         elif pos.get("trade_count", 0) > 0:
-            lines.append(f"  ⚪ {coin_key}: 空仓 | 累计盈亏 {pos.get('profit', 0):+.2f}")
+            profit = pos.get("profit", 0)
+            p_emoji = "✅" if profit >= 0 else "❌"
+            lines.append(f"  ⚪ {coin_key}: 空仓 | {p_emoji} 累计盈亏 {profit:+.2f}")
 
-    if not lines:
-        return "  暂无持仓记录"
-
-    total_profit = portfolio.get("total_profit", 0)
     balance      = portfolio.get("balance", 10000)
     init_balance = portfolio.get("initial_balance", 10000)
     total_return = (balance - init_balance + total_unrealized) / init_balance * 100
-
+    total_equity = balance + total_unrealized
     used_capital = sum(
         p.get("position_size", 0) for p in portfolio.get("positions", {}).values()
         if p.get("holding")
     )
-    available    = balance - used_capital
-    total_equity = balance + total_unrealized  # 总净值 = 现金 + 持仓浮动市值
-    max_pos      = portfolio.get("max_positions", 2)
-    holding_count= sum(1 for p in portfolio.get("positions", {}).values() if p.get("holding"))
-    lines.append(f"  💰 总净值: {total_equity:.2f} | 现金: {available:.2f} | 浮盈: {total_unrealized:+.2f}")
-    lines.append(f"  📈 累计收益率: {total_return:+.2f}% | 持仓: {holding_count}/{max_pos}个")
+    available     = balance - used_capital
+    max_pos       = portfolio.get("max_positions", 2)
+    holding_count = sum(1 for p in portfolio.get("positions", {}).values() if p.get("holding"))
+
+    if not lines:
+        lines.append("  暂无持仓记录")
+
+    lines.append(
+        f"  💰 总净值: <b>{total_equity:.2f}</b> | 可用: {available:.2f}\n"
+        f"  📈 收益率: <b>{total_return:+.2f}%</b> | 持仓: {holding_count}/{max_pos}个"
+    )
     return "\n".join(lines)
 
 # =========================
@@ -540,6 +554,34 @@ def calc_dynamic_threshold(score_history, default_buy=62, default_sell=38):
         sell_thr = int(mid - 5)
 
     return buy_thr, sell_thr
+
+# =========================
+# 按市场周期偏移动态阈值
+# 基础阈值由百分位数计算，周期偏移叠加在上面（不替换）
+# 牛市：保持严格，只取最强信号
+# 震荡：适当放宽，允许中等强度信号进场
+# 熊市：进一步放宽，否则熊市永远无法建仓
+# =========================
+def adjust_threshold_by_cycle(buy_thr, sell_thr, market_cycle):
+    """
+    按市场周期对动态阈值做偏移
+    叠加在百分位数动态阈值之上，不替换基础值
+    """
+    if market_cycle == "牛市":
+        # 牛市保持严格，信号质量最重要
+        return buy_thr, sell_thr
+    elif market_cycle == "震荡":
+        # 震荡市适当放宽3分，允许回调反弹信号进场
+        adj_buy  = max(buy_thr - 3, 52)
+        adj_sell = min(sell_thr + 3, 48)
+        return adj_buy, adj_sell
+    elif market_cycle == "熊市":
+        # 熊市放宽5分，否则评分普遍50-55永远进不了场
+        adj_buy  = max(buy_thr - 5, 50)
+        adj_sell = min(sell_thr + 5, 50)
+        return adj_buy, adj_sell
+    else:
+        return buy_thr, sell_thr
 
 # =========================
 # 修改二：定时状态持久化
@@ -1258,23 +1300,17 @@ def apply_cycle_strategy_adjustment(memory, cycle):
         save_memory(memory)
         print(f"周期调整(未训练): {cycle}，仅调整权重，阈值保持55/45")
         return memory
-    # 已训练时正常调整阈值
+    # 已训练时：只调整权重，不改阈值
+    # 阈值由动态阈值+周期偏移统一管理（见adjust_threshold_by_cycle）
+    # 这里改阈值会和动态阈值冲突，所以删掉
     if cycle == "牛市":
         memory["trend_weight"]   = min(memory.get("trend_weight", 0.3) + 0.05, 1.0)
-        memory["buy_threshold"]  = min(memory.get("buy_threshold", 70) + 2, 85)
-        memory["sell_threshold"] = max(memory.get("sell_threshold", 35) - 2, 20)
     elif cycle == "熊市":
         memory["trend_weight"]   = max(memory.get("trend_weight", 0.3) - 0.05, 0.0)
-        memory["buy_threshold"]  = max(memory.get("buy_threshold", 70) - 2, 55)
-        memory["sell_threshold"] = max(memory.get("sell_threshold", 35) - 2, 20)
     elif cycle == "震荡":
         memory["volume_weight"]  = min(memory.get("volume_weight", 0.2) + 0.05, 1.0)
-        memory["buy_threshold"]  = max(memory.get("buy_threshold", 70) - 3, 55)
-        memory["sell_threshold"] = min(memory.get("sell_threshold", 35) + 3, 45)
-    memory["buy_threshold"]  = max(min(memory["buy_threshold"], 85), memory["sell_threshold"] + 5)
-    memory["sell_threshold"] = max(min(memory["sell_threshold"], 50), 15)
     save_memory(memory)
-    print(f"周期调整: {cycle}, 买入={memory['buy_threshold']}, 卖出={memory['sell_threshold']}")
+    print(f"周期调整: {cycle}，已更新权重（阈值由动态阈值统一管理）")
     return memory
 
 # =========================
@@ -1829,18 +1865,27 @@ def generate_backtest_report():
         coin_lines.append(f"  {emoji} {cn}: {stat['total']}次 | 胜率{wr:.0%} | 均盈亏{avg_p:+.3f}%")
     coin_report = "\n".join(coin_lines) if coin_lines else "  （各币种数据不足5条）"
 
-    return (f"📊 每日回测报告\n"
+    # 盈亏比
+    rr = ev_data['avg_win'] / ev_data['avg_loss'] if (ev_data and ev_data['avg_loss'] > 0) else 0
+    rr_emoji = "✅" if rr >= 1.5 else ("⚠️" if rr >= 1.0 else "❌")
+
+    # 系统健康判断
+    if ev_data and ev_data['ev'] > 0 and rr >= 1.5 and correct/total >= 0.45:
+        health = "✅ 系统健康，具备持续盈利能力"
+    elif ev_data and ev_data['ev'] > 0:
+        health = "⚠️ 系统临界，可能盈利但不稳定"
+    else:
+        health = "❌ 期望值为负，需要优化"
+
+    return (f"📊 <b>每日盈利报告</b>\n"
             f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-            f"📈 总体统计:\n"
-            f"  总信号: {total}条\n"
-            f"  正确: {correct} | 错误: {total - correct}\n"
-            f"  综合胜率: {correct/total:.2%}\n"
-            f"  平均盈亏: {avg_profit:.3f}%\n\n"
-            f"🔍 分类胜率:\n"
-            f"  买入信号: {len(buy_list)}次 | 胜率{buy_wr:.0%}\n"
-            f"  卖出信号: {len(sell_list)}次 | 胜率{sell_wr:.0%}\n\n"
-            f"🪙 按币种胜率（≥5条数据）:\n{coin_report}\n\n"
-            f"💰 系统期望值:\n{ev_msg}")
+            f"💰 系统期望值:\n{ev_msg}\n\n"
+            f"📈 交易统计:\n"
+            f"  总信号: {total}条 | 胜率: {correct/total:.0%}\n"
+            f"  买入: {len(buy_list)}次({buy_wr:.0%}) | 卖出: {len(sell_list)}次({sell_wr:.0%})\n"
+            f"  {rr_emoji} 盈亏比(RR): {rr:.2f}（≥1.5为健康）\n\n"
+            f"🪙 各币种表现（≥5条）:\n{coin_report}\n\n"
+            f"🎯 综合判断: {health}")
 
 def get_recent_signals(n=3):
     log     = load_log()
@@ -1869,16 +1914,42 @@ def get_signal_stats_since(hours):
 # 修改一：优化后的买入过滤
 # 区分主流币（BTC联动强）和山寨币（可能独立行情）
 # =========================
+def check_4h_slope(coin):
+    """
+    计算4h MA20斜率，用于判断4h趋势强度
+    返回：(斜率值, 趋势描述)
+    斜率 < -0.02 → 强下跌（>2%）
+    -0.02 <= 斜率 < 0 → 轻微下跌
+    斜率 >= 0 → 上涨或平稳
+    """
+    try:
+        df_4h = get_kline(coin, interval="4h", limit=30)
+        ma20  = df_4h["close"].rolling(20).mean()
+        # 斜率 = 最近5根4h K线MA的变化率（约20小时内的趋势强度）
+        slope = (ma20.iloc[-1] - ma20.iloc[-5]) / ma20.iloc[-5] if ma20.iloc[-5] != 0 else 0
+        return slope
+    except Exception:
+        return 0  # 获取失败时返回0（不过滤）
+
+
 def check_buy_filters(coin, df, memory, analysis=None):
     base             = coin.split("-")[0].upper()
     is_major         = base in MAJOR_COINS
     btc_info         = get_btc_dominance_trend()
     is_accumulating  = not ai_model.is_trained
 
-    # ── 趋势过滤（核心）──
-    # 4小时趋势向下时禁止买入，避免逆势操作
-    if analysis and analysis.get('trend_4h') == "↓":
-        return False, f"4小时趋势向下，禁止买入（逆势风险高）"
+    # ── 4h趋势强度过滤（行业标准：强下跌才过滤，轻微下跌允许回调买入）──
+    # 专业量化平台共识：4h强趋势下跌才禁止，轻微下跌+1h反转可以买入
+    slope_4h = check_4h_slope(coin)
+    trend_1h = analysis.get('trend_1h', '未知') if analysis else '未知'
+
+    if slope_4h < -0.02:
+        # 4h强下跌（MA斜率超过-2%）→ 禁止买入
+        return False, f"4小时强下跌（斜率{slope_4h*100:.1f}%），禁止买入"
+    elif slope_4h < 0 and trend_1h == "↓":
+        # 4h轻微下跌 + 1h也向下 → 双周期确认下跌，禁止买入
+        return False, f"4h轻微下跌+1h向下，双重确认，禁止买入"
+    # 4h轻微下跌 + 1h↑ → 允许买入（回调反弹机会），仓位降档在build_signal_message里处理
 
     if is_major:
         if btc_info['btc_falling']:
@@ -2154,19 +2225,127 @@ def build_status_message(coins, memory, config,
     portfolio     = load_portfolio()
     portfolio_str = format_portfolio_status(portfolio)
 
-    # 打印系统状态到日志（不发Telegram）
+    # ── 系统详细状态打印到日志（排查用）──
     print(f"[状态] 运行:{h}h{m}m | 周期:{current_market_cycle} | "
           f"阈值:买入{config['buy_threshold']}/卖出{config['sell_threshold']} | "
           f"评分历史:{len(_score_history)}条 | {model_info.replace(chr(10), ' ')}")
 
+    # ── 盈亏比RR ──
+    rr_str = ""
+    rr_val = 0
+    if ev_data:
+        rr_val = ev_data['avg_win'] / ev_data['avg_loss'] if ev_data['avg_loss'] > 0 else 0
+        rr_emoji = "✅" if rr_val >= 1.5 else ("⚠️" if rr_val >= 1.0 else "❌")
+        rr_str = f"{rr_emoji} 盈亏比: {rr_val:.2f}"
+
+    # ── 构建币种涨跌动态 + 评分诊断 ──
+    coin_section  = []
+    score_section = []   # 评分诊断，帮助排查为什么没信号
+    buy_thr  = config["buy_threshold"]
+    sell_thr = config["sell_threshold"]
+
+    for coin in config.get("coins", []):
+        try:
+            if cached_scores and cached_factors and coin in cached_scores:
+                score    = cached_scores[coin]
+                factors  = cached_factors[coin]
+                analysis = factors['analysis']
+                price    = get_ticker(coin) or 0
+            else:
+                df       = get_kline(coin, interval="15m", limit=200)
+                score, factors, _ = calculate_score(
+                    df, memory, detect_whale(coin), current_market_cycle, coin, config)
+                analysis = factors['analysis']
+                price    = get_ticker(coin) or df['close'].iloc[-1]
+
+            t4h  = analysis.get('trend_4h', '?')
+            t1h  = analysis.get('trend_1h', '?')
+            t15m = analysis.get('trend_15m', '?')
+
+            # 4h和1h的实际涨跌幅
+            try:
+                df4h   = get_kline(coin, interval="4h", limit=6)
+                df1h   = get_kline(coin, interval="1h", limit=2)
+                chg_4h = (df4h['close'].iloc[-1] - df4h['close'].iloc[-5]) / df4h['close'].iloc[-5] * 100
+                chg_1h = (df1h['close'].iloc[-1] - df1h['close'].iloc[-2]) / df1h['close'].iloc[-2] * 100
+                chg_str = f"4h:{chg_4h:+.1f}% 1h:{chg_1h:+.1f}%"
+            except Exception:
+                chg_str = f"4h{t4h} 1h{t1h}"
+
+            arrow = "📈" if t15m == "↑" else ("📉" if t15m == "↓" else "➡️")
+            base  = coin.replace("-USDT", "")
+            coin_section.append(f"  {arrow} <b>{base}</b> ${price:.6g}  {chg_str}")
+
+            # 评分诊断：显示评分和距离阈值的差距，以及拦截原因
+            gap_buy  = score - buy_thr
+            gap_sell = score - sell_thr
+            if score >= buy_thr:
+                score_tag = f"✅ 买入({score}≥{buy_thr})"
+            elif score <= sell_thr:
+                score_tag = f"✅ 卖出({score}≤{sell_thr})"
+            elif gap_buy >= -5:
+                score_tag = f"🟡 差{abs(gap_buy):.0f}分触买入({score}/{buy_thr})"
+            elif gap_sell <= 5:
+                score_tag = f"🟡 差{abs(gap_sell):.0f}分触卖出({score}/{sell_thr})"
+            else:
+                score_tag = f"⚪ 中性({score})"
+
+            # 拦截原因诊断
+            block_reason = ""
+            try:
+                slope = check_4h_slope(coin)
+                if slope < -0.02:
+                    block_reason = f" 🚫4h强跌({slope*100:.1f}%)"
+                elif slope < 0 and t1h == "↓":
+                    block_reason = f" 🚫4h+1h双跌"
+            except Exception:
+                pass
+
+            score_section.append(f"  {base}: {score_tag}{block_reason}")
+
+        except Exception:
+            coin_section.append(f"  ❓ {coin}: 获取失败")
+            score_section.append(f"  ❓ {coin}: 获取失败")
+
+    # ── 热门涨幅 ──
+    hot     = scan_hot_coins()[:3]
+    hot_str = "  " + "  ".join(
+        [f"{c.replace('-USDT','')}: {ch:+.1f}%" for c, ch in hot]) if hot else "  暂无"
+
+    # ── 模型健康（一行摘要）──
+    if ai_model.is_trained and ai_model.training_history:
+        last    = ai_model.training_history[-1]
+        cv_acc  = last.get('cv_accuracy', ai_model.cv_accuracy)
+        samples = last.get('samples', 0)
+        gap     = last.get('train_acc', 0) - cv_acc
+        overfit = " ⚠️过拟合" if gap > 0.2 else ""
+        model_line = f"  🤖 模型: {samples}样本 | CV:{cv_acc:.0%}{overfit}"
+    else:
+        log_data       = load_log()
+        verified_count = sum(1 for e in log_data
+                             if e.get("verified") and e.get("result") in ("correct","wrong"))
+        model_line = f"  🤖 模型: 训练中({verified_count}/{MIN_TRAIN_SAMPLES}条)"
+
+    # ── 阈值状态（显示基础值和偏移后的值）──
+    dyn_buy, dyn_sell = calc_dynamic_threshold(_score_history)
+    threshold_line = (f"  📐 阈值: 买{buy_thr}(基础{dyn_buy}) | "
+                      f"卖{sell_thr}(基础{dyn_sell}) | {current_market_cycle}偏移")
+
+    # ── 组装Telegram推送 ──
+    now_str = datetime.now().strftime('%m-%d %H:%M')
     status = (
-        f"📡 <b>AI监控</b> | {current_market_cycle} | 运行{h}h{m}m\n\n"
-        f"💼 持仓状态:\n{portfolio_str}\n\n"
-        f"⏱️ 最近信号:\n" +
-        ("\n".join([f"  {s}" for s in recent]) if recent else "  暂无") + "\n\n"
-        f"💰 系统表现:\n"
-        f"  24小时: {today_total}次信号 | 胜率{today_winrate:.0%}{winrate_tag}\n"
-        f"{ev_line}"
+        f"📊 <b>市场动态</b> | {current_market_cycle} | {now_str}\n\n"
+        f"{''.join([l+chr(10) for l in coin_section])}\n"
+        f"🔥 热门: {hot_str}\n\n"
+        f"💼 <b>持仓盈亏:</b>\n{portfolio_str}\n\n"
+        f"📉 <b>账户表现:</b>\n"
+        f"  胜率: {today_winrate:.0%}{winrate_tag} | {rr_str}\n"
+        f"{ev_line.strip()}\n\n"
+        f"🔍 <b>信号诊断:</b>\n"
+        f"{''.join([l+chr(10) for l in score_section])}"
+        f"{threshold_line}\n"
+        f"{model_line}\n"
+        f"  ⏱️ 最近: {'  '.join(recent) if recent else '暂无'}"
     )
     return status
 
@@ -2513,20 +2692,26 @@ def main():
                 config["buy_threshold"]  = 55
                 config["sell_threshold"] = 45
             else:
-                # ── 百分位数动态阈值（GPT方案一核心）──
-                # 用最近500条历史评分自动计算阈值
-                # 牛市自动升高，熊市自动降低，完全自适应
+                # ── 百分位数动态阈值 + 周期偏移（融合方案）──
+                # 第一步：百分位数计算基础阈值
                 dyn_buy, dyn_sell = calc_dynamic_threshold(_score_history)
-                config["buy_threshold"]  = dyn_buy
-                config["sell_threshold"] = dyn_sell
 
-                # 同步保存到memory，供模型训练等模块使用
+                # 第二步：按市场周期叠加偏移（不替换，叠加）
+                # 熊市-5 / 震荡-3 / 牛市不变
+                adj_buy, adj_sell = adjust_threshold_by_cycle(
+                    dyn_buy, dyn_sell, current_market_cycle)
+
+                config["buy_threshold"]  = adj_buy
+                config["sell_threshold"] = adj_sell
+
+                # memory只保存基础动态阈值（不含周期偏移），供训练模块使用
                 memory["buy_threshold"]  = dyn_buy
                 memory["sell_threshold"] = dyn_sell
                 save_memory(memory)
 
                 print(f"[动态阈值] 历史评分{len(_score_history)}条 → "
-                      f"买入={dyn_buy} 卖出={dyn_sell}")
+                      f"基础:{dyn_buy}/{dyn_sell} "
+                      f"周期偏移后:{adj_buy}/{adj_sell}({current_market_cycle})")
 
             # DEBUG每10轮打印一次，避免日志刷屏
             _loop_count = getattr(main, '_loop_count', 0) + 1
@@ -2592,11 +2777,28 @@ def main():
                     # 普通信号：未训练需1次，已训练需2次
                     is_strong = (base_signal == "买入" and score >= SIGNAL_STRONG_BUY) or                                 (base_signal == "卖出" and score <= SIGNAL_STRONG_SELL)
 
+                    # 临界信号：评分在阈值3分以内，只需1次确认（GPT方案）
+                    # 防止53-55分卡死在"等待二次确认"永远触发不了的问题
+                    is_near_threshold = (
+                        base_signal == "买入" and
+                        score >= config["buy_threshold"] - 3 and
+                        score < config["buy_threshold"]
+                    ) or (
+                        base_signal == "卖出" and
+                        score <= config["sell_threshold"] + 3 and
+                        score > config["sell_threshold"]
+                    )
+
                     if is_strong:
                         # 强信号直通，跳过二次确认等待
                         required_confirms = 1
                         _, avg_score = check_signal_confirm(coin, base_signal, score)
                         print(f"{coin} 强信号直通（评分{score}，无需二次确认）")
+                    elif is_near_threshold:
+                        # 临界信号：在阈值3分以内，只需1次确认
+                        required_confirms = 1
+                        _, avg_score = check_signal_confirm(coin, base_signal, score)
+                        print(f"{coin} 临界信号（评分{score}，1次确认即可）")
                     else:
                         required_confirms = 1 if not ai_model.is_trained else SIGNAL_CONFIRM_COUNT
                         confirmed, avg_score = check_signal_confirm(coin, base_signal, score)
