@@ -17,7 +17,7 @@ import threading
 # =========================
 # 版本号
 # =========================
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 # v1.0.0 - 基础信号系统
 # v1.1.0 - 三重障碍法验证
 # v1.2.0 - 三周期共振（4h+1h+15m）
@@ -33,6 +33,7 @@ VERSION = "2.3.1"
 # v2.2.0 - 牛市冷却90分钟 + 旧持仓止损改用entry_price
 # v2.3.0 - 周期阈值偏移 + 4h斜率过滤 + 临界信号放宽 + 修复阈值覆盖
 # v2.3.1 - 推送重构：市场动态+持仓盈亏+账户表现 + 盈亏比RR
+# v2.3.2 - 修复ev_data未定义导致主循环崩溃
 
 # =========================
 # Railway Volume 挂载等待
@@ -2214,6 +2215,7 @@ def build_status_message(coins, memory, config,
 
     # ── 期望值：区分全局和近期，避免两个数字混淆 ──
     ev_line = ""
+    ev_data = calculate_expected_value()   # ← 补上这行定义
     if ev_data:
         ev_emoji = "✅" if ev_data['ev'] > 0 else "❌"
         # 同时计算近期100条的EV
