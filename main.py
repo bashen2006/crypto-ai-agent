@@ -17,7 +17,7 @@ import threading
 # =========================
 # 版本号
 # =========================
-VERSION = "2.3.2"
+VERSION = "2.3.5"
 # v1.0.0 - 基础信号系统
 # v1.1.0 - 三重障碍法验证
 # v1.2.0 - 三周期共振（4h+1h+15m）
@@ -28,12 +28,15 @@ VERSION = "2.3.2"
 # v1.7.0 - 按周期动态止盈止损ATR
 # v1.8.0 - 止损/止盈强制执行（硬规则）
 # v1.9.0 - 资金锁仓 + 验证窗口±0.5%
-# v2.0.0 - 信号通知精简 + 买卖原因分类 + 消息分层
+# v2.0.0 - 信号=通知精简 + 买卖原因分类 + 消息分层
 # v2.1.0 - 强信号直通 + 最大持仓数限制 + 熊市冷却90分钟
 # v2.2.0 - 牛市冷却90分钟 + 旧持仓止损改用entry_price
 # v2.3.0 - 周期阈值偏移 + 4h斜率过滤 + 临界信号放宽 + 修复阈值覆盖
 # v2.3.1 - 推送重构：市场动态+持仓盈亏+账户表现 + 盈亏比RR
 # v2.3.2 - 修复ev_data未定义导致主循环崩溃
+# v2.3.3 - 阈值改75/25百分位+卖出上限42+重启冷却减半
+# v2.3.4 - 移植v3.0.1：4h改扣分+EV不影响仓位+趋势权重降15
+# v2.3.5 - 特征重要性反向驱动rule_weight，真正实现自适应市场：4h改扣分+EV不影响仓位+趋势权重降15
 
 # =========================
 # Railway Volume 挂载等待
@@ -539,14 +542,14 @@ def calc_dynamic_threshold(score_history, default_buy=62, default_sell=38):
 
     scores = np.array(score_history[-500:])  # 最近500条
 
-    # 第80百分位作为买入阈值（最强20%才触发）
-    # 第20百分位作为卖出阈值（最弱20%才触发）
-    buy_thr  = float(np.percentile(scores, 80))
-    sell_thr = float(np.percentile(scores, 20))
+    # 改为第75百分位买入，第25百分位卖出（GPT建议）
+    # 原80/20门槛太高导致熊市进不了场
+    buy_thr  = float(np.percentile(scores, 75))
+    sell_thr = float(np.percentile(scores, 25))
 
-    # 安全边界：防止极端行情下阈值过高或过低
-    buy_thr  = max(min(round(buy_thr),  70), 55)  # 买入：55-70之间
-    sell_thr = max(min(round(sell_thr), 45), 30)  # 卖出：30-45之间
+    # 安全边界：卖出上限从45降到42，防止无意义卖出信号
+    buy_thr  = max(min(round(buy_thr),  70), 52)  # 买入：52-70之间
+    sell_thr = max(min(round(sell_thr), 42), 28)  # 卖出：28-42之间（上限从45降到42）
 
     # 保证买卖之间至少10分间距
     if buy_thr - sell_thr < 10:
@@ -1368,26 +1371,34 @@ def calculate_score(df, memory, whale, market_cycle, coin, config):
         # 三周期共振加权：
         # 4h定方向（权重最高），1h确认趋势，15m入场（当前df）
         # 三周期同向 → 强信号加分；逆向 → 减分
+        # 移植v3.0.1：趋势权重从25降到15，避免单一因子主导过强
         trend_15m = "↑" if ma20 > ma60 else "↓"
         if trend_4h != "未知" and trend_1h != "未知":
             if trend_4h == "↑" and trend_1h == "↑" and trend_15m == "↑":
-                rule_score += 25 * trend_w   # 三周期全做多：最强信号
+                rule_score += 15 * trend_w   # 三周期全做多
             elif trend_4h == "↓" and trend_1h == "↓" and trend_15m == "↓":
-                rule_score -= 25 * trend_w   # 三周期全做空：最强空信号
+                rule_score -= 15 * trend_w   # 三周期全做空
             elif trend_4h == "↑" and trend_1h == "↑":
-                rule_score += 15 * trend_w   # 4h+1h做多，15m未确认：普通信号
+                rule_score += 10 * trend_w
             elif trend_4h == "↓" and trend_1h == "↓":
-                rule_score -= 15 * trend_w   # 4h+1h做空
+                rule_score -= 10 * trend_w
             elif trend_4h == "↑":
-                rule_score += 8 * trend_w    # 只有4h看多
+                rule_score += 5 * trend_w
             elif trend_4h == "↓":
-                rule_score -= 8 * trend_w    # 只有4h看空
+                rule_score -= 5 * trend_w
         else:
-            # 降级到原来的单周期判断（兜底）
             if ma20 > ma60:
-                rule_score += 20 * trend_w
+                rule_score += 15 * trend_w
             else:
-                rule_score -= 20 * trend_w
+                rule_score -= 15 * trend_w
+
+        # ── 移植v3.0.1：4h斜率扣分/加分（行业标准，不硬过滤）──
+        slope_4h = check_4h_slope(coin)
+        if   slope_4h < -0.02: rule_score -= 10  # 强下跌扣10
+        elif slope_4h < -0.01: rule_score -= 5   # 轻跌扣5
+        elif slope_4h < 0:     rule_score -= 2   # 微跌扣2
+        elif slope_4h >  0.02: rule_score += 3   # 上涨加3
+        rule_score = max(0, min(100, int(rule_score)))
 
         # 动量：双向评分（强势加分，弱势减分）
         if momentum > 0.02:
@@ -1698,32 +1709,47 @@ def adaptive_strategy_optimization(config):
     memory = load_memory()
     memory['feature_importance'] = ai_model.feature_importance
 
-    # 近期信号样本数（用于防止少量样本胜率虚高导致阈值失控）
-    recent_signals_count = len(sorted(verified,
-                                      key=lambda x: x.get('timestamp', 0),
-                                      reverse=True)[:50])
+    # ── ml_weight更新（不动阈值，阈值由动态阈值统一管理）──
+    if cv_acc > 0.60:
+        memory['ml_weight'] = min(0.5, memory.get('ml_weight', 0.4) + 0.05)
+    elif cv_acc < 0.50:
+        memory['ml_weight'] = max(0.1, memory.get('ml_weight', 0.4) - 0.10)
+        print(f"⚠️ CV偏低({cv_acc:.3f})，已降低AI权重至{memory['ml_weight']:.2f}")
+    memory['ml_weight'] = min(0.5, memory['ml_weight'])
 
-    # 至少需要30条近期已验证信号才能调整阈值
-    # 防止3条样本100%胜率就把阈值推到85的情况
-    if recent_signals_count >= 30:
-        if cv_acc > 0.60:
-            memory['buy_threshold']  = min(memory.get('buy_threshold', 65) + 2, 75)  # 上限75（原85）
-            memory['sell_threshold'] = max(memory.get('sell_threshold', 35) - 2, 25)  # 下限25（原20）
-            memory['ml_weight']      = min(0.5, memory.get('ml_weight', 0.4) + 0.05)  # 上限0.5，防过拟合放大
-        elif cv_acc < 0.50:
-            memory['buy_threshold']  = max(memory.get('buy_threshold', 65) - 2, 55)
-            memory['sell_threshold'] = min(memory.get('sell_threshold', 35) + 2, 45)
-            memory['ml_weight']      = max(0.1, memory.get('ml_weight', 0.4) - 0.1)
-            print(f"⚠️ 交叉验证准确率偏低({cv_acc:.3f})，已降低AI模型权重至{memory['ml_weight']:.2f}")
-    else:
-        print(f"⚠️ 近期样本不足30条（当前{recent_signals_count}条），跳过阈值调整，防止虚高胜率误导")
+    # ── 核心自适应：用特征重要性反向驱动rule_weight ──
+    # AI训练后的feature_importance告诉我们"哪类指标最近最有效"
+    # 把这个信息反馈到评分权重，实现真正的自适应市场
+    imp = ai_model.feature_importance
+    if imp:
+        trend_feats    = ['ma_5','ma_10','ma_20','ma_30','ma_50','ma_60',
+                          'price_ma_5_ratio','price_ma_10_ratio','price_ma_20_ratio',
+                          'price_ma_30_ratio','price_ma_50_ratio','price_ma_100_ratio',
+                          'h1_ma20','h1_price_ma20_ratio','btc_ma20','btc_price_ma20_ratio']
+        momentum_feats = ['momentum_5','momentum_10','momentum_20','momentum_30',
+                          'rsi','macd','macd_signal','macd_histogram',
+                          'btc_momentum_10','h1_momentum_10']
+        volume_feats   = ['volume_ratio','volume_trend','bb_position','price_position_20',
+                          'market_up_count','market_down_count','market_up_down_ratio',
+                          'market_top_vol_avg_change','atr_ratio']
 
-    # 阈值安全边界（绝对不能超出的范围）
-    # 买入最高70（熊市评分普遍40-65，70以上几乎触发不了）
-    # 卖出最低30（同理）
-    # 两者差值至少10，保证信号区间足够宽
-    memory['buy_threshold']  = max(min(memory['buy_threshold'], 70), memory['sell_threshold'] + 10)
-    memory['sell_threshold'] = max(min(memory['sell_threshold'], 45), 30)
+        ti    = sum(imp.get(f, 0) for f in trend_feats)
+        mi    = sum(imp.get(f, 0) for f in momentum_feats)
+        vi    = sum(imp.get(f, 0) for f in volume_feats)
+        total = ti + mi + vi
+
+        if total > 0:
+            new_tw = round(0.1 + 0.5 * (ti / total), 3)
+            new_mw = round(0.1 + 0.5 * (mi / total), 3)
+            new_vw = round(0.1 + 0.5 * (vi / total), 3)
+            # 平滑更新（30%新值+70%旧值），防止权重剧烈跳动
+            memory['trend_weight']    = round(0.7*memory.get('trend_weight',0.3)    + 0.3*new_tw, 3)
+            memory['momentum_weight'] = round(0.7*memory.get('momentum_weight',0.25)+ 0.3*new_mw, 3)
+            memory['volume_weight']   = round(0.7*memory.get('volume_weight',0.2)   + 0.3*new_vw, 3)
+            print(f"[自适应权重] 趋势:{memory['trend_weight']:.3f} "
+                  f"动量:{memory['momentum_weight']:.3f} "
+                  f"量能:{memory['volume_weight']:.3f}")
+
     save_memory(memory)
 
     recent_verified = sorted(verified, key=lambda x: x.get('timestamp', 0), reverse=True)[:100]
@@ -1735,22 +1761,12 @@ def adaptive_strategy_optimization(config):
     if train_acc - cv_acc > 0.15:
         overfit_warning = f"\n⚠️ 检测到过拟合（训练与验证差距{train_acc - cv_acc:.2%}），已自动降低AI模型权重"
 
-    top5        = sorted(ai_model.feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
-    feature_msg = "\n".join([f"  {f}: {v:.4f}" for f, v in top5]) if top5 else "  （暂无）"
-
-    # 计算期望值
     ev_data = calculate_expected_value(recent_verified)
     ev_msg  = format_ev_message(ev_data)
 
-    # 详细训练报告打印到日志（方便排查）
     print(f"[AI进化] 样本:{len(X_df)} | 训练:{train_acc:.2%} | CV:{cv_acc:.2%} | "
-          f"胜率:{real_winrate:.2%} | 阈值:买入{memory['buy_threshold']}/卖出{memory['sell_threshold']} | "
-          f"权重:{memory['ml_weight']:.2f}{overfit_warning}")
-    print(f"[AI进化] 前5特征: {feature_msg.replace(chr(10), ', ')}")
+          f"胜率:{real_winrate:.2%} | 权重:{memory['ml_weight']:.2f}{overfit_warning}")
 
-    # 注意：不再覆盖config阈值
-    # 阈值由主循环的"动态阈值+周期偏移"统一管理，训练完不能覆盖
-    # 否则每次训练都会把周期偏移后的52/43重置回基础值60/40
     simple_msg = (
         f"🤖 AI模型已更新\n\n"
         f"📊 系统表现:\n{ev_msg}\n\n"
@@ -1940,18 +1956,9 @@ def check_buy_filters(coin, df, memory, analysis=None):
     btc_info         = get_btc_dominance_trend()
     is_accumulating  = not ai_model.is_trained
 
-    # ── 4h趋势强度过滤（行业标准：强下跌才过滤，轻微下跌允许回调买入）──
-    # 专业量化平台共识：4h强趋势下跌才禁止，轻微下跌+1h反转可以买入
-    slope_4h = check_4h_slope(coin)
-    trend_1h = analysis.get('trend_1h', '未知') if analysis else '未知'
-
-    if slope_4h < -0.02:
-        # 4h强下跌（MA斜率超过-2%）→ 禁止买入
-        return False, f"4小时强下跌（斜率{slope_4h*100:.1f}%），禁止买入"
-    elif slope_4h < 0 and trend_1h == "↓":
-        # 4h轻微下跌 + 1h也向下 → 双周期确认下跌，禁止买入
-        return False, f"4h轻微下跌+1h向下，双重确认，禁止买入"
-    # 4h轻微下跌 + 1h↑ → 允许买入（回调反弹机会），仓位降档在build_signal_message里处理
+    # ── 4h过滤：移植v3.0.1做法，只做扣分，不硬过滤 ──
+    # 4h斜率已在calculate_score里扣分，这里不再重复硬过滤
+    # 保留：BTC死叉、资金虹吸、成交量、波动率这些客观过滤条件
 
     if is_major:
         if btc_info['btc_falling']:
@@ -2023,24 +2030,22 @@ def build_signal_message(coin, base_signal, score, display_price,
         sl_pct = abs(sl - display_price) / display_price * 100
         tp_pct = abs(display_price - tp) / display_price * 100
 
-    # 期望值联动仓位建议
-    ev_data  = calculate_expected_value()
-    ev_value = ev_data['ev'] if ev_data else 0
-
+    # ── 仓位建议：移植v3.0.1，只基于风险等级和市场周期，EV不参与 ──
+    # EV影响仓位会形成负反馈：EV差→降仓→更少交易→EV更差（死循环）
     if risk_level == "高":
         position_suggest = "轻仓(≤10%)"
     elif risk_level == "中":
-        if ev_value < 0:
-            position_suggest = "极轻仓(≤5%) ⚠️期望值为负"
-        elif ev_value < 0.01:
-            position_suggest = "轻仓(≤15%) 期望值偏低"
+        if current_market_cycle == "熊市":
+            position_suggest = "轻仓(≤15%)"
+        elif current_market_cycle == "震荡":
+            position_suggest = "半仓(≤25%)"
         else:
             position_suggest = "半仓(≤30%)"
     else:
-        if ev_value < 0:
-            position_suggest = "轻仓(≤10%) ⚠️期望值为负"
-        elif ev_value < 0.01:
-            position_suggest = "半仓(≤30%) 期望值偏低"
+        if current_market_cycle == "熊市":
+            position_suggest = "轻仓(≤20%)"
+        elif current_market_cycle == "震荡":
+            position_suggest = "半仓(≤30%)"
         else:
             position_suggest = "正常仓(≤50%)"
 
@@ -2538,9 +2543,19 @@ def main():
     # 恢复信号冷却时间，防止重启后重复发送信号
     last_signal_time = load_signal_time()
     if last_signal_time:
-        active = {k: v for k, v in last_signal_time.items()
-                  if time.time() - v < max(COOLDOWN_BY_CYCLE.values())}
-        print(f"📅 已恢复信号冷却记录，共 {len(active)} 个币种")
+        now_ts = time.time()
+        max_cool = max(COOLDOWN_BY_CYCLE.values())
+        # 重启后只恢复剩余冷却时间的一半
+        # 防止重启后6个币全部锁死90分钟，错过买入机会
+        adjusted = {}
+        for k, v in last_signal_time.items():
+            elapsed  = now_ts - v
+            if elapsed < max_cool:
+                remaining = max_cool - elapsed
+                # 只保留剩余冷却的50%
+                adjusted[k] = now_ts - (max_cool - remaining * 0.5)
+        last_signal_time = adjusted
+        print(f"📅 已恢复信号冷却记录，共 {len(adjusted)} 个币种（冷却时间减半）")
 
     # 启动后强制推送一次状态，让用户确认系统正常运行
     force_push_on_start = True
