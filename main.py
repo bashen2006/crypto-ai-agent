@@ -1212,9 +1212,10 @@ def send_telegram_message(text, config):
     if not token or not chat_id:
         return
     try:
+        tagged = f"<b>【v2.3】</b>\n{text}"
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            data={"chat_id": chat_id, "text": tagged, "parse_mode": "HTML"},
             timeout=10
         )
     except Exception as e:
@@ -1746,9 +1747,9 @@ def adaptive_strategy_optimization(config):
           f"权重:{memory['ml_weight']:.2f}{overfit_warning}")
     print(f"[AI进化] 前5特征: {feature_msg.replace(chr(10), ', ')}")
 
-    # Telegram只发简洁的盈利相关信息
-    config['buy_threshold']  = memory['buy_threshold']
-    config['sell_threshold'] = memory['sell_threshold']
+    # 注意：不再覆盖config阈值
+    # 阈值由主循环的"动态阈值+周期偏移"统一管理，训练完不能覆盖
+    # 否则每次训练都会把周期偏移后的52/43重置回基础值60/40
     simple_msg = (
         f"🤖 AI模型已更新\n\n"
         f"📊 系统表现:\n{ev_msg}\n\n"
@@ -2211,15 +2212,25 @@ def build_status_message(coins, memory, config,
     hot     = scan_hot_coins()[:3]
     hot_str = "\n".join([f"  {c}: {ch:+.2f}%" for c, ch in hot]) if hot else "  暂无"
 
-    # 计算期望值
-    ev_data = calculate_expected_value()
+    # ── 期望值：区分全局和近期，避免两个数字混淆 ──
     ev_line = ""
     if ev_data:
         ev_emoji = "✅" if ev_data['ev'] > 0 else "❌"
-        ev_line  = (f"\n💰 系统期望值:\n"
-                    f"  {ev_emoji} {ev_data['ev']:+.3f}% | "
-                    f"胜率{ev_data['win_rate']:.0%} | "
-                    f"盈{ev_data['avg_win']:.2f}% 亏{ev_data['avg_loss']:.2f}%")
+        # 同时计算近期100条的EV
+        log_all      = load_log()
+        recent_100   = sorted(
+            [e for e in log_all if e.get("verified") and e.get("result") in ("correct","wrong")],
+            key=lambda x: x.get("timestamp", 0), reverse=True)[:100]
+        ev_recent    = calculate_expected_value(recent_100)
+        if ev_recent:
+            r_emoji  = "✅" if ev_recent['ev'] > 0 else "❌"
+            ev_line  = (f"\n💰 期望值:\n"
+                        f"  全局: {ev_emoji} {ev_data['ev']:+.3f}% | 胜率{ev_data['win_rate']:.0%}\n"
+                        f"  近期: {r_emoji} {ev_recent['ev']:+.3f}% | 胜率{ev_recent['win_rate']:.0%}"
+                        f"{'  ⚠️近期转差' if ev_recent['ev'] < 0 < ev_data['ev'] else ''}")
+        else:
+            ev_line  = (f"\n💰 期望值: {ev_emoji} {ev_data['ev']:+.3f}% | "
+                        f"胜率{ev_data['win_rate']:.0%}")
 
     # 仓位状态
     portfolio     = load_portfolio()
